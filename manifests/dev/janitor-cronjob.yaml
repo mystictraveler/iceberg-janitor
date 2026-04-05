@@ -1,0 +1,49 @@
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: iceberg-janitor
+  namespace: iceberg-janitor
+spec:
+  # Run every 15 minutes — adjust based on streaming volume
+  schedule: "*/15 * * * *"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 2
+      activeDeadlineSeconds: 600
+      template:
+        metadata:
+          labels:
+            app: iceberg-janitor
+        spec:
+          restartPolicy: OnFailure
+          containers:
+            - name: janitor
+              image: iceberg-janitor:latest
+              imagePullPolicy: IfNotPresent
+              command: ["python", "-m", "iceberg_janitor.runner.cron"]
+              args: ["--config", "/etc/janitor/config.yaml"]
+              env:
+                - name: AWS_ACCESS_KEY_ID
+                  value: admin
+                - name: AWS_SECRET_ACCESS_KEY
+                  value: password
+                - name: AWS_REGION
+                  value: us-east-1
+              volumeMounts:
+                - name: config
+                  mountPath: /etc/janitor
+                  readOnly: true
+              resources:
+                requests:
+                  memory: 512Mi
+                  cpu: 250m
+                limits:
+                  memory: 1Gi
+                  cpu: 1000m
+          volumes:
+            - name: config
+              configMap:
+                name: janitor-config

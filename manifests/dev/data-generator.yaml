@@ -1,0 +1,43 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: data-generator
+  namespace: iceberg-janitor
+spec:
+  backoffLimit: 1
+  template:
+    metadata:
+      labels:
+        app: data-generator
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: generator
+          image: iceberg-janitor:latest
+          imagePullPolicy: IfNotPresent
+          command: ["python", "/app/scripts/generate-data.py"]
+          env:
+            - name: CATALOG_URI
+              value: http://rest-catalog:8181
+            - name: WAREHOUSE
+              value: s3://warehouse/
+            - name: S3_ENDPOINT
+              value: http://minio:9000
+            - name: AWS_ACCESS_KEY_ID
+              value: admin
+            - name: AWS_SECRET_ACCESS_KEY
+              value: password
+            - name: AWS_REGION
+              value: us-east-1
+            # Number of micro-batches to simulate streaming
+            - name: NUM_BATCHES
+              value: "200"
+            - name: ROWS_PER_BATCH
+              value: "100"
+          resources:
+            requests:
+              memory: 256Mi
+              cpu: 100m
+            limits:
+              memory: 512Mi
+              cpu: 500m

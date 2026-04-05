@@ -1,0 +1,38 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: janitor-config
+  namespace: iceberg-janitor
+data:
+  config.yaml: |
+    catalog:
+      name: default
+      uri: http://rest-catalog:8181
+      warehouse: s3://warehouse/
+      type: rest
+      s3.endpoint: http://minio:9000
+      s3.access-key-id: admin
+      s3.secret-access-key: password
+
+    # Leave empty to auto-discover all tables from catalog
+    tables: []
+
+    policy:
+      default_policy:
+        max_small_file_ratio: 0.3
+        small_file_threshold_bytes: 8388608    # 8 MB
+        target_file_size_bytes: 134217728      # 128 MB
+        max_file_count: 10000
+        max_snapshots: 100
+        snapshot_retention_hours: 168           # 7 days
+        min_snapshots_to_keep: 5
+        orphan_retention_hours: 72             # 3 days
+        max_manifest_count: 500
+
+      # Per-table overrides
+      table_overrides:
+        # Example: high-throughput events table gets more aggressive compaction
+        # default.events:
+        #   max_small_file_ratio: 0.2
+        #   max_snapshots: 50
+        #   snapshot_retention_hours: 24

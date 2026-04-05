@@ -1,0 +1,63 @@
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: rest-catalog
+  namespace: iceberg-janitor
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: rest-catalog
+  template:
+    metadata:
+      labels:
+        app: rest-catalog
+    spec:
+      containers:
+        - name: rest-catalog
+          image: tabulario/iceberg-rest:1.5.0
+          env:
+            - name: CATALOG_WAREHOUSE
+              value: s3://warehouse/
+            - name: CATALOG_IO__IMPL
+              value: org.apache.iceberg.aws.s3.S3FileIO
+            - name: CATALOG_S3_ENDPOINT
+              value: http://minio:9000
+            - name: CATALOG_S3_PATH__STYLE__ACCESS
+              value: "true"
+            - name: AWS_ACCESS_KEY_ID
+              value: admin
+            - name: AWS_SECRET_ACCESS_KEY
+              value: password
+            - name: AWS_REGION
+              value: us-east-1
+          ports:
+            - containerPort: 8181
+              name: http
+          resources:
+            requests:
+              memory: 256Mi
+              cpu: 100m
+            limits:
+              memory: 512Mi
+              cpu: 500m
+          readinessProbe:
+            httpGet:
+              path: /v1/config
+              port: 8181
+            initialDelaySeconds: 10
+            periodSeconds: 10
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: rest-catalog
+  namespace: iceberg-janitor
+spec:
+  selector:
+    app: rest-catalog
+  ports:
+    - name: http
+      port: 8181
+      targetPort: 8181

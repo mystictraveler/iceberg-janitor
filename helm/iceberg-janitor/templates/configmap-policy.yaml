@@ -1,0 +1,33 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "iceberg-janitor.fullname" . }}-config
+  labels:
+    {{- include "iceberg-janitor.labels" . | nindent 4 }}
+data:
+  config.yaml: |
+    catalog:
+      name: {{ .Values.catalog.name }}
+      uri: {{ .Values.catalog.uri }}
+      warehouse: {{ .Values.catalog.warehouse }}
+      type: {{ .Values.catalog.type }}
+      {{- range $key, $value := .Values.catalog.properties }}
+      {{ $key }}: {{ $value | quote }}
+      {{- end }}
+
+    tables: []
+
+    policy:
+      default_policy:
+        max_small_file_ratio: {{ .Values.policy.defaultPolicy.maxSmallFileRatio }}
+        small_file_threshold_bytes: {{ .Values.policy.defaultPolicy.smallFileThresholdBytes }}
+        target_file_size_bytes: {{ .Values.policy.defaultPolicy.targetFileSizeBytes }}
+        max_file_count: {{ .Values.policy.defaultPolicy.maxFileCount }}
+        max_snapshots: {{ .Values.policy.defaultPolicy.maxSnapshots }}
+        snapshot_retention_hours: {{ .Values.policy.defaultPolicy.snapshotRetentionHours }}
+        min_snapshots_to_keep: {{ .Values.policy.defaultPolicy.minSnapshotsToKeep }}
+        orphan_retention_hours: {{ .Values.policy.defaultPolicy.orphanRetentionHours }}
+        max_manifest_count: {{ .Values.policy.defaultPolicy.maxManifestCount }}
+
+      table_overrides:
+        {{- toYaml .Values.policy.tableOverrides | nindent 8 }}
