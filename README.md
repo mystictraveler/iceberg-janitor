@@ -498,29 +498,52 @@ Simulated with 2 DuckDB instances querying 3 TPC-DS fact tables across 2 regions
 
 Compacting only one region leaves the other region serving queries against uncompacted data — a 27% performance gap that persists until CRR delivers the compacted files (seconds to minutes of lag).
 
-### Recommended Architecture
+### Recommended Architecture: Metadata-Only Replication
+
+The key insight: **replicate metadata only, not data files.** Each region receives its own streaming data from its own Kafka/Flink pipeline and compacts locally. S3 CRR is scoped to `metadata/` prefixes only — no data file transfer between regions.
 
 ```
-Region A (us-east)                     Region B (eu-west)
-┌──────────────────────┐              ┌──────────────────────┐
-│ Janitor + Flink      │              │ Janitor + Flink      │
-│ (independent)        │              │ (independent)        │
-└──────────┬───────────┘              └──────────┬───────────┘
-           │                                     │
-┌──────────▼───────────┐    S3 CRR    ┌──────────▼───────────┐
-│ S3 (us-east)         │ ◄──────────► │ S3 (eu-west)         │
-└──────────────────────┘   metadata   └──────────────────────┘
-                           + data
+Region A (us-east)                          Region B (eu-west)
+┌────────────────────────────┐             ┌────────────────────────────┐
+│ Kafka → Flink → S3 (data/) │             │ Kafka → Flink → S3 (data/) │
+│ (own streaming writes)      │             │ (own streaming writes)      │
+│                             │             │                             │
+│ Janitor + Flink             │             │ Janitor + Flink             │
+│ (compacts locally)          │             │ (compacts locally)          │
+└──────────┬──────────────────┘             └──────────┬──────────────────┘
+           │                                           │
+    s3://warehouse-east/                        s3://warehouse-west/
+    ├── metadata/ ──── CRR (metadata only) ───→ metadata/
+    └── data/     ✗ NOT replicated              data/ (own files)
 ```
+
+**S3 CRR rule configuration:**
+
+```json
+{
+  "Rules": [{
+    "ID": "replicate-iceberg-metadata-only",
+    "Status": "Enabled",
+    "Filter": { "Prefix": "metadata/" },
+    "Destination": { "Bucket": "arn:aws:s3:::warehouse-eu-west" }
+  }]
+}
+```
+
+This prevents CRR from shipping compacted data files cross-region. Each region's data files stay local. Metadata replication ensures both regions see the same logical schema, snapshot history, and table properties — but physical data files are independent.
+
+**Why this works with Iceberg:** Iceberg metadata (JSON + Avro manifests) is tiny — typically < 1 MB even for TB-scale tables. Replicating metadata costs fractions of a cent. Data files (Parquet) are the expensive part — and with this approach, they never cross regions.
 
 **Design principles:**
 
 1. **Each region runs its own janitor + Flink cluster** — independent compaction, no cross-region coordination
-2. **Shared policy via GitOps** — same thresholds, same triggers, deployed by CI/CD
-3. **Idempotent compaction** — if CRR delivers compacted metadata before the local janitor runs, the health check sees a healthy table and skips compaction (zero wasted work)
-4. **Each region cleans its own orphans** — old small files from pre-compaction become orphans after CRR delivers new metadata
+2. **Metadata-only CRR** — schema, snapshots, and table properties replicate; data files stay local
+3. **Each region has its own streaming pipeline** — Kafka → Flink → Iceberg writes happen locally
+4. **Shared policy via GitOps** — same thresholds, same triggers, deployed by CI/CD
+5. **Idempotent compaction** — if a table is already healthy (few files, good sizes), the janitor skips it regardless of why it's healthy
+6. **Each region cleans its own orphans** — no cross-region orphan concerns since data files are never replicated
 
-**Conclusion:** Always compact locally. The 20:1 transfer-to-compute cost ratio makes cross-region shipping uneconomical at any scale. Full analysis: [Multi-Region Strategy](docs/multiregion-strategy.md)
+**Conclusion:** Always compact locally. Replicate metadata only. The 20:1 transfer-to-compute cost ratio makes cross-region data shipping uneconomical at any scale. Full analysis: [Multi-Region Strategy](docs/multiregion-strategy.md)
 
 ---
 
