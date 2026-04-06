@@ -147,9 +147,22 @@ PERFORMANCE COMPARISON: BEFORE vs AFTER COMPACTION
   TOTAL                                       858.4ms    685.6ms   -20.1%
 ```
 
-[Full results (gist)](https://gist.github.com/mystictraveler/190206e73d6c8cca29aac40211673b38)
+### 10M Row Benchmark (200 micro-batches)
 
-**51 files → 1 file** per table after compaction. Average file size increased from **~50KB to ~2MB**, reducing S3 API calls by 98%.
+| Query | Before | After | Change |
+|---|---|---|---|
+| q1_top_return_customers (4-table join) | 245.7ms | 132.0ms | **-46.3%** |
+| q19_brand_manager_zip (6-table join) | 248.2ms | 146.0ms | **-41.2%** |
+| q3_brand_revenue (3-table join) | 151.1ms | 101.6ms | **-32.7%** |
+| q25_cross_channel_returns (7-table join) | 400.5ms | 310.5ms | **-22.5%** |
+| **TOTAL** | **1842.9ms** | **1439.5ms** | **-21.9%** |
+
+### Performance Test Results
+
+- [50-batch benchmark (87K rows)](https://gist.github.com/mystictraveler/190206e73d6c8cca29aac40211673b38) — 20.1% improvement, 51 → 1 files per table
+- [200-batch benchmark (10M rows)](https://gist.github.com/mystictraveler/8cfbfae0bc10a26513a8b3a30ff70cf4) — 21.9% improvement, 201 → 1 files per table
+
+Compaction impact **increases with data volume**. Average file size grew from ~100KB to ~10MB, reducing S3 API calls by 99%.
 
 ---
 
