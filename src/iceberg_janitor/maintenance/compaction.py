@@ -1,10 +1,21 @@
-"""Small file compaction for Iceberg tables."""
+"""Small file compaction for Iceberg tables.
+
+Provides both a synchronous local implementation (``compact_files``) and an
+asynchronous orchestrated path (``compact_files_async``) that routes large
+tables to Flink while keeping small tables in-process.
+"""
 
 from __future__ import annotations
+
+from typing import TYPE_CHECKING
 
 import structlog
 
 from pyiceberg.catalog import Catalog
+
+if TYPE_CHECKING:
+    from iceberg_janitor.execution.base import CompactionJob
+    from iceberg_janitor.execution.orchestrator import CompactionOrchestrator, PipelineRecord
 
 logger = structlog.get_logger()
 
@@ -16,7 +27,7 @@ def compact_files(
     small_file_threshold_bytes: int = 8 * 1024 * 1024,
     dry_run: bool = False,
 ) -> dict:
-    """Compact small data files in an Iceberg table.
+    """Compact small data files in an Iceberg table (local, in-process).
 
     Uses PyIceberg's rewrite_files to merge small files into larger ones
     approaching the target file size.
@@ -93,3 +104,43 @@ def compact_files(
         "total_small_bytes": total_small_bytes,
         "compacted": True,
     }
+
+
+def compact_files_async(
+    orchestrator: CompactionOrchestrator,
+    job: CompactionJob,
+) -> PipelineRecord:
+    """Run compaction through the orchestrator, routing large tables to Flink.
+
+    This is the preferred entry point for production workloads.  The
+    orchestrator's :class:`ExecutionRouter` decides whether to run locally or
+    submit to a Flink cluster based on estimated data size and cluster
+    availability.
+
+    The call blocks until the compaction pipeline reaches a terminal state
+    (DONE or FAILED).
+
+    Args:
+        orchestrator: Fully configured :class:`CompactionOrchestrator`.
+        job: Compaction job descriptor with estimated size information.
+
+    Returns:
+        :class:`PipelineRecord` containing the final state, metrics, and any
+        error information.
+    """
+    log = logger.bind(
+        job_id=job.job_id,
+        table_id=job.table_id,
+        estimated_data_size_mb=round(job.estimated_data_size_bytes / (1024 * 1024), 2),
+    )
+    log.info("compact_files_async_starting")
+
+    record = orchestrator.run_compaction_pipeline(job)
+
+    log.info(
+        "compact_files_async_complete",
+        state=record.state.value,
+        attempts=record.attempt,
+        error=record.error,
+    )
+    return record

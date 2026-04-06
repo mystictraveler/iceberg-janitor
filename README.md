@@ -1,194 +1,189 @@
 # iceberg-janitor
 
-**Knative-powered, catalog-only Iceberg table maintenance for streaming workloads.**
+**Knative-powered, catalog-only Iceberg table maintenance with adaptive scheduling, Flink-based compaction, and a self-correcting feedback loop.**
 
-Solves the small-file, snapshot explosion, and metadata bloat problems that occur when streaming data continuously writes to Apache Iceberg tables — without requiring direct S3 access or DuckDB. The only external dependency is the Iceberg catalog (REST, AWS Glue, Hive, or any PyIceberg-supported catalog).
+Solves the small-file, snapshot explosion, and metadata bloat problems that occur when streaming data (Flink, Spark, etc.) continuously writes to Apache Iceberg tables. The janitor acts as a **maintenance cluster** — orchestrating health assessment, policy evaluation, and compaction execution — with the only hard dependency being the Iceberg catalog (REST, AWS Glue, Hive, or any PyIceberg-supported backend).
 
-> **Evolution:** This project started as a K8s-native implementation using CronJobs and Deployments, then migrated to a fully **Knative** architecture — Knative Serving for scale-to-zero API/maintenance execution, Knative Eventing PingSource for scheduled maintenance, and KafkaSource for event-driven triggers on Kafka commits. The Helm chart still supports plain K8s mode (`knative.enabled: false`) for environments without Knative.
+---
+
+## Table of Contents
+
+- [The Problem](#the-problem)
+- [Architecture](#architecture)
+- [How It Works](#how-it-works)
+- [Benchmark Results](#benchmark-results)
+- [Quick Start](#quick-start)
+- [CLI Reference](#cli-reference)
+- [Configuration](#configuration)
+- [Execution Model](#execution-model)
+- [Adaptive Feedback Loop](#adaptive-feedback-loop)
+- [REST API](#rest-api)
+- [TPC-DS Test Suite](#tpc-ds-test-suite)
+- [Project Structure](#project-structure)
+- [Design Decisions](#design-decisions)
+- [Research](#research)
 
 ---
 
 ## The Problem
 
-When streaming engines (Flink, Spark Structured Streaming, etc.) write to Iceberg tables, each micro-batch commit creates:
+When streaming engines write to Iceberg tables, each micro-batch commit creates:
 
-- **Small files** — thousands of tiny Parquet files (often < 1 MB) that defeat columnar read benefits
-- **Snapshot explosion** — hundreds of snapshots per hour, bloating metadata
-- **Manifest bloat** — deep manifest trees that slow query planning
-- **Orphan files** — unreferenced files from failed writes consuming storage
+| Symptom | Cause | Impact |
+|---|---|---|
+| **Thousands of tiny files** | Each Flink checkpoint / Spark batch creates new Parquet files | Defeats columnar read benefits, explodes S3 API calls |
+| **Snapshot explosion** | Every commit = new snapshot | Metadata trees grow unbounded |
+| **Manifest bloat** | Deep manifest chains from frequent commits | Query planning slows to a crawl |
+| **Orphan files** | Failed writes, interrupted compaction | Storage costs grow silently |
 
-These compound over time: the more data streams in, the worse queries get. Without automated maintenance, table performance degrades until someone manually intervenes.
-
-## The Solution
-
-iceberg-janitor provides automated, policy-driven table maintenance that:
-
-1. **Assesses health** via the Iceberg catalog API (file counts, size distributions, snapshot stats, partition hotspots)
-2. **Evaluates policies** with configurable per-table thresholds and tunable triggers
-3. **Executes maintenance** — compaction, snapshot expiration, orphan cleanup, manifest rewriting
-4. **Adapts automatically** — access-frequency tracking prioritizes hot tables; a feedback loop measures compaction effectiveness and self-adjusts
-
----
-
-## Design Philosophy
-
-### Catalog-only architecture
-
-Every operation goes through the Iceberg catalog interface. No direct S3/GCS/HDFS access for metadata reads. This means:
-
-```
-                          PyIceberg Catalog API
-                                  │
-             ┌────────────────────┼────────────────────┐
-             │                    │                     │
-        REST Catalog        AWS Glue Catalog      Hive Metastore
-```
-
-Swap your catalog, swap your storage, swap your query engine — iceberg-janitor works the same way. The access pattern does not change.
-
-**Why not DuckDB for metadata?** The original design used DuckDB's `iceberg_scan()` to query metadata by scanning S3 directly. This created a hard dependency on S3 credentials and the DuckDB iceberg extension — bypassing the catalog entirely. The refactored design uses `table.scan().plan_files()` and `table.metadata.snapshots` through PyIceberg, which routes through whatever catalog you've configured. DuckDB is still available as an optional dependency (`pip install iceberg-janitor[query]`) for the JMeter benchmarking suite, but is not required for any maintenance operation.
-
-### From K8s-native to Knative
-
-The original implementation used standard K8s primitives — a CronJob for scheduled maintenance and a Deployment for the long-running controller. This worked but had drawbacks: CronJob pods stay scheduled even when idle, and the controller polls the catalog continuously. The migration to Knative replaced these with event-driven, scale-to-zero components:
-
-| Concern | Implementation |
-|---|---|
-| **API + maintenance execution** | Knative Serving — scales to zero between maintenance runs |
-| **Scheduled maintenance** | Knative PingSource — sends CloudEvent every 15 min |
-| **Event-driven maintenance** | Knative KafkaSource — reacts to Kafka commit events |
-| **Infrastructure** (MinIO, Kafka, REST Catalog) | Standard K8s Deployments |
-
-**Why the migration?** Three reasons:
-1. **Cost** — Knative Serving scales to zero. You pay only for actual maintenance compute, not idle pods.
-2. **Latency** — Event-driven triggers (KafkaSource) react to commits immediately instead of waiting for the next 15-minute poll cycle.
-3. **Simplicity** — One Knative Service replaces both the CronJob and the controller Deployment. CloudEvents provide a uniform interface for all trigger types.
-
-The Helm chart supports both modes via `knative.enabled: true|false` for environments without Knative. The same Docker image works for CLI, CronJob, and Knative — only the entrypoint differs.
-
-### Maps 1:1 to Iceberg spec actions
-
-The REST API uses the exact Iceberg action vocabulary:
-
-| API Endpoint | Iceberg Action |
-|---|---|
-| `POST /v1/tables/{id}/rewrite-data-files` | `rewriteDataFiles` (binpack/sort/zorder) |
-| `POST /v1/tables/{id}/expire-snapshots` | `expireSnapshots` |
-| `POST /v1/tables/{id}/delete-orphan-files` | `deleteOrphanFiles` |
-| `POST /v1/tables/{id}/rewrite-manifests` | `rewriteManifests` |
-| `POST /v1/tables/{id}/rewrite-position-delete-files` | `rewritePositionDeleteFiles` (V2/V3) |
-| `POST /v1/tables/{id}/maintain` | All of the above in recommended order |
-| `GET /v1/tables/{id}/health` | No Iceberg equivalent — unique value |
-
-The Iceberg REST Catalog spec has **zero maintenance endpoints** (it's a metadata protocol only). Every vendor builds proprietary maintenance. This API fills that gap as an open standard.
-
-### Adaptive maintenance with feedback loop
-
-Static thresholds don't work in enterprise environments where tables have vastly different access patterns. The adaptive system creates a self-correcting loop:
-
-```
-Query engine reports access → AccessTracker classifies heat (hot/warm/cold)
-→ AdaptivePolicyEngine adjusts thresholds → Scheduler prioritizes
-→ Compaction runs → FeedbackLoop measures effectiveness
-→ Priority adjusted for next cycle
-```
-
-- **Hot tables** (high query frequency) get 0.5x thresholds — compact sooner
-- **Cold tables** (rarely queried) get 3x thresholds — compact less, save resources
-- **Ineffective compaction** (didn't improve query latency) gets deprioritized automatically
+Without automated maintenance, **query performance degrades continuously** until manual intervention.
 
 ---
 
 ## Architecture
 
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│                        Knative Serving                          │
-│  ┌──────────┐  ┌───────────┐  ┌────────────┐  ┌────────────┐  │
-│  │ REST API │  │ CloudEvent│  │  Analyzer   │  │Maintenance │  │
-│  │ /v1/...  │  │ Handler   │  │ (catalog   │  │ (compact,  │  │
-│  │          │  │ /ce       │  │  API only)  │  │  expire,   │  │
-│  └──────────┘  └───────────┘  └────────────┘  │  orphans)  │  │
-│                                                └────────────┘  │
-│  ┌──────────────────────────────────────────────────────────┐  │
-│  │              Policy Engine + Strategy Layer               │  │
-│  │  Triggers │ Scheduler │ AccessTracker │ FeedbackLoop     │  │
-│  └──────────────────────────────────────────────────────────┘  │
-└──────────────────────────┬──────────────────────────────────────┘
+┌────────────────────────────────────────────────────────────────────┐
+│                    Janitor Maintenance Cluster                      │
+│                       (Knative Serving)                             │
+│                                                                    │
+│  ┌──────────┐  ┌────────────┐  ┌──────────────┐  ┌────────────┐  │
+│  │ REST API │  │ CloudEvent │  │   Analyzer    │  │  Policy     │  │
+│  │ /v1/...  │  │ Handler    │  │ (catalog-only)│  │  Engine     │  │
+│  └──────────┘  └────────────┘  └──────────────┘  └────────────┘  │
+│                                                                    │
+│  ┌──────────────────────────────────────────────────────────────┐  │
+│  │                    Execution Router                           │  │
+│  │                                                              │  │
+│  │  table metadata ──→ size estimate ──→ route decision         │  │
+│  │                        │                    │                │  │
+│  │                   < threshold          > threshold           │  │
+│  │                        │                    │                │  │
+│  │                   LocalExecutor        FlinkExecutor         │  │
+│  │                   (in-process)         (REST API submit)     │  │
+│  └──────────────────────────────────────────────────────────────┘  │
+│                                                                    │
+│  ┌──────────────────────────────────────────────────────────────┐  │
+│  │                   Orchestrator (State Machine)                │  │
+│  │                                                              │  │
+│  │  IDLE → ANALYZING → SUBMITTING → RUNNING → POST_ANALYSIS    │  │
+│  │                                         → FAILED → RETRY    │  │
+│  │                                                              │  │
+│  │  + AccessTracker  + AdaptivePolicyEngine  + FeedbackLoop     │  │
+│  └──────────────────────────────────────────────────────────────┘  │
+│                                                                    │
+│  ┌──────────┐  ┌────────────┐  ┌──────────────┐                  │
+│  │ Triggers │  │ Scheduler  │  │  Prometheus   │                  │
+│  │ (commit, │  │ (priority, │  │  Metrics      │                  │
+│  │  time,   │  │  rate limit│  │               │                  │
+│  │  size)   │  │  windows)  │  │               │                  │
+│  └──────────┘  └────────────┘  └──────────────┘                  │
+└──────────────────────────┬─────────────────────────────────────────┘
                            │
-              ┌────────────┼────────────────┐
-              │            │                │
-   ┌──────────────┐ ┌────────────┐ ┌──────────────┐
-   │ PingSource   │ │ KafkaSource│ │ Manual CLI   │
-   │ (scheduled)  │ │ (events)   │ │ (on-demand)  │
-   └──────────────┘ └────────────┘ └──────────────┘
+          ┌────────────────┼────────────────────┐
+          │                │                    │
+     PingSource       KafkaSource          Manual CLI
+     (scheduled)      (Kafka commits)      (on-demand)
+                           │
+                           ▼
+              ┌─────────────────────────┐
+              │   Flink Cluster (K8s)    │
+              │   + Karpenter autoscale  │
+              │                         │
+              │  FlinkCompactionJob.java │
+              │  - rewriteDataFiles      │
+              │  - binpack/sort/zorder   │
+              │  - partition filters     │
+              └─────────────────────────┘
+                           │
+                           ▼
+              ┌─────────────────────────┐
+              │    Iceberg Catalog       │
+              │  (REST / Glue / Hive)    │
+              └──────────┬──────────────┘
+                         │
+                         ▼
+              ┌─────────────────────────┐
+              │   S3 / MinIO / GCS      │
+              └─────────────────────────┘
 ```
+
+---
+
+## How It Works
+
+### 1. Assess (catalog-only)
+The analyzer queries table health through the **Iceberg catalog API** — `table.scan().plan_files()` and `table.metadata.snapshots`. No DuckDB, no direct S3 access. Works identically with REST Catalog, AWS Glue, or Hive Metastore.
+
+### 2. Decide (policy + triggers)
+The policy engine evaluates per-table thresholds. Triggers fire based on commit count, file count, elapsed time, or data size. The adaptive layer adjusts thresholds based on access patterns — hot tables compact sooner.
+
+### 3. Route (smart execution)
+The execution router checks table size against a configurable threshold:
+- **Small tables** (< 1 GB default): compacted **in-process** within the janitor pod using PyIceberg
+- **Large tables** (> 1 GB): submitted to a **Flink cluster** via REST API with full execution context (catalog URI, credentials, strategy, partition filters)
+
+### 4. Measure (feedback loop)
+After compaction, the feedback loop records before/after metrics and computes effectiveness. High effectiveness → boost priority for next cycle. Low effectiveness → reduce priority to avoid wasting compute.
+
+---
+
+## Benchmark Results
+
+TPC-DS benchmark with 24 Iceberg tables, 7 streaming fact tables, 10 complex join queries:
+
+```
+PERFORMANCE COMPARISON: BEFORE vs AFTER COMPACTION
+======================================================================
+  Query                                        Before      After     Change
+  ---------------------------------------- ---------- ---------- ----------
+  q7_promo_impact (5-table join)              134.2ms     72.3ms   -46.1% faster
+  q25_cross_channel_returns (7-table join)    142.4ms    103.5ms   -27.4% faster
+  q1_top_return_customers (4-table join)       76.5ms     61.9ms   -19.1% faster
+  q3_brand_revenue (3-table join)              53.8ms     44.4ms   -17.5% faster
+  q13_demo_store_sales (6-table join)          86.4ms     72.9ms   -15.6% faster
+  q43_weekly_store_sales (3-table join)        54.3ms     46.1ms   -15.0% faster
+  ---------------------------------------- ---------- ---------- ----------
+  TOTAL                                       858.4ms    685.6ms   -20.1%
+```
+
+[Full results (gist)](https://gist.github.com/mystictraveler/190206e73d6c8cca29aac40211673b38)
+
+**51 files → 1 file** per table after compaction. Average file size increased from **~50KB to ~2MB**, reducing S3 API calls by 98%.
 
 ---
 
 ## Quick Start
 
 ### Prerequisites
-
-- Docker
-- minikube or kind
-- kubectl
-- (Optional) Knative CLI (`kn`)
+- Docker, kubectl, minikube or kind
+- Python 3.11+
 
 ### Local Development
 
 ```bash
-# 1. Create cluster with Knative
-make kind-setup-knative
+# 1. Cluster with Knative
+make kind-setup-knative    # or: minikube start + make knative-setup
 
-# 2. Build and load image
-make docker-build
-make docker-load
-
-# 3. Deploy the full stack (MinIO + Kafka + REST Catalog + Knative services)
+# 2. Build and deploy
+make docker-build && make docker-load
 make dev-up
 
-# 4. Generate test data (creates the small-file problem)
-make generate-data
+# 3. Port-forward services
+kubectl -n iceberg-janitor port-forward svc/minio 9000:9000 &
+kubectl -n iceberg-janitor port-forward svc/rest-catalog 8181:8181 &
 
-# 5. Check table health via CLI
-janitor analyze default.events \
-  --catalog-uri http://localhost:8181 \
-  --warehouse s3://warehouse/ \
-  --s3-endpoint http://localhost:9000
+# 4. Run TPC-DS benchmark (creates tables, streams data, compacts, compares)
+pip install -e ".[query,dev]"
+NUM_BATCHES=50 pytest tests/test_tpcds_benchmark.py -v -s
 
-# 6. Run maintenance
-janitor maintain default.events \
-  --catalog-uri http://localhost:8181 \
-  --warehouse s3://warehouse/ \
-  --s3-endpoint http://localhost:9000 \
-  --dry-run
-```
-
-### CLI Commands
-
-```bash
-# Health assessment
-janitor analyze <table_id> --catalog-uri ... --warehouse ...
-
-# Full policy-based maintenance
-janitor maintain <table_id> --catalog-uri ... --warehouse ... [--dry-run]
-
-# Manual overrides
-janitor compact <table_id> --catalog-uri ... --warehouse ... [--partition X] [--dry-run]
-janitor expire-snapshots <table_id> --catalog-uri ... --warehouse ... [--retention-hours 168]
-janitor cleanup-orphans <table_id> --catalog-uri ... --warehouse ... [--dry-run]
-
-# Inspect trigger state
-janitor trigger-status <table_id> --catalog-uri ... --warehouse ...
-
-# Start long-running controller
-janitor controller config.yaml
+# 5. Run feedback loop validation
+pytest tests/test_feedback_loop.py -v -s
 ```
 
 ### Catalog Configuration
 
-```python
+```bash
 # REST Catalog (local dev)
 janitor analyze db.events --catalog-uri http://rest-catalog:8181 --warehouse s3://warehouse/
 
@@ -201,37 +196,32 @@ janitor analyze db.events --catalog-uri thrift://hive:9083 --warehouse s3://my-b
 
 ---
 
-## Project Structure
+## CLI Reference
 
-```
-iceberg-janitor/
-├── src/iceberg_janitor/
-│   ├── analyzer/          # Health assessment via catalog API (no DuckDB)
-│   ├── maintenance/       # Compaction, snapshot expiry, orphan cleanup
-│   ├── policy/            # Per-table thresholds, trigger configuration
-│   ├── strategy/          # Triggers, scheduler, access tracker, feedback loop
-│   ├── api/               # FastAPI REST API + CloudEvents handler
-│   ├── runner/            # Executor, cron entrypoint, controller
-│   ├── metrics/           # Prometheus instrumentation
-│   ├── cli/               # Click CLI
-│   └── catalog.py         # Catalog connection factory
-├── manifests/             # Kustomize manifests (base + dev)
-│   └── dev/               # MinIO, Kafka, REST Catalog, Knative services
-├── helm/                  # Helm chart (supports both CronJob and Knative modes)
-├── flink-jobs/            # Java Flink job: Kafka → Iceberg streaming
-├── jmeter/                # Performance benchmarking (before/after compaction)
-├── openapi/               # OpenAPI 3.1 spec (v1 original + v2 simplified)
-├── scripts/               # kind-setup, dev-stack-up/down, data generator
-├── docker/                # Dockerfiles
-├── tests/                 # pytest suite
-└── docs/                  # Research: Tableflow comparison, Iceberg spec analysis
+```bash
+# Health assessment
+janitor analyze <table_id> --catalog-uri ... --warehouse ...
+
+# Full policy-based maintenance
+janitor maintain <table_id> --catalog-uri ... --warehouse ... [--dry-run]
+
+# Manual overrides (immediate execution)
+janitor compact <table_id> --catalog-uri ... --warehouse ... [--partition X] [--dry-run]
+janitor expire-snapshots <table_id> --catalog-uri ... [--retention-hours 168]
+janitor cleanup-orphans <table_id> --catalog-uri ... [--dry-run]
+
+# Inspect trigger state
+janitor trigger-status <table_id> --catalog-uri ... --warehouse ...
+
+# Long-running controller
+janitor controller config.yaml
 ```
 
 ---
 
-## Policy Configuration
+## Configuration
 
-Policies are defined in a ConfigMap (or Helm values) with per-table overrides:
+### Policy (ConfigMap / Helm values)
 
 ```yaml
 policy:
@@ -246,16 +236,26 @@ policy:
     time_trigger_interval_minutes: 30
 
   table_overrides:
-    default.high_volume_events:
+    high_volume.events:
       trigger_mode: auto
       max_small_file_ratio: 0.2
-      max_snapshots: 50
       commit_count_trigger_threshold: 20
 ```
 
-### Adaptive Policy (Enterprise)
+### Execution Routing
 
-When enabled, thresholds are dynamically adjusted based on access patterns:
+```yaml
+execution:
+  executor: auto              # auto | local | flink
+  local_max_data_bytes: 1073741824  # 1 GB — below this, compact in-process
+  flink_rest_url: http://flink-jobmanager:8081
+  flink_default_parallelism: 4
+  flink_max_parallelism: 32
+  max_concurrent_jobs: 5
+  job_timeout_seconds: 3600
+```
+
+### Adaptive Policy
 
 ```yaml
 adaptive:
@@ -269,23 +269,207 @@ adaptive:
 
 ---
 
-## Research
+## Execution Model
 
-- **[Tableflow Comparison](docs/research-tableflow-comparison.md)** — Detailed comparison with Confluent Cloud's Tableflow maintenance strategy
-- **[Iceberg Maintenance API Analysis](docs/research-iceberg-maintenance-api.md)** — Gap analysis of the Iceberg REST Catalog spec, V3 format changes, and API simplification rationale
+### The Janitor as Maintenance Cluster
+
+The janitor is not just an orchestrator — it's a **maintenance cluster** that does real work:
+
+| Table Size | Where Compaction Runs | Why |
+|---|---|---|
+| **< 1 GB** | In the janitor pod (PyIceberg `table.overwrite()`) | Fast, no cluster overhead, sub-second latency |
+| **> 1 GB** | Flink cluster (`rewriteDataFiles` action) | Distributed compute, handles TB-scale tables |
+
+The execution router makes this decision automatically based on table metadata (no data scan needed — file sizes are in the catalog).
+
+### Flink Cluster Sizing (with Karpenter)
+
+The Flink cluster auto-scales via Karpenter:
+
+| Scenario | TaskManagers | TM Memory | Parallelism | Time |
+|---|---|---|---|---|
+| 10 GB table | 2 | 4 GB | 4 | ~2 min |
+| 100 GB table | 4 | 8 GB | 8 | ~10 min |
+| 1 TB table | 8-16 | 8 GB | 16-32 | ~30 min |
+
+**Karpenter strategy:**
+- Pending Flink TaskManager pods trigger node scale-up
+- Compute-optimized instances (c5/c6i) for compaction workloads
+- Nodes scale down after 5 min idle (consolidation policy)
+- Zero TaskManagers when no compaction is running → zero cost
+
+### Execution Context
+
+The janitor passes full execution context to Flink:
+
+```json
+{
+  "table_id": "analytics.events",
+  "catalog_uri": "http://rest-catalog:8181",
+  "warehouse": "s3://warehouse/",
+  "catalog_type": "rest",
+  "catalog_properties": {"s3.endpoint": "http://minio:9000", ...},
+  "strategy": "binpack",
+  "target_file_size_bytes": 134217728,
+  "partition_filter": "dt >= '2026-04-01'",
+  "estimated_data_size_bytes": 53687091200
+}
+```
+
+Flink executors receive this as program arguments, connect to the catalog independently, and execute `Actions.forTable(table).rewriteDataFiles()`.
 
 ---
 
-## Key Decisions
+## Adaptive Feedback Loop
+
+The self-correcting cycle that gets smarter over time:
+
+```
+┌─────────────┐     ┌──────────────────┐     ┌────────────────┐
+│ Query Engine │────→│  AccessTracker   │────→│ Classification │
+│ (events API) │     │ (heat scoring)   │     │ hot/warm/cold  │
+└─────────────┘     └──────────────────┘     └───────┬────────┘
+                                                      │
+                    ┌──────────────────┐              │
+                    │  Adaptive Policy │◄─────────────┘
+                    │  (adjust thresh) │
+                    └───────┬──────────┘
+                            │
+                    ┌───────▼──────────┐
+                    │  Compaction      │
+                    │  (local / Flink) │
+                    └───────┬──────────┘
+                            │
+                    ┌───────▼──────────┐     ┌──────────────────┐
+                    │  FeedbackLoop    │────→│ Priority Adjust  │
+                    │  (effectiveness) │     │ (back to tracker)│
+                    └──────────────────┘     └──────────────────┘
+```
+
+| Access Pattern | Policy Adjustment | Compaction Behavior |
+|---|---|---|
+| **Hot** (>100 QPH) | 0.5x thresholds | Compact sooner, higher priority |
+| **Warm** (10-100 QPH) | 1.0x (default) | Normal maintenance |
+| **Cold** (<10 QPH) | 3.0x thresholds | Compact less, save resources |
+| **Effective compaction** | Boost priority | Keep compacting aggressively |
+| **Ineffective compaction** | Reduce priority | Skip next cycle, save compute |
+
+---
+
+## REST API
+
+Simplified to 9 endpoints, mapped 1:1 to Iceberg's canonical maintenance actions:
+
+| Endpoint | Iceberg Action |
+|---|---|
+| `GET /v1/tables/{id}/health` | Health assessment (no Iceberg equivalent) |
+| `POST /v1/tables/{id}/rewrite-data-files` | `rewriteDataFiles` (binpack/sort/zorder) |
+| `POST /v1/tables/{id}/expire-snapshots` | `expireSnapshots` |
+| `POST /v1/tables/{id}/delete-orphan-files` | `deleteOrphanFiles` |
+| `POST /v1/tables/{id}/rewrite-manifests` | `rewriteManifests` |
+| `POST /v1/tables/{id}/rewrite-position-delete-files` | `rewritePositionDeleteFiles` (V2/V3) |
+| `POST /v1/tables/{id}/maintain` | All actions in recommended order |
+| `GET /v1/health` | Service health |
+| `GET /v1/metrics` | Prometheus metrics |
+
+Full OpenAPI 3.1 spec: [`openapi/iceberg-janitor-api-v2.yaml`](openapi/iceberg-janitor-api-v2.yaml)
+
+---
+
+## TPC-DS Test Suite
+
+24 TPC-DS tables as Iceberg tables, with streaming micro-batch writes to 7 fact tables:
+
+```bash
+# Run with 50 micro-batches per fact table (~87K total rows)
+NUM_BATCHES=50 pytest tests/test_tpcds_benchmark.py -v -s
+
+# Run with 200 micro-batches (~10M total rows)
+NUM_BATCHES=200 pytest tests/test_tpcds_benchmark.py -v -s
+```
+
+**10 benchmark queries** with 3-7 table joins:
+- `q1`: Top customers by returns (4-table join)
+- `q7`: Promotion impact on sales (5-table join)
+- `q13`: Store sales by demographics (6-table join)
+- `q25`: Cross-channel return analysis (7-table join)
+- `q43`: Weekly store sales breakdown (3-table join)
+- `q46`: Customer spend by city (6-table join)
+- And 4 more...
+
+**Feedback loop tests** (22 tests):
+```bash
+pytest tests/test_feedback_loop.py -v -s
+```
+
+---
+
+## Project Structure
+
+```
+iceberg-janitor/
+├── src/iceberg_janitor/
+│   ├── analyzer/          # Health assessment via catalog API (no DuckDB)
+│   ├── maintenance/       # Compaction, snapshot expiry, orphan cleanup
+│   ├── execution/         # Executor backends: local (PyIceberg), Flink (REST)
+│   │   ├── base.py        # Abstract CompactionExecutor + CompactionJob
+│   │   ├── local.py       # In-process executor for small tables
+│   │   ├── flink.py       # Flink REST API executor for large tables
+│   │   ├── router.py      # Smart routing based on table size
+│   │   └── orchestrator.py # State machine: analyze → submit → monitor → feedback
+│   ├── strategy/          # Triggers, scheduler, access tracker, feedback loop
+│   ├── policy/            # Per-table thresholds, trigger config, execution config
+│   ├── api/               # FastAPI REST API + CloudEvents handler
+│   ├── runner/            # Shared executor, cron entrypoint, controller
+│   ├── metrics/           # Prometheus instrumentation
+│   ├── cli/               # Click CLI with manual overrides
+│   └── catalog.py         # Catalog connection factory
+├── flink-jobs/            # Java: FlinkIcebergSink + FlinkCompactionJob
+├── manifests/dev/         # K8s: MinIO, Kafka, REST Catalog, Knative, Flink, Karpenter
+├── helm/                  # Helm chart (CronJob mode + Knative mode)
+├── openapi/               # OpenAPI 3.1 spec (v1 + v2 simplified)
+├── jmeter/                # DuckDB query benchmark suite
+├── scripts/               # TPC-DS schema, data generators, setup scripts
+├── tests/                 # TPC-DS benchmark + feedback loop + policy + analyzer tests
+└── docs/                  # Research: Tableflow comparison, Iceberg spec, Flink sizing
+```
+
+---
+
+## Design Decisions
 
 | Decision | Rationale |
 |---|---|
-| **Catalog-only metadata access** | Portability across REST, Glue, Hive. No S3 credential leakage to the maintenance layer. |
-| **DuckDB as optional dependency** | Core maintenance should not require a query engine. DuckDB is available for benchmarking. |
-| **Knative over CronJobs** | Scale-to-zero saves resources. Event-driven > polling. Helm chart supports both modes. |
-| **Endpoint names match Iceberg actions** | `rewrite-data-files` not `compact`. Self-documenting for Iceberg users. |
-| **Adaptive policy with feedback loop** | Static thresholds don't work across diverse enterprise workloads. |
-| **V2 simplified API (9 endpoints)** | V1 had 17 endpoints duplicating catalog responsibilities. V2 focuses on what the catalog can't do. |
+| **Catalog-only metadata** | Portability across REST, Glue, Hive. No S3 credentials in the maintenance layer. |
+| **DuckDB as optional extra** | Core maintenance doesn't need a query engine. DuckDB available for benchmarking via `pip install .[query]`. |
+| **K8s → Knative evolution** | Scale-to-zero saves cost. Event-driven (KafkaSource) beats polling. Helm supports both modes. |
+| **Janitor as maintenance cluster** | Small tables compact in-process (fast, no overhead). Large tables go to Flink (distributed, handles TBs). |
+| **Flink for heavy compute** | Iceberg's `rewriteDataFiles` Action API is production-proven. Karpenter scales compute to zero when idle. |
+| **Adaptive feedback loop** | Static thresholds fail in diverse enterprise environments. Self-correcting prioritization allocates compute where it matters. |
+| **API names match Iceberg actions** | `rewrite-data-files` not `compact`. Self-documenting for Iceberg users. |
+| **TPC-DS as benchmark** | Real-world query complexity with multi-table joins. Proves compaction impact on actual workloads. |
+
+---
+
+## Evolution
+
+This project evolved through several architectural stages:
+
+1. **K8s CronJob** — Simple scheduled maintenance every 15 minutes
+2. **Long-running controller** — Poll-based catalog watching with trigger evaluation
+3. **Knative migration** — Scale-to-zero Serving + event-driven PingSource/KafkaSource
+4. **Catalog-only refactor** — Removed DuckDB/S3 dependencies from core, everything through PyIceberg
+5. **Adaptive scheduling** — Access frequency tracking, heat classification, feedback loop
+6. **Flink execution** — Smart routing: small tables in-process, large tables on Flink with Karpenter autoscaling
+7. **TPC-DS validation** — 24-table benchmark proving 15-20% query improvement after compaction
+
+---
+
+## Research
+
+- [Tableflow Comparison](docs/research-tableflow-comparison.md) — vs. Confluent Cloud's managed Iceberg maintenance
+- [Iceberg Maintenance API Analysis](docs/research-iceberg-maintenance-api.md) — Gap analysis of the REST Catalog spec, V3 changes, API simplification
+- [Flink Cluster Sizing](docs/flink-sizing.md) — TaskManager memory, parallelism, Karpenter autoscaling strategy
 
 ---
 

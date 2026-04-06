@@ -1,0 +1,221 @@
+---
+# Flink Session Cluster for compaction workloads
+# Components: JobManager (1 replica), TaskManagers (2 replicas), ConfigMap, Services
+
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: flink-config
+  namespace: iceberg-janitor
+  labels:
+    app: flink
+data:
+  flink-conf.yaml: |
+    jobmanager.rpc.address: flink-jobmanager
+    jobmanager.rpc.port: 6123
+    jobmanager.memory.process.size: 1024m
+    taskmanager.memory.process.size: 2048m
+    taskmanager.numberOfTaskSlots: 2
+    parallelism.default: 4
+    # Batch execution for compaction workloads
+    execution.runtime-mode: BATCH
+    # State backend (not critical for batch, but useful for recovery)
+    state.backend: hashmap
+    state.checkpoints.dir: file:///tmp/flink-checkpoints
+    # REST API
+    rest.port: 8081
+    rest.address: 0.0.0.0
+    rest.bind-address: 0.0.0.0
+    # Logging
+    env.log.dir: /opt/flink/log
+    # S3 / MinIO configuration (shared with Iceberg)
+    s3.endpoint: http://minio:9000
+    s3.path-style-access: true
+    s3.access-key: minioadmin
+    s3.secret-key: minioadmin
+    # Resource management
+    cluster.fine-grained-resource-management.enabled: true
+  log4j-console.properties: |
+    rootLogger.level = INFO
+    rootLogger.appenderRef.console.ref = ConsoleAppender
+    appender.console.name = ConsoleAppender
+    appender.console.type = CONSOLE
+    appender.console.layout.type = PatternLayout
+    appender.console.layout.pattern = %d{yyyy-MM-dd HH:mm:ss,SSS} %-5p %-60c %x - %m%n
+    logger.iceberg.name = org.apache.iceberg
+    logger.iceberg.level = INFO
+    logger.flink.name = org.apache.flink
+    logger.flink.level = INFO
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: flink-jobmanager
+  namespace: iceberg-janitor
+  labels:
+    app: flink
+    component: jobmanager
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: flink
+      component: jobmanager
+  template:
+    metadata:
+      labels:
+        app: flink
+        component: jobmanager
+    spec:
+      containers:
+        - name: jobmanager
+          image: flink:1.19.1-java11
+          command: ["/docker-entrypoint.sh"]
+          args: ["jobmanager"]
+          ports:
+            - containerPort: 6123
+              name: rpc
+            - containerPort: 8081
+              name: rest
+            - containerPort: 6124
+              name: blob
+          env:
+            - name: FLINK_PROPERTIES
+              value: ""
+          resources:
+            requests:
+              cpu: "500m"
+              memory: "1Gi"
+            limits:
+              cpu: "1"
+              memory: "1Gi"
+          volumeMounts:
+            - name: flink-config
+              mountPath: /opt/flink/conf/flink-conf.yaml
+              subPath: flink-conf.yaml
+            - name: flink-config
+              mountPath: /opt/flink/conf/log4j-console.properties
+              subPath: log4j-console.properties
+          livenessProbe:
+            httpGet:
+              path: /overview
+              port: rest
+            initialDelaySeconds: 30
+            periodSeconds: 10
+          readinessProbe:
+            httpGet:
+              path: /overview
+              port: rest
+            initialDelaySeconds: 20
+            periodSeconds: 5
+      volumes:
+        - name: flink-config
+          configMap:
+            name: flink-config
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: flink-taskmanager
+  namespace: iceberg-janitor
+  labels:
+    app: flink
+    component: taskmanager
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: flink
+      component: taskmanager
+  template:
+    metadata:
+      labels:
+        app: flink
+        component: taskmanager
+    spec:
+      containers:
+        - name: taskmanager
+          image: flink:1.19.1-java11
+          command: ["/docker-entrypoint.sh"]
+          args: ["taskmanager"]
+          ports:
+            - containerPort: 6122
+              name: rpc
+          env:
+            - name: FLINK_PROPERTIES
+              value: ""
+          resources:
+            requests:
+              cpu: "1"
+              memory: "2Gi"
+            limits:
+              cpu: "2"
+              memory: "2Gi"
+          volumeMounts:
+            - name: flink-config
+              mountPath: /opt/flink/conf/flink-conf.yaml
+              subPath: flink-conf.yaml
+            - name: flink-config
+              mountPath: /opt/flink/conf/log4j-console.properties
+              subPath: log4j-console.properties
+      volumes:
+        - name: flink-config
+          configMap:
+            name: flink-config
+      # Prefer scheduling on Flink-labelled nodes (Karpenter-provisioned)
+      affinity:
+        nodeAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 80
+              preference:
+                matchExpressions:
+                  - key: workload-type
+                    operator: In
+                    values:
+                      - flink-compaction
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: flink-jobmanager
+  namespace: iceberg-janitor
+  labels:
+    app: flink
+    component: jobmanager
+spec:
+  type: ClusterIP
+  selector:
+    app: flink
+    component: jobmanager
+  ports:
+    - name: rpc
+      port: 6123
+      targetPort: rpc
+    - name: rest
+      port: 8081
+      targetPort: rest
+    - name: blob
+      port: 6124
+      targetPort: blob
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: flink-jobmanager-rest
+  namespace: iceberg-janitor
+  labels:
+    app: flink
+    component: jobmanager
+spec:
+  type: ClusterIP
+  selector:
+    app: flink
+    component: jobmanager
+  ports:
+    - name: rest
+      port: 8081
+      targetPort: rest

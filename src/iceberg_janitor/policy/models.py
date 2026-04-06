@@ -167,6 +167,65 @@ class AdaptivePolicyConfig(BaseModel):
     )
 
 
+class ExecutionConfig(BaseModel):
+    """Configuration for the compaction execution layer.
+
+    Controls how the janitor routes compaction work between local (in-process
+    PyIceberg) and remote (Flink) executors.
+    """
+
+    executor: Literal["auto", "local", "flink", "spark"] = Field(
+        default="auto",
+        description=(
+            "Executor selection mode.  'auto' routes based on data size; "
+            "'local' and 'flink' force a specific backend; 'spark' is reserved "
+            "for future use."
+        ),
+    )
+    flink_rest_url: str = Field(
+        default="http://flink-jobmanager:8081",
+        description="Base URL for the Flink JobManager REST API",
+    )
+    flink_jar_id: str = Field(
+        default="",
+        description=(
+            "ID of the pre-uploaded compaction JAR on the Flink cluster.  "
+            "Obtain via GET /jars after uploading the fat JAR."
+        ),
+    )
+    local_max_data_bytes: int = Field(
+        default=1_073_741_824,  # 1 GiB
+        description=(
+            "Maximum data size in bytes for which the local executor is preferred.  "
+            "Tables larger than this are routed to Flink."
+        ),
+    )
+    flink_default_parallelism: int = Field(
+        default=4,
+        description="Default Flink job parallelism when not auto-calculated from data size",
+    )
+    flink_max_parallelism: int = Field(
+        default=32,
+        description="Upper bound on Flink job parallelism regardless of data size",
+    )
+    max_concurrent_jobs: int = Field(
+        default=5,
+        description="Global cap on concurrent compaction jobs across all tables",
+    )
+    job_timeout_seconds: int = Field(
+        default=3600,
+        description="Maximum wall-clock seconds before a running job is considered timed out",
+    )
+    retry_max_attempts: int = Field(
+        default=3,
+        description="Maximum number of submission attempts (including the original)",
+    )
+    retry_backoff_seconds: int = Field(
+        default=60,
+        description="Base back-off in seconds between retries (doubles on each attempt)",
+    )
+
+
 class PolicyConfig(BaseModel):
     """Top-level policy configuration, supporting per-table overrides."""
 
@@ -178,6 +237,10 @@ class PolicyConfig(BaseModel):
     adaptive: AdaptivePolicyConfig = Field(
         default_factory=AdaptivePolicyConfig,
         description="Adaptive policy engine configuration for access-frequency-based scheduling",
+    )
+    execution: ExecutionConfig = Field(
+        default_factory=ExecutionConfig,
+        description="Compaction execution layer configuration (local vs. Flink routing)",
     )
 
     def get_policy(self, table_id: str) -> TablePolicy:
