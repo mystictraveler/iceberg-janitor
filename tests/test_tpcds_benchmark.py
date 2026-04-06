@@ -245,6 +245,7 @@ def duckdb_conn():
     conn.execute(f"SET s3_secret_access_key='{S3_SECRET_KEY}';")
     conn.execute("SET s3_use_ssl=false;")
     conn.execute("SET s3_url_style='path';")
+    conn.execute("SET unsafe_enable_version_guessing=true;")
     return conn
 
 

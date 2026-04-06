@@ -228,18 +228,20 @@ def gen_small_dim(name: str, schema: pa.schema, n: int) -> pa.Table:
     for i in range(n):
         row = {}
         for f in schema:
-            if f.name.endswith("_sk"):
-                row[f.name] = i + 1
-            elif f.name.endswith("_id"):
-                row[f.name] = f"{name.upper()[:4]}{i:06d}"
-            elif f.type == pa.date32():
-                row[f.name] = _rand_date()
+            # Type-first matching to avoid name-based mismatches
+            if f.type == pa.int64():
+                row[f.name] = i + 1 if f.name.endswith("_sk") else _RNG.randint(1, 10000)
             elif f.type == pa.int32():
                 row[f.name] = _RNG.randint(1, 100)
-            elif f.type == pa.int64():
-                row[f.name] = _RNG.randint(1, 10000)
             elif f.type == pa.float64():
                 row[f.name] = round(_RNG.uniform(-10, 100), 2)
+            elif f.type == pa.date32():
+                row[f.name] = _rand_date()
+            elif f.type == pa.string():
+                if f.name.endswith("_id"):
+                    row[f.name] = f"{name.upper()[:4]}{i:06d}"
+                else:
+                    row[f.name] = f"{name}_{f.name}_{i}"
             else:
                 row[f.name] = f"{name}_{f.name}_{i}"
         rows.append(row)
