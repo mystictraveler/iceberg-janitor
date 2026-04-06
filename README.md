@@ -464,6 +464,66 @@ iceberg-janitor/
 
 ---
 
+## Multi-Region Considerations
+
+When Iceberg tables are replicated across regions via S3 Cross-Region Replication (CRR), compaction creates a decision point: compact locally in each region, or compact once and ship the compacted files?
+
+### The Core Trade-Off
+
+**Cross-region transfer costs 20x more than local compute:**
+
+| | Cost per GB |
+|---|---|
+| Local compaction compute | **$0.001** |
+| Cross-region data transfer | **$0.02** |
+
+### Strategy Comparison
+
+| Data Size | Compact Both Regions | Compact Once + Ship | Winner |
+|---|---|---|---|
+| 1 GB | $0.002 | $0.021 | **Compact both** (10x cheaper) |
+| 10 GB | $0.020 | $0.210 | **Compact both** (10x cheaper) |
+| 100 GB | $0.200 | $2.100 | **Compact both** (10x cheaper) |
+| 1 TB | $2.000 | $21.000 | **Compact both** (10x cheaper) |
+
+### Query Latency Impact (Simulation Results)
+
+Simulated with 2 DuckDB instances querying 3 TPC-DS fact tables across 2 regions:
+
+| Strategy | Overall Query Improvement |
+|---|---|
+| Only Region A compacted | **-33.0%** faster (Region A fast, B unchanged) |
+| Both regions compacted | **-60.2%** faster (both regions benefit) |
+| Benefit of local compaction in B | **+27.2%** additional improvement |
+
+Compacting only one region leaves the other region serving queries against uncompacted data — a 27% performance gap that persists until CRR delivers the compacted files (seconds to minutes of lag).
+
+### Recommended Architecture
+
+```
+Region A (us-east)                     Region B (eu-west)
+┌──────────────────────┐              ┌──────────────────────┐
+│ Janitor + Flink      │              │ Janitor + Flink      │
+│ (independent)        │              │ (independent)        │
+└──────────┬───────────┘              └──────────┬───────────┘
+           │                                     │
+┌──────────▼───────────┐    S3 CRR    ┌──────────▼───────────┐
+│ S3 (us-east)         │ ◄──────────► │ S3 (eu-west)         │
+└──────────────────────┘   metadata   └──────────────────────┘
+                           + data
+```
+
+**Design principles:**
+
+1. **Each region runs its own janitor + Flink cluster** — independent compaction, no cross-region coordination
+2. **Shared policy via GitOps** — same thresholds, same triggers, deployed by CI/CD
+3. **Idempotent compaction** — if CRR delivers compacted metadata before the local janitor runs, the health check sees a healthy table and skips compaction (zero wasted work)
+4. **Each region cleans its own orphans** — old small files from pre-compaction become orphans after CRR delivers new metadata
+
+**Conclusion:** Always compact locally. The 20:1 transfer-to-compute cost ratio makes cross-region shipping uneconomical at any scale. Full analysis: [Multi-Region Strategy](docs/multiregion-strategy.md)
+
+---
+
 ## Evolution
 
 This project evolved through several architectural stages:
@@ -475,6 +535,7 @@ This project evolved through several architectural stages:
 5. **Adaptive scheduling** — Access frequency tracking, heat classification, feedback loop
 6. **Flink execution** — Smart routing: small tables in-process, large tables on Flink with Karpenter autoscaling
 7. **TPC-DS validation** — 24-table benchmark proving 15-20% query improvement after compaction
+8. **Multi-region strategy** — Simulated 2-region compaction; proved local compaction is 10x cheaper than cross-region shipping
 
 ---
 
@@ -483,6 +544,7 @@ This project evolved through several architectural stages:
 - [Tableflow Comparison](docs/research-tableflow-comparison.md) — vs. Confluent Cloud's managed Iceberg maintenance
 - [Iceberg Maintenance API Analysis](docs/research-iceberg-maintenance-api.md) — Gap analysis of the REST Catalog spec, V3 changes, API simplification
 - [Flink Cluster Sizing](docs/flink-sizing.md) — TaskManager memory, parallelism, Karpenter autoscaling strategy
+- [Multi-Region Strategy](docs/multiregion-strategy.md) — Cost analysis: local compaction vs. cross-region shipping (with simulation results)
 
 ---
 
