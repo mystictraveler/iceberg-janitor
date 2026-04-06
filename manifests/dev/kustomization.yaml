@@ -10,3 +10,4 @@ resources:
   - knative-pingsource.yaml
   - knative-kafkasource.yaml
   - flink-cluster.yaml
+  - karpenter-provisioner.yaml
