@@ -6,4 +6,6 @@ resources:
   - minio.yaml
   - kafka.yaml
   - rest-catalog.yaml
-  - janitor-cronjob.yaml
+  - knative-serving.yaml
+  - knative-pingsource.yaml
+  - knative-kafkasource.yaml

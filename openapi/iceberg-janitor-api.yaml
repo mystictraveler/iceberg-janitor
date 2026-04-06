@@ -1,0 +1,1230 @@
+openapi: 3.1.0
+info:
+  title: Iceberg Janitor API
+  version: 1.0.0
+  description: |
+    REST API for Apache Iceberg table maintenance automation.
+
+    Iceberg Janitor provides health assessment and automated maintenance for
+    Iceberg tables, including data file compaction, snapshot expiration, orphan
+    file removal, manifest rewriting, sort order optimization, and partition
+    evolution.
+
+    All maintenance operations support a `dry_run` flag for safe previewing
+    of changes before execution.
+  contact:
+    name: Iceberg Janitor
+  license:
+    name: Apache-2.0
+    identifier: Apache-2.0
+
+servers:
+  - url: http://localhost:8000
+    description: Local development
+
+tags:
+  - name: Tables
+    description: Table listing and metadata
+  - name: Health
+    description: Table health assessment and analysis
+  - name: Maintenance
+    description: Table maintenance operations (compaction, expiration, orphan cleanup, etc.)
+  - name: Policy
+    description: Maintenance policy configuration
+  - name: Metadata
+    description: Table metadata inspection (snapshots, files, partitions)
+  - name: Operations
+    description: Service health and observability
+
+paths:
+  /api/v1/tables:
+    get:
+      operationId: listTables
+      summary: List all managed tables
+      tags: [Tables]
+      parameters:
+        - $ref: "#/components/parameters/LimitParam"
+        - $ref: "#/components/parameters/OffsetParam"
+        - name: namespace
+          in: query
+          schema:
+            type: string
+          description: Filter by Iceberg namespace
+      responses:
+        "200":
+          description: Paginated list of managed tables
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/PaginatedResponse"
+                  - type: object
+                    properties:
+                      items:
+                        type: array
+                        items:
+                          $ref: "#/components/schemas/TableInfo"
+              example:
+                items:
+                  - table_id: "analytics.events"
+                    namespace: "analytics"
+                    name: "events"
+                    location: "s3://warehouse/analytics/events"
+                    format_version: 2
+                    last_updated: "2026-04-05T10:30:00Z"
+                total: 42
+                limit: 20
+                offset: 0
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  /api/v1/tables/{table_id}/health:
+    get:
+      operationId: getTableHealth
+      summary: Get health report for a table
+      description: |
+        Returns the most recent cached health report for the table.
+        Use `POST /analyze` to trigger a fresh assessment.
+      tags: [Health]
+      parameters:
+        - $ref: "#/components/parameters/TableIdParam"
+      responses:
+        "200":
+          description: Health report
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HealthReportResponse"
+              example:
+                table_id: "analytics.events"
+                assessed_at: "2026-04-05T10:30:00Z"
+                is_healthy: false
+                needs_compaction: true
+                needs_snapshot_expiry: false
+                file_stats:
+                  file_count: 3200
+                  total_bytes: 5368709120
+                  avg_file_size_bytes: 1677722
+                  min_file_size_bytes: 1024
+                  max_file_size_bytes: 134217728
+                  median_file_size_bytes: 2097152
+                  small_file_count: 1800
+                  small_file_ratio: 0.5625
+                  total_mb: 5120.0
+                snapshot_stats:
+                  snapshot_count: 45
+                  oldest_snapshot_ts: "2026-03-01T00:00:00Z"
+                  newest_snapshot_ts: "2026-04-05T10:00:00Z"
+                size_distribution:
+                  - bucket: "<1MB"
+                    file_count: 500
+                    total_bytes: 262144000
+                  - bucket: "1-8MB"
+                    file_count: 1300
+                    total_bytes: 5452595200
+                hot_partitions:
+                  - partition: "dt=2026-04-05"
+                    file_count: 340
+                    total_bytes: 178257920
+                    avg_file_size_bytes: 524288
+                errors: []
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  /api/v1/tables/{table_id}/analyze:
+    post:
+      operationId: analyzeTable
+      summary: Trigger health analysis
+      description: |
+        Runs a fresh health assessment of the table, inspecting data files,
+        snapshots, partitions, and size distributions. The analysis is run
+        as a background task and the response includes a task ID.
+      tags: [Health]
+      parameters:
+        - $ref: "#/components/parameters/TableIdParam"
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/AnalyzeRequest"
+      responses:
+        "202":
+          description: Analysis triggered
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TaskResponse"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  /api/v1/tables/{table_id}/maintenance/compact:
+    post:
+      operationId: compactTable
+      summary: Trigger data file compaction
+      description: |
+        Rewrites small data files into larger files approaching the target file size.
+        This reduces the metadata overhead and improves scan performance.
+        Corresponds to the Iceberg `rewriteDataFiles` action.
+      tags: [Maintenance]
+      parameters:
+        - $ref: "#/components/parameters/TableIdParam"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CompactionRequest"
+            example:
+              target_file_size_bytes: 134217728
+              small_file_threshold_bytes: 8388608
+              dry_run: false
+      responses:
+        "202":
+          description: Compaction triggered
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CompactionResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  /api/v1/tables/{table_id}/maintenance/expire-snapshots:
+    post:
+      operationId: expireSnapshots
+      summary: Expire old snapshots
+      description: |
+        Removes snapshots older than the retention period while always keeping
+        a minimum number of recent snapshots. Expired snapshots' data files
+        are eligible for orphan cleanup if no other snapshot references them.
+      tags: [Maintenance]
+      parameters:
+        - $ref: "#/components/parameters/TableIdParam"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SnapshotExpirationRequest"
+            example:
+              retention_hours: 168
+              min_snapshots_to_keep: 5
+              dry_run: false
+      responses:
+        "202":
+          description: Snapshot expiration triggered
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SnapshotExpirationResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  /api/v1/tables/{table_id}/maintenance/remove-orphans:
+    post:
+      operationId: removeOrphans
+      summary: Remove orphan files
+      description: |
+        Identifies and removes data or metadata files in the table's storage
+        location that are not referenced by any current snapshot. Orphan files
+        typically result from failed writes, expired snapshots, or interrupted
+        compaction jobs.
+      tags: [Maintenance]
+      parameters:
+        - $ref: "#/components/parameters/TableIdParam"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/OrphanCleanupRequest"
+            example:
+              retention_hours: 72
+              dry_run: true
+      responses:
+        "202":
+          description: Orphan cleanup triggered
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/OrphanCleanupResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  /api/v1/tables/{table_id}/maintenance/rewrite-manifests:
+    post:
+      operationId: rewriteManifests
+      summary: Rewrite manifest files
+      description: |
+        Rewrites the table's manifest files to optimize metadata. This can
+        reduce the number of manifest files and improve planning performance.
+        Corresponds to the Iceberg `rewriteManifests` action.
+      tags: [Maintenance]
+      parameters:
+        - $ref: "#/components/parameters/TableIdParam"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/RewriteManifestsRequest"
+            example:
+              dry_run: false
+      responses:
+        "202":
+          description: Manifest rewrite triggered
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RewriteManifestsResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  /api/v1/tables/{table_id}/maintenance/optimize-sort:
+    post:
+      operationId: optimizeSortOrder
+      summary: Optimize sort order
+      description: |
+        Rewrites data files to match the table's configured sort order.
+        This improves query performance for filters on sorted columns by
+        enabling more effective file pruning and min/max statistics.
+      tags: [Maintenance]
+      parameters:
+        - $ref: "#/components/parameters/TableIdParam"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/OptimizeSortRequest"
+            example:
+              sort_order_id: null
+              dry_run: true
+      responses:
+        "202":
+          description: Sort optimization triggered
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/OptimizeSortResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  /api/v1/tables/{table_id}/maintenance/run-all:
+    post:
+      operationId: runFullMaintenance
+      summary: Run full maintenance cycle
+      description: |
+        Executes the complete maintenance cycle in the recommended order:
+        1. Expire snapshots
+        2. Remove orphan files
+        3. Compact data files
+        4. Rewrite manifests
+
+        Each step uses the table's effective policy configuration.
+      tags: [Maintenance]
+      parameters:
+        - $ref: "#/components/parameters/TableIdParam"
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/RunAllRequest"
+            example:
+              dry_run: false
+      responses:
+        "202":
+          description: Full maintenance cycle triggered
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RunAllResponse"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  /api/v1/tables/{table_id}/maintenance/history:
+    get:
+      operationId: getMaintenanceHistory
+      summary: Get maintenance history
+      description: Returns a paginated log of past maintenance operations for the table.
+      tags: [Maintenance]
+      parameters:
+        - $ref: "#/components/parameters/TableIdParam"
+        - $ref: "#/components/parameters/LimitParam"
+        - $ref: "#/components/parameters/OffsetParam"
+        - name: action_type
+          in: query
+          schema:
+            type: string
+            enum:
+              - compact_files
+              - expire_snapshots
+              - remove_orphans
+              - rewrite_manifests
+              - optimize_sort
+          description: Filter by maintenance action type
+      responses:
+        "200":
+          description: Maintenance history
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/PaginatedResponse"
+                  - type: object
+                    properties:
+                      items:
+                        type: array
+                        items:
+                          $ref: "#/components/schemas/MaintenanceHistoryEntry"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  /api/v1/tables/{table_id}/policy:
+    get:
+      operationId: getTablePolicy
+      summary: Get current policy for table
+      description: |
+        Returns the effective maintenance policy for the table, including any
+        table-specific overrides merged with the default policy.
+      tags: [Policy]
+      parameters:
+        - $ref: "#/components/parameters/TableIdParam"
+      responses:
+        "200":
+          description: Table policy
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PolicyResponse"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "500":
+          $ref: "#/components/responses/InternalError"
+    put:
+      operationId: updateTablePolicy
+      summary: Update policy for table
+      description: |
+        Sets or updates the table-specific policy overrides. Fields not provided
+        will fall back to the default policy.
+      tags: [Policy]
+      parameters:
+        - $ref: "#/components/parameters/TableIdParam"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/PolicyUpdateRequest"
+      responses:
+        "200":
+          description: Updated policy
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PolicyResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  /api/v1/tables/{table_id}/snapshots:
+    get:
+      operationId: listSnapshots
+      summary: List snapshots
+      description: |
+        Returns the table's snapshot history ordered by timestamp descending.
+        Each entry includes the snapshot ID, parent snapshot ID, timestamp,
+        operation type, and summary statistics from the Iceberg manifest list.
+      tags: [Metadata]
+      parameters:
+        - $ref: "#/components/parameters/TableIdParam"
+        - $ref: "#/components/parameters/LimitParam"
+        - $ref: "#/components/parameters/OffsetParam"
+      responses:
+        "200":
+          description: Snapshot list
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/PaginatedResponse"
+                  - type: object
+                    properties:
+                      items:
+                        type: array
+                        items:
+                          $ref: "#/components/schemas/SnapshotInfo"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  /api/v1/tables/{table_id}/files:
+    get:
+      operationId: listDataFiles
+      summary: List data files with size info
+      description: |
+        Lists the data files in the table's current snapshot, including file path,
+        size, record count, and partition information.
+      tags: [Metadata]
+      parameters:
+        - $ref: "#/components/parameters/TableIdParam"
+        - $ref: "#/components/parameters/LimitParam"
+        - $ref: "#/components/parameters/OffsetParam"
+        - name: min_size_bytes
+          in: query
+          schema:
+            type: integer
+          description: Filter files larger than this size
+        - name: max_size_bytes
+          in: query
+          schema:
+            type: integer
+          description: Filter files smaller than this size
+      responses:
+        "200":
+          description: Data file list
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/PaginatedResponse"
+                  - type: object
+                    properties:
+                      items:
+                        type: array
+                        items:
+                          $ref: "#/components/schemas/FileInfo"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  /api/v1/tables/{table_id}/partitions:
+    get:
+      operationId: listPartitions
+      summary: List partitions with health info
+      description: |
+        Returns partition-level statistics including file count, total size,
+        and average file size. Useful for identifying partitions that need
+        targeted compaction.
+      tags: [Metadata]
+      parameters:
+        - $ref: "#/components/parameters/TableIdParam"
+        - $ref: "#/components/parameters/LimitParam"
+        - $ref: "#/components/parameters/OffsetParam"
+        - name: sort_by
+          in: query
+          schema:
+            type: string
+            enum: [file_count, total_bytes, avg_file_size_bytes]
+            default: file_count
+          description: Sort partitions by this field (descending)
+      responses:
+        "200":
+          description: Partition list
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/PaginatedResponse"
+                  - type: object
+                    properties:
+                      items:
+                        type: array
+                        items:
+                          $ref: "#/components/schemas/PartitionInfo"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  /api/v1/health:
+    get:
+      operationId: serviceHealth
+      summary: Service health check
+      tags: [Operations]
+      responses:
+        "200":
+          description: Service is healthy
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ServiceHealthResponse"
+              example:
+                status: "healthy"
+                version: "1.0.0"
+                catalog_connected: true
+                uptime_seconds: 3600
+
+  /api/v1/metrics:
+    get:
+      operationId: prometheusMetrics
+      summary: Prometheus metrics
+      tags: [Operations]
+      responses:
+        "200":
+          description: Prometheus exposition format
+          content:
+            text/plain:
+              schema:
+                type: string
+
+components:
+  parameters:
+    TableIdParam:
+      name: table_id
+      in: path
+      required: true
+      schema:
+        type: string
+      description: Fully qualified table identifier (e.g., `analytics.events`)
+      example: "analytics.events"
+    LimitParam:
+      name: limit
+      in: query
+      schema:
+        type: integer
+        default: 20
+        minimum: 1
+        maximum: 1000
+      description: Maximum number of items to return
+    OffsetParam:
+      name: offset
+      in: query
+      schema:
+        type: integer
+        default: 0
+        minimum: 0
+      description: Number of items to skip
+
+  schemas:
+    ErrorResponse:
+      type: object
+      required: [error, detail]
+      properties:
+        error:
+          type: string
+          description: Error code
+        detail:
+          type: string
+          description: Human-readable error message
+        table_id:
+          type: string
+          description: Table identifier if applicable
+
+    PaginatedResponse:
+      type: object
+      required: [items, total, limit, offset]
+      properties:
+        items:
+          type: array
+          items: {}
+        total:
+          type: integer
+          description: Total number of items matching the query
+        limit:
+          type: integer
+        offset:
+          type: integer
+
+    TableInfo:
+      type: object
+      required: [table_id, namespace, name]
+      properties:
+        table_id:
+          type: string
+          description: Fully qualified table identifier
+          example: "analytics.events"
+        namespace:
+          type: string
+          example: "analytics"
+        name:
+          type: string
+          example: "events"
+        location:
+          type: string
+          description: Storage location URI
+          example: "s3://warehouse/analytics/events"
+        format_version:
+          type: integer
+          description: Iceberg format version (1, 2, or 3)
+          enum: [1, 2, 3]
+        last_updated:
+          type: string
+          format: date-time
+
+    FileStatsResponse:
+      type: object
+      properties:
+        file_count:
+          type: integer
+        total_bytes:
+          type: integer
+          format: int64
+        avg_file_size_bytes:
+          type: number
+          format: double
+        min_file_size_bytes:
+          type: integer
+          format: int64
+        max_file_size_bytes:
+          type: integer
+          format: int64
+        median_file_size_bytes:
+          type: number
+          format: double
+        small_file_count:
+          type: integer
+        small_file_ratio:
+          type: number
+          format: double
+          description: Ratio of small files to total files (0.0-1.0)
+        total_mb:
+          type: number
+          format: double
+
+    SnapshotStatsResponse:
+      type: object
+      properties:
+        snapshot_count:
+          type: integer
+        oldest_snapshot_ts:
+          type: string
+          format: date-time
+          nullable: true
+        newest_snapshot_ts:
+          type: string
+          format: date-time
+          nullable: true
+
+    SizeBucketResponse:
+      type: object
+      properties:
+        bucket:
+          type: string
+          example: "<1MB"
+        file_count:
+          type: integer
+        total_bytes:
+          type: integer
+          format: int64
+
+    PartitionHealthResponse:
+      type: object
+      properties:
+        partition:
+          type: string
+          example: "dt=2026-04-05"
+        file_count:
+          type: integer
+        total_bytes:
+          type: integer
+          format: int64
+        avg_file_size_bytes:
+          type: number
+          format: double
+
+    HealthReportResponse:
+      type: object
+      required: [table_id, assessed_at, is_healthy, file_stats, snapshot_stats]
+      properties:
+        table_id:
+          type: string
+        assessed_at:
+          type: string
+          format: date-time
+        is_healthy:
+          type: boolean
+        needs_compaction:
+          type: boolean
+        needs_snapshot_expiry:
+          type: boolean
+        file_stats:
+          $ref: "#/components/schemas/FileStatsResponse"
+        snapshot_stats:
+          $ref: "#/components/schemas/SnapshotStatsResponse"
+        size_distribution:
+          type: array
+          items:
+            $ref: "#/components/schemas/SizeBucketResponse"
+        hot_partitions:
+          type: array
+          items:
+            $ref: "#/components/schemas/PartitionHealthResponse"
+        errors:
+          type: array
+          items:
+            type: string
+
+    AnalyzeRequest:
+      type: object
+      properties:
+        small_file_threshold_bytes:
+          type: integer
+          default: 8388608
+          description: Files below this size are considered small (default 8MB)
+        partition_min_files:
+          type: integer
+          default: 10
+          description: Only report partitions with more files than this
+        partition_limit:
+          type: integer
+          default: 20
+          description: Maximum number of hot partitions to return
+
+    TaskResponse:
+      type: object
+      required: [task_id, status]
+      properties:
+        task_id:
+          type: string
+          format: uuid
+        status:
+          type: string
+          enum: [accepted, running, completed, failed]
+        message:
+          type: string
+
+    CompactionRequest:
+      type: object
+      properties:
+        target_file_size_bytes:
+          type: integer
+          default: 134217728
+          description: Target file size after compaction (default 128MB)
+        small_file_threshold_bytes:
+          type: integer
+          default: 8388608
+          description: Files below this threshold are compaction candidates (default 8MB)
+        dry_run:
+          type: boolean
+          default: false
+          description: Preview compaction without executing
+
+    CompactionResponse:
+      type: object
+      required: [task_id, dry_run]
+      properties:
+        task_id:
+          type: string
+          format: uuid
+        dry_run:
+          type: boolean
+        total_files:
+          type: integer
+        small_files_found:
+          type: integer
+        total_small_bytes:
+          type: integer
+          format: int64
+        estimated_output_files:
+          type: integer
+          description: Estimated number of files after compaction (dry_run only)
+        compacted:
+          type: boolean
+        status:
+          type: string
+          enum: [accepted, running, completed, failed]
+
+    SnapshotExpirationRequest:
+      type: object
+      properties:
+        retention_hours:
+          type: integer
+          default: 168
+          description: Expire snapshots older than this many hours (default 7 days)
+        min_snapshots_to_keep:
+          type: integer
+          default: 5
+          description: Always retain at least this many recent snapshots
+        dry_run:
+          type: boolean
+          default: false
+
+    SnapshotExpirationResponse:
+      type: object
+      required: [task_id, dry_run]
+      properties:
+        task_id:
+          type: string
+          format: uuid
+        dry_run:
+          type: boolean
+        total_snapshots:
+          type: integer
+        expired:
+          type: integer
+          description: Number of snapshots expired (or would_expire if dry_run)
+        retained:
+          type: integer
+        status:
+          type: string
+          enum: [accepted, running, completed, failed]
+
+    OrphanCleanupRequest:
+      type: object
+      properties:
+        retention_hours:
+          type: integer
+          default: 72
+          description: Only consider files older than this as orphans (default 3 days)
+        dry_run:
+          type: boolean
+          default: false
+
+    OrphanCleanupResponse:
+      type: object
+      required: [task_id, dry_run]
+      properties:
+        task_id:
+          type: string
+          format: uuid
+        dry_run:
+          type: boolean
+        orphans_found:
+          type: integer
+        removed:
+          type: integer
+        files:
+          type: array
+          items:
+            type: string
+          description: Sample of orphan file paths (dry_run only, capped at 50)
+        status:
+          type: string
+          enum: [accepted, running, completed, failed]
+
+    RewriteManifestsRequest:
+      type: object
+      properties:
+        dry_run:
+          type: boolean
+          default: false
+
+    RewriteManifestsResponse:
+      type: object
+      required: [task_id, dry_run]
+      properties:
+        task_id:
+          type: string
+          format: uuid
+        dry_run:
+          type: boolean
+        manifests_rewritten:
+          type: integer
+        manifests_kept:
+          type: integer
+        status:
+          type: string
+          enum: [accepted, running, completed, failed]
+
+    OptimizeSortRequest:
+      type: object
+      properties:
+        sort_order_id:
+          type: integer
+          nullable: true
+          description: |
+            Iceberg sort order ID to apply. If null, uses the table's current
+            default sort order.
+        dry_run:
+          type: boolean
+          default: false
+
+    OptimizeSortResponse:
+      type: object
+      required: [task_id, dry_run]
+      properties:
+        task_id:
+          type: string
+          format: uuid
+        dry_run:
+          type: boolean
+        files_rewritten:
+          type: integer
+        sort_order_id:
+          type: integer
+        status:
+          type: string
+          enum: [accepted, running, completed, failed]
+
+    RunAllRequest:
+      type: object
+      properties:
+        dry_run:
+          type: boolean
+          default: false
+          description: Preview all maintenance steps without executing
+
+    RunAllResponse:
+      type: object
+      required: [task_id, dry_run, steps]
+      properties:
+        task_id:
+          type: string
+          format: uuid
+        dry_run:
+          type: boolean
+        steps:
+          type: array
+          items:
+            type: object
+            properties:
+              action:
+                type: string
+                enum:
+                  - expire_snapshots
+                  - remove_orphans
+                  - compact_files
+                  - rewrite_manifests
+              status:
+                type: string
+                enum: [pending, running, completed, failed, skipped]
+              result:
+                type: object
+                additionalProperties: true
+        status:
+          type: string
+          enum: [accepted, running, completed, failed]
+
+    MaintenanceHistoryEntry:
+      type: object
+      required: [id, table_id, action_type, status, started_at]
+      properties:
+        id:
+          type: string
+          format: uuid
+        table_id:
+          type: string
+        action_type:
+          type: string
+          enum:
+            - compact_files
+            - expire_snapshots
+            - remove_orphans
+            - rewrite_manifests
+            - optimize_sort
+            - run_all
+        status:
+          type: string
+          enum: [running, completed, failed]
+        started_at:
+          type: string
+          format: date-time
+        completed_at:
+          type: string
+          format: date-time
+          nullable: true
+        dry_run:
+          type: boolean
+        result:
+          type: object
+          additionalProperties: true
+          description: Operation-specific result details
+        error:
+          type: string
+          nullable: true
+
+    PolicyResponse:
+      type: object
+      required: [table_id, policy, is_override]
+      properties:
+        table_id:
+          type: string
+        policy:
+          $ref: "#/components/schemas/TablePolicySchema"
+        is_override:
+          type: boolean
+          description: Whether this is a table-specific override or the default policy
+
+    PolicyUpdateRequest:
+      $ref: "#/components/schemas/TablePolicySchema"
+
+    TablePolicySchema:
+      type: object
+      properties:
+        max_small_file_ratio:
+          type: number
+          format: double
+          default: 0.3
+          description: Trigger compaction when small file ratio exceeds this
+        small_file_threshold_bytes:
+          type: integer
+          default: 8388608
+          description: Files smaller than this are considered small (default 8MB)
+        target_file_size_bytes:
+          type: integer
+          default: 134217728
+          description: Target file size after compaction (default 128MB)
+        max_file_count:
+          type: integer
+          default: 10000
+        max_snapshots:
+          type: integer
+          default: 100
+        snapshot_retention_hours:
+          type: integer
+          default: 168
+          description: Keep snapshots newer than this (default 7 days)
+        min_snapshots_to_keep:
+          type: integer
+          default: 5
+        orphan_retention_hours:
+          type: integer
+          default: 72
+          description: Only remove orphans older than this (default 3 days)
+        max_manifest_count:
+          type: integer
+          default: 500
+        enabled:
+          type: boolean
+          default: true
+
+    SnapshotInfo:
+      type: object
+      required: [snapshot_id, timestamp_ms]
+      properties:
+        snapshot_id:
+          type: integer
+          format: int64
+          description: Unique Iceberg snapshot ID
+        parent_snapshot_id:
+          type: integer
+          format: int64
+          nullable: true
+        timestamp_ms:
+          type: integer
+          format: int64
+        timestamp:
+          type: string
+          format: date-time
+        operation:
+          type: string
+          description: Snapshot operation type (append, overwrite, replace, delete)
+        summary:
+          type: object
+          additionalProperties:
+            type: string
+          description: Iceberg snapshot summary properties (added-data-files, etc.)
+        manifest_list_location:
+          type: string
+          description: Location of the manifest list for this snapshot
+
+    FileInfo:
+      type: object
+      required: [file_path, file_size_bytes, file_format]
+      properties:
+        file_path:
+          type: string
+        file_size_bytes:
+          type: integer
+          format: int64
+        file_format:
+          type: string
+          enum: [PARQUET, ORC, AVRO]
+        record_count:
+          type: integer
+          format: int64
+        partition:
+          type: object
+          additionalProperties:
+            type: string
+          description: Partition values for this file
+        sort_order_id:
+          type: integer
+          nullable: true
+
+    PartitionInfo:
+      type: object
+      required: [partition, file_count, total_bytes]
+      properties:
+        partition:
+          type: string
+          description: Partition spec string (e.g., dt=2026-04-05)
+        file_count:
+          type: integer
+        total_bytes:
+          type: integer
+          format: int64
+        avg_file_size_bytes:
+          type: number
+          format: double
+        needs_compaction:
+          type: boolean
+          description: Whether this partition's file stats suggest compaction is needed
+
+    ServiceHealthResponse:
+      type: object
+      required: [status]
+      properties:
+        status:
+          type: string
+          enum: [healthy, degraded, unhealthy]
+        version:
+          type: string
+        catalog_connected:
+          type: boolean
+        uptime_seconds:
+          type: number
+          format: double
+
+  responses:
+    BadRequest:
+      description: Invalid request parameters
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+          example:
+            error: "bad_request"
+            detail: "target_file_size_bytes must be positive"
+    NotFound:
+      description: Table not found
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+          example:
+            error: "not_found"
+            detail: "Table 'analytics.events' not found in catalog"
+            table_id: "analytics.events"
+    InternalError:
+      description: Internal server error
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+          example:
+            error: "internal_error"
+            detail: "An unexpected error occurred"

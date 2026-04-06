@@ -1,12 +1,13 @@
 apiVersion: v2
 name: iceberg-janitor
-description: K8s-native Iceberg table maintenance with DuckDB health analysis
+description: K8s-native Iceberg table maintenance with Knative scale-to-zero and DuckDB health analysis
 type: application
-version: 0.1.0
-appVersion: "0.1.0"
+version: 0.2.0
+appVersion: "0.2.0"
 keywords:
   - iceberg
   - duckdb
   - data-engineering
   - table-maintenance
   - streaming
+  - knative

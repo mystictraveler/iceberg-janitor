@@ -1,0 +1,16 @@
+apiVersion: sources.knative.dev/v1
+kind: PingSource
+metadata:
+  name: iceberg-janitor-ping
+  namespace: iceberg-janitor
+  labels:
+    app: iceberg-janitor
+spec:
+  schedule: "*/15 * * * *"
+  contentType: application/json
+  data: '{"trigger": "scheduled", "scope": "all_tables"}'
+  sink:
+    ref:
+      apiVersion: serving.knative.dev/v1
+      kind: Service
+      name: iceberg-janitor

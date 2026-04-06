@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from enum import Enum
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, Field
 
@@ -56,6 +56,49 @@ class TablePolicy(BaseModel):
     # Scheduling
     enabled: bool = Field(default=True, description="Whether maintenance is enabled for this table")
 
+    # --- Trigger configuration ---
+    trigger_mode: Literal["auto", "manual", "scheduled"] = Field(
+        default="auto",
+        description=(
+            "Trigger mode: 'auto' evaluates triggers continuously, "
+            "'manual' only runs on explicit request, "
+            "'scheduled' runs during maintenance windows only."
+        ),
+    )
+
+    commit_count_trigger_threshold: int = Field(
+        default=50,
+        description="Fire maintenance after this many commits since last compaction (0 to disable)",
+    )
+    file_count_trigger_threshold: int = Field(
+        default=500,
+        description="Fire maintenance when small file count exceeds this (0 to disable)",
+    )
+    time_trigger_interval_minutes: int = Field(
+        default=30,
+        description="Fire maintenance at least every N minutes (0 to disable)",
+    )
+    size_trigger_threshold_bytes: int = Field(
+        default=1_073_741_824,
+        description="Fire maintenance when uncompacted data exceeds this in bytes (0 to disable, default 1 GiB)",
+    )
+
+    # --- Maintenance windows ---
+    maintenance_window_start: str | None = Field(
+        default=None,
+        description="Start of maintenance window in UTC HH:MM format (e.g. '02:00')",
+    )
+    maintenance_window_end: str | None = Field(
+        default=None,
+        description="End of maintenance window in UTC HH:MM format (e.g. '06:00')",
+    )
+
+    # --- Rate limiting ---
+    max_concurrent_compactions: int = Field(
+        default=2,
+        description="Maximum number of simultaneous compaction operations",
+    )
+
 
 class MaintenanceAction(BaseModel):
     """A maintenance action to be executed against a table."""
@@ -67,6 +110,63 @@ class MaintenanceAction(BaseModel):
     reason: str = Field(default="", description="Human-readable reason for this action")
 
 
+class AdaptivePolicyConfig(BaseModel):
+    """Configuration for the adaptive access-frequency-based policy engine."""
+
+    adaptive_policy_enabled: bool = Field(
+        default=False,
+        description="Enable adaptive policy engine that adjusts thresholds based on table access patterns",
+    )
+    hot_threshold_queries_per_hour: int = Field(
+        default=100,
+        description="Queries per hour above which a table is classified as 'hot'",
+    )
+    warm_threshold_queries_per_hour: int = Field(
+        default=10,
+        description="Queries per hour above which a table is 'warm' (below = 'cold')",
+    )
+    hot_multiplier: float = Field(
+        default=0.5,
+        description=(
+            "Threshold multiplier for hot tables (< 1.0 = more aggressive compaction). "
+            "E.g. 0.5 means hot tables trigger compaction at half the normal thresholds."
+        ),
+    )
+    warm_multiplier: float = Field(
+        default=1.0,
+        description="Threshold multiplier for warm tables (1.0 = use default thresholds)",
+    )
+    cold_multiplier: float = Field(
+        default=3.0,
+        description=(
+            "Threshold multiplier for cold tables (> 1.0 = less frequent compaction). "
+            "E.g. 3.0 means cold tables only compact at 3x the normal thresholds."
+        ),
+    )
+    feedback_loop_enabled: bool = Field(
+        default=False,
+        description=(
+            "Enable the self-correcting feedback loop that measures compaction "
+            "effectiveness and adjusts future aggressiveness automatically"
+        ),
+    )
+    effectiveness_lookback_hours: int = Field(
+        default=24,
+        description="How many hours of effectiveness history to consider for trend analysis",
+    )
+    access_state_persistence_path: str | None = Field(
+        default=None,
+        description="File path for persisting access tracker state across restarts (JSON format)",
+    )
+    decay_half_life_hours: float = Field(
+        default=6.0,
+        description=(
+            "Half-life in hours for the exponential decay of access counts. "
+            "After this period, old events contribute half as much to the heat score."
+        ),
+    )
+
+
 class PolicyConfig(BaseModel):
     """Top-level policy configuration, supporting per-table overrides."""
 
@@ -74,6 +174,10 @@ class PolicyConfig(BaseModel):
     table_overrides: dict[str, TablePolicy] = Field(
         default_factory=dict,
         description="Per-table policy overrides keyed by table identifier",
+    )
+    adaptive: AdaptivePolicyConfig = Field(
+        default_factory=AdaptivePolicyConfig,
+        description="Adaptive policy engine configuration for access-frequency-based scheduling",
     )
 
     def get_policy(self, table_id: str) -> TablePolicy:

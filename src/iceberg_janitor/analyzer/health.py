@@ -1,19 +1,20 @@
-"""Table health assessment using DuckDB to query Iceberg metadata."""
+"""Table health assessment using the Iceberg catalog API only.
+
+No DuckDB, no direct S3 access. All metadata comes through PyIceberg's
+catalog interface, which works identically against REST Catalog, AWS Glue,
+Hive Metastore, or any other Iceberg catalog implementation.
+"""
 
 from __future__ import annotations
 
+from collections import defaultdict
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
+from statistics import median
 
-import duckdb
 import structlog
 
-from iceberg_janitor.analyzer.queries import (
-    FILE_SIZE_DISTRIBUTION,
-    FILE_STATS,
-    PARTITION_FILE_COUNTS,
-    SNAPSHOT_STATS,
-)
+from pyiceberg.catalog import Catalog
 
 logger = structlog.get_logger()
 
@@ -74,6 +75,7 @@ class HealthReport:
     assessed_at: datetime
     file_stats: FileStats
     snapshot_stats: SnapshotStats
+    format_version: int = 1
     size_distribution: list[SizeBucket] = field(default_factory=list)
     hot_partitions: list[PartitionHealth] = field(default_factory=list)
     errors: list[str] = field(default_factory=list)
@@ -91,16 +93,36 @@ class HealthReport:
         return not self.needs_compaction and not self.needs_snapshot_expiry and not self.errors
 
 
+def _classify_size(size: int) -> str:
+    """Classify a file size into a human-readable bucket."""
+    if size < 1_048_576:
+        return "< 1 MB"
+    if size < 10_485_760:
+        return "1-10 MB"
+    if size < 67_108_864:
+        return "10-64 MB"
+    if size < 134_217_728:
+        return "64-128 MB"
+    if size < 268_435_456:
+        return "128-256 MB"
+    return "> 256 MB"
+
+
 def assess_table(
-    table_path: str,
+    catalog: Catalog,
+    table_id: str,
     small_file_threshold: int = DEFAULT_SMALL_FILE_THRESHOLD_BYTES,
     partition_min_files: int = 10,
     partition_limit: int = 20,
 ) -> HealthReport:
-    """Analyze an Iceberg table's health using DuckDB.
+    """Analyze an Iceberg table's health using the catalog API only.
+
+    All metadata is retrieved through PyIceberg's catalog interface.
+    Works with any catalog backend: REST, Glue, Hive, SQL.
 
     Args:
-        table_path: Path to the Iceberg table (s3://bucket/table or local path).
+        catalog: PyIceberg catalog instance.
+        table_id: Fully qualified table identifier (namespace.table).
         small_file_threshold: Files smaller than this (bytes) are counted as "small".
         partition_min_files: Only report partitions with more files than this.
         partition_limit: Max number of hot partitions to return.
@@ -108,71 +130,122 @@ def assess_table(
     Returns:
         HealthReport with file stats, snapshot stats, size distribution, and hot partitions.
     """
-    log = logger.bind(table_path=table_path)
+    log = logger.bind(table_id=table_id)
     log.info("assessing_table_health")
 
-    conn = duckdb.connect()
-    conn.execute("INSTALL iceberg; LOAD iceberg;")
-
     errors: list[str] = []
-    assessed_at = datetime.now()
+    assessed_at = datetime.now(timezone.utc)
 
-    # File statistics
     try:
-        result = conn.execute(
-            FILE_STATS.format(
-                table_path=table_path,
-                small_file_threshold=small_file_threshold,
-            )
-        ).fetchone()
-        file_stats = FileStats(*result) if result else FileStats()
+        table = catalog.load_table(table_id)
     except Exception as e:
-        log.error("file_stats_failed", error=str(e))
-        errors.append(f"File stats query failed: {e}")
-        file_stats = FileStats()
+        log.error("table_load_failed", error=str(e))
+        return HealthReport(
+            table_id=table_id,
+            assessed_at=assessed_at,
+            file_stats=FileStats(),
+            snapshot_stats=SnapshotStats(),
+            errors=[f"Failed to load table: {e}"],
+        )
 
-    # Snapshot statistics
+    format_version = table.metadata.format_version
+
+    # ── Snapshot stats (from table metadata) ────────────────────────
     try:
-        result = conn.execute(SNAPSHOT_STATS.format(table_path=table_path)).fetchone()
-        snapshot_stats = SnapshotStats(*result) if result else SnapshotStats()
+        snapshots = table.metadata.snapshots
+        snap_timestamps = [
+            datetime.fromtimestamp(s.timestamp_ms / 1000, tz=timezone.utc)
+            for s in snapshots
+        ]
+        snapshot_stats = SnapshotStats(
+            snapshot_count=len(snapshots),
+            oldest_snapshot_ts=min(snap_timestamps) if snap_timestamps else None,
+            newest_snapshot_ts=max(snap_timestamps) if snap_timestamps else None,
+        )
     except Exception as e:
         log.error("snapshot_stats_failed", error=str(e))
-        errors.append(f"Snapshot stats query failed: {e}")
+        errors.append(f"Snapshot stats failed: {e}")
         snapshot_stats = SnapshotStats()
 
-    # File size distribution
-    size_distribution: list[SizeBucket] = []
+    # ── File stats (from plan_files via catalog) ────────────────────
     try:
-        rows = conn.execute(
-            FILE_SIZE_DISTRIBUTION.format(table_path=table_path)
-        ).fetchall()
-        size_distribution = [SizeBucket(*row) for row in rows]
-    except Exception as e:
-        log.error("size_distribution_failed", error=str(e))
-        errors.append(f"Size distribution query failed: {e}")
+        plan_files = list(table.scan().plan_files())
+        sizes = [task.file.file_size_in_bytes for task in plan_files]
 
-    # Hot partitions
-    hot_partitions: list[PartitionHealth] = []
-    try:
-        rows = conn.execute(
-            PARTITION_FILE_COUNTS.format(
-                table_path=table_path,
-                min_files_per_partition=partition_min_files,
-                limit=partition_limit,
+        if sizes:
+            small_count = sum(1 for s in sizes if s < small_file_threshold)
+            file_stats = FileStats(
+                file_count=len(sizes),
+                total_bytes=sum(sizes),
+                avg_file_size_bytes=sum(sizes) / len(sizes),
+                min_file_size_bytes=min(sizes),
+                max_file_size_bytes=max(sizes),
+                median_file_size_bytes=median(sizes),
+                small_file_count=small_count,
             )
-        ).fetchall()
-        hot_partitions = [PartitionHealth(*row) for row in rows]
+        else:
+            file_stats = FileStats()
     except Exception as e:
-        log.error("partition_stats_failed", error=str(e))
-        errors.append(f"Partition stats query failed: {e}")
+        log.error("file_stats_failed", error=str(e))
+        errors.append(f"File stats failed: {e}")
+        file_stats = FileStats()
+        sizes = []
 
-    conn.close()
+    # ── Size distribution ───────────────────────────────────────────
+    size_distribution: list[SizeBucket] = []
+    if sizes:
+        try:
+            buckets: dict[str, list[int]] = defaultdict(list)
+            for s in sizes:
+                buckets[_classify_size(s)].append(s)
+
+            # Sort by smallest bucket first
+            bucket_order = ["< 1 MB", "1-10 MB", "10-64 MB", "64-128 MB", "128-256 MB", "> 256 MB"]
+            for bucket_name in bucket_order:
+                if bucket_name in buckets:
+                    bucket_sizes = buckets[bucket_name]
+                    size_distribution.append(SizeBucket(
+                        bucket=bucket_name,
+                        file_count=len(bucket_sizes),
+                        total_bytes=sum(bucket_sizes),
+                    ))
+        except Exception as e:
+            log.error("size_distribution_failed", error=str(e))
+            errors.append(f"Size distribution failed: {e}")
+
+    # ── Hot partitions (from plan_files partition info) ──────────────
+    hot_partitions: list[PartitionHealth] = []
+    if plan_files:
+        try:
+            part_files: dict[str, list[int]] = defaultdict(list)
+            for task in plan_files:
+                # Build partition key from the file's partition data
+                part_key = str(task.file.partition) if task.file.partition else "unpartitioned"
+                part_files[part_key].append(task.file.file_size_in_bytes)
+
+            for part_key, part_sizes in sorted(
+                part_files.items(), key=lambda kv: len(kv[1]), reverse=True
+            ):
+                if len(part_sizes) <= partition_min_files:
+                    continue
+                hot_partitions.append(PartitionHealth(
+                    partition=part_key,
+                    file_count=len(part_sizes),
+                    total_bytes=sum(part_sizes),
+                    avg_file_size_bytes=sum(part_sizes) / len(part_sizes),
+                ))
+                if len(hot_partitions) >= partition_limit:
+                    break
+        except Exception as e:
+            log.error("partition_stats_failed", error=str(e))
+            errors.append(f"Partition stats failed: {e}")
 
     report = HealthReport(
-        table_id=table_path,
+        table_id=table_id,
         assessed_at=assessed_at,
         file_stats=file_stats,
         snapshot_stats=snapshot_stats,
+        format_version=format_version,
         size_distribution=size_distribution,
         hot_partitions=hot_partitions,
         errors=errors,

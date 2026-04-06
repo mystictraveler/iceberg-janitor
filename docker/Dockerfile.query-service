@@ -1,0 +1,29 @@
+FROM python:3.11-slim
+
+WORKDIR /app
+
+# Install Python dependencies
+RUN pip install --no-cache-dir \
+    fastapi>=0.110 \
+    uvicorn>=0.29 \
+    duckdb>=1.1.0 \
+    pydantic>=2.0
+
+# Copy the query service
+COPY jmeter/query-service.py /app/query-service.py
+
+# DuckDB will download and cache extensions on first use.
+# Pre-install them at build time so startup is faster.
+RUN python -c "\
+import duckdb; \
+conn = duckdb.connect(':memory:'); \
+conn.execute('INSTALL iceberg'); \
+conn.execute('INSTALL httpfs'); \
+conn.close(); \
+print('Extensions installed successfully')"
+
+EXPOSE 8070
+
+ENV QUERY_SERVICE_PORT=8070
+
+ENTRYPOINT ["python", "/app/query-service.py"]

@@ -1,0 +1,587 @@
+openapi: 3.1.0
+info:
+  title: Iceberg Janitor API
+  version: 2.0.0
+  description: |
+    Simplified REST API for Apache Iceberg table maintenance.
+
+    Maps directly to the 5 canonical Iceberg maintenance actions:
+    `rewriteDataFiles`, `rewriteManifests`, `expireSnapshots`,
+    `deleteOrphanFiles`, and `rewritePositionDeleteFiles`.
+
+    The Iceberg REST Catalog spec (V1) intentionally excludes maintenance —
+    it is a metadata protocol only. This API fills that gap by providing a
+    REST interface for maintenance orchestration.
+
+    All operations support `dry_run` for safe previewing.
+  license:
+    name: Apache-2.0
+    identifier: Apache-2.0
+
+servers:
+  - url: http://localhost:8000
+    description: Local development
+
+tags:
+  - name: Health
+    description: Table health assessment
+  - name: Maintenance
+    description: "Maps to Iceberg actions: rewriteDataFiles, expireSnapshots, deleteOrphanFiles, rewriteManifests, rewritePositionDeleteFiles"
+  - name: System
+    description: Service health and metrics
+
+paths:
+  # ──────────────────────────────────────────────
+  # Health
+  # ──────────────────────────────────────────────
+
+  /v1/tables/{table_id}/health:
+    get:
+      operationId: getTableHealth
+      summary: Assess table health
+      description: |
+        Runs a DuckDB-based health assessment: file counts, size distribution,
+        snapshot count, small-file ratio, and hot partitions.
+      tags: [Health]
+      parameters:
+        - $ref: "#/components/parameters/TableId"
+        - name: small_file_threshold_bytes
+          in: query
+          schema:
+            type: integer
+            default: 8388608
+          description: Files below this are "small" (default 8 MB)
+      responses:
+        "200":
+          description: Health report
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HealthReport"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  # ──────────────────────────────────────────────
+  # Maintenance — maps 1:1 to Iceberg actions
+  # ──────────────────────────────────────────────
+
+  /v1/tables/{table_id}/rewrite-data-files:
+    post:
+      operationId: rewriteDataFiles
+      summary: Compact data files
+      description: |
+        Iceberg action: `rewriteDataFiles`
+
+        Rewrites small data files into larger ones. Supports binpack (default)
+        and sort strategies. Optionally scoped to a partition filter.
+      tags: [Maintenance]
+      parameters:
+        - $ref: "#/components/parameters/TableId"
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/RewriteDataFilesRequest"
+      responses:
+        "200":
+          description: Compaction result (synchronous for dry_run, async otherwise)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RewriteDataFilesResponse"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /v1/tables/{table_id}/expire-snapshots:
+    post:
+      operationId: expireSnapshots
+      summary: Expire old snapshots
+      description: |
+        Iceberg action: `expireSnapshots`
+
+        Removes snapshots older than a threshold while retaining a minimum count.
+        Unreferenced data files become eligible for orphan cleanup.
+      tags: [Maintenance]
+      parameters:
+        - $ref: "#/components/parameters/TableId"
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ExpireSnapshotsRequest"
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ExpireSnapshotsResponse"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /v1/tables/{table_id}/delete-orphan-files:
+    post:
+      operationId: deleteOrphanFiles
+      summary: Remove orphan files
+      description: |
+        Iceberg action: `deleteOrphanFiles`
+
+        Finds and removes data/metadata files in the table's storage location
+        that are not referenced by any snapshot. Safety margin via retention_hours.
+      tags: [Maintenance]
+      parameters:
+        - $ref: "#/components/parameters/TableId"
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/DeleteOrphanFilesRequest"
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DeleteOrphanFilesResponse"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /v1/tables/{table_id}/rewrite-manifests:
+    post:
+      operationId: rewriteManifests
+      summary: Consolidate manifest files
+      description: |
+        Iceberg action: `rewriteManifests`
+
+        Merges many small manifest files into fewer larger ones, reducing
+        query planning overhead.
+      tags: [Maintenance]
+      parameters:
+        - $ref: "#/components/parameters/TableId"
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/RewriteManifestsRequest"
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RewriteManifestsResponse"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /v1/tables/{table_id}/rewrite-position-delete-files:
+    post:
+      operationId: rewritePositionDeleteFiles
+      summary: Compact position delete files
+      description: |
+        Iceberg action: `rewritePositionDeleteFiles`
+
+        Compacts position delete files (V2) or applies deletion vectors (V3)
+        by merging deletes into their associated data files.
+      tags: [Maintenance]
+      parameters:
+        - $ref: "#/components/parameters/TableId"
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/RewritePositionDeleteFilesRequest"
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RewritePositionDeleteFilesResponse"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  # ──────────────────────────────────────────────
+  # Convenience: run all maintenance in order
+  # ──────────────────────────────────────────────
+
+  /v1/tables/{table_id}/maintain:
+    post:
+      operationId: maintain
+      summary: Run full maintenance cycle
+      description: |
+        Executes all applicable actions in the recommended order:
+        1. expireSnapshots
+        2. deleteOrphanFiles
+        3. rewriteDataFiles
+        4. rewritePositionDeleteFiles (V2/V3 tables)
+        5. rewriteManifests
+
+        Uses the table's effective policy for all thresholds.
+      tags: [Maintenance]
+      parameters:
+        - $ref: "#/components/parameters/TableId"
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                dry_run:
+                  type: boolean
+                  default: false
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/MaintainResponse"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  # ──────────────────────────────────────────────
+  # System
+  # ──────────────────────────────────────────────
+
+  /v1/health:
+    get:
+      operationId: serviceHealth
+      summary: Service health check
+      tags: [System]
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                    enum: [healthy, degraded, unhealthy]
+                  version:
+                    type: string
+                  catalog_connected:
+                    type: boolean
+
+  /v1/metrics:
+    get:
+      operationId: metrics
+      summary: Prometheus metrics
+      tags: [System]
+      responses:
+        "200":
+          content:
+            text/plain:
+              schema:
+                type: string
+
+components:
+  parameters:
+    TableId:
+      name: table_id
+      in: path
+      required: true
+      schema:
+        type: string
+      description: "Fully qualified table ID (e.g. `db.events`)"
+
+  responses:
+    NotFound:
+      description: Table not found in catalog
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+
+  schemas:
+    Error:
+      type: object
+      required: [error, detail]
+      properties:
+        error:
+          type: string
+        detail:
+          type: string
+
+    # ── Health ──────────────────────────────────
+
+    HealthReport:
+      type: object
+      required: [table_id, assessed_at, is_healthy]
+      properties:
+        table_id:
+          type: string
+        assessed_at:
+          type: string
+          format: date-time
+        is_healthy:
+          type: boolean
+        needs_compaction:
+          type: boolean
+        needs_snapshot_expiry:
+          type: boolean
+        format_version:
+          type: integer
+          description: "Iceberg format version (1, 2, or 3)"
+        files:
+          type: object
+          properties:
+            count:
+              type: integer
+            total_bytes:
+              type: integer
+              format: int64
+            avg_size_bytes:
+              type: number
+            small_count:
+              type: integer
+              description: Files below the small-file threshold
+            small_ratio:
+              type: number
+              description: "0.0–1.0"
+        snapshots:
+          type: object
+          properties:
+            count:
+              type: integer
+            oldest:
+              type: string
+              format: date-time
+              nullable: true
+            newest:
+              type: string
+              format: date-time
+              nullable: true
+        delete_files:
+          type: object
+          description: "V2/V3: position delete files and deletion vectors"
+          properties:
+            position_delete_file_count:
+              type: integer
+            deletion_vector_count:
+              type: integer
+        size_distribution:
+          type: array
+          items:
+            type: object
+            properties:
+              bucket:
+                type: string
+              count:
+                type: integer
+              total_bytes:
+                type: integer
+                format: int64
+        hot_partitions:
+          type: array
+          items:
+            type: object
+            properties:
+              partition:
+                type: string
+              file_count:
+                type: integer
+              total_bytes:
+                type: integer
+                format: int64
+        errors:
+          type: array
+          items:
+            type: string
+
+    # ── rewriteDataFiles ───────────────────────
+
+    RewriteDataFilesRequest:
+      type: object
+      properties:
+        strategy:
+          type: string
+          enum: [binpack, sort, zorder]
+          default: binpack
+          description: "Maps to Iceberg RewriteDataFiles strategy"
+        target_file_size_bytes:
+          type: integer
+          default: 134217728
+          description: "Target output file size (default 128 MB)"
+        min_file_size_bytes:
+          type: integer
+          default: 8388608
+          description: "Files below this are compaction candidates (default 8 MB)"
+        min_input_files:
+          type: integer
+          default: 5
+          description: "Minimum small files in a group to trigger rewrite"
+        sort_columns:
+          type: array
+          items:
+            type: string
+          description: "Column names for sort/zorder strategy"
+        where:
+          type: string
+          description: "Partition filter expression (e.g. `dt >= '2026-04-01'`)"
+        partial_progress:
+          type: boolean
+          default: true
+          description: "Commit partial progress for large compactions"
+        dry_run:
+          type: boolean
+          default: false
+
+    RewriteDataFilesResponse:
+      type: object
+      properties:
+        dry_run:
+          type: boolean
+        files_scanned:
+          type: integer
+        files_rewritten:
+          type: integer
+        files_added:
+          type: integer
+        bytes_rewritten:
+          type: integer
+          format: int64
+        groups:
+          type: integer
+          description: "Number of file groups processed"
+
+    # ── expireSnapshots ────────────────────────
+
+    ExpireSnapshotsRequest:
+      type: object
+      properties:
+        older_than:
+          type: string
+          format: date-time
+          description: "Expire snapshots older than this timestamp"
+        older_than_hours:
+          type: integer
+          description: "Alternative: expire snapshots older than N hours ago"
+        retain_last:
+          type: integer
+          default: 5
+          description: "Always keep at least this many snapshots"
+        dry_run:
+          type: boolean
+          default: false
+
+    ExpireSnapshotsResponse:
+      type: object
+      properties:
+        dry_run:
+          type: boolean
+        total_snapshots:
+          type: integer
+        expired:
+          type: integer
+        retained:
+          type: integer
+        data_files_deleted:
+          type: integer
+          description: "Unreferenced data files removed with expired snapshots"
+
+    # ── deleteOrphanFiles ──────────────────────
+
+    DeleteOrphanFilesRequest:
+      type: object
+      properties:
+        older_than_hours:
+          type: integer
+          default: 72
+          description: "Safety margin: only remove orphans older than this (default 3 days)"
+        location:
+          type: string
+          description: "Override storage location to scan (defaults to table location)"
+        dry_run:
+          type: boolean
+          default: false
+
+    DeleteOrphanFilesResponse:
+      type: object
+      properties:
+        dry_run:
+          type: boolean
+        orphans_found:
+          type: integer
+        deleted:
+          type: integer
+        sample_paths:
+          type: array
+          items:
+            type: string
+          description: "Sample of orphan paths (dry_run only, max 50)"
+
+    # ── rewriteManifests ───────────────────────
+
+    RewriteManifestsRequest:
+      type: object
+      properties:
+        dry_run:
+          type: boolean
+          default: false
+
+    RewriteManifestsResponse:
+      type: object
+      properties:
+        dry_run:
+          type: boolean
+        manifests_before:
+          type: integer
+        manifests_after:
+          type: integer
+        manifests_rewritten:
+          type: integer
+
+    # ── rewritePositionDeleteFiles ─────────────
+
+    RewritePositionDeleteFilesRequest:
+      type: object
+      properties:
+        where:
+          type: string
+          description: "Partition filter expression"
+        dry_run:
+          type: boolean
+          default: false
+
+    RewritePositionDeleteFilesResponse:
+      type: object
+      properties:
+        dry_run:
+          type: boolean
+        delete_files_rewritten:
+          type: integer
+        data_files_rewritten:
+          type: integer
+          description: "Data files rewritten to apply deletes"
+        deletion_vectors_applied:
+          type: integer
+          description: "V3: deletion vectors merged into data files"
+
+    # ── maintain (full cycle) ──────────────────
+
+    MaintainResponse:
+      type: object
+      properties:
+        dry_run:
+          type: boolean
+        steps:
+          type: array
+          items:
+            type: object
+            required: [action, status]
+            properties:
+              action:
+                type: string
+                enum:
+                  - expire_snapshots
+                  - delete_orphan_files
+                  - rewrite_data_files
+                  - rewrite_position_delete_files
+                  - rewrite_manifests
+              status:
+                type: string
+                enum: [completed, skipped, failed]
+              result:
+                type: object
+                additionalProperties: true
+              skipped_reason:
+                type: string
+                description: "Why this step was skipped (e.g. 'no small files found')"
+              error:
+                type: string

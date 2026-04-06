@@ -31,6 +31,10 @@ kubectl -n iceberg-janitor wait --for=condition=ready pod -l app=kafka --timeout
 echo "==> Waiting for REST catalog..."
 kubectl -n iceberg-janitor wait --for=condition=ready pod -l app=rest-catalog --timeout=120s
 
+# Wait for Knative service to be ready
+echo "==> Waiting for Knative service iceberg-janitor..."
+kubectl -n iceberg-janitor wait --for=condition=Ready ksvc/iceberg-janitor --timeout=300s
+
 echo ""
 echo "==> Dev stack is ready!"
 echo ""
@@ -39,6 +43,14 @@ echo "  MinIO API:      kubectl -n iceberg-janitor port-forward svc/minio 9000:9
 echo "  MinIO Console:  kubectl -n iceberg-janitor port-forward svc/minio 9001:9001"
 echo "  REST Catalog:   kubectl -n iceberg-janitor port-forward svc/rest-catalog 8181:8181"
 echo "  Kafka:          kubectl -n iceberg-janitor port-forward svc/kafka 9092:9092"
+echo ""
+echo "Knative service URL:"
+KSVC_URL=$(kubectl -n iceberg-janitor get ksvc iceberg-janitor -o jsonpath='{.status.url}' 2>/dev/null || echo "<pending>")
+echo "  ${KSVC_URL}"
+echo ""
+echo "Test the Knative service:"
+echo "  curl -X POST \${KSVC_URL} -H 'Content-Type: application/json' -d '{\"trigger\": \"manual\", \"scope\": \"all_tables\"}'"
+echo "  curl \${KSVC_URL}/health"
 echo ""
 echo "Generate test data:"
 echo "  kubectl apply -f ${PROJECT_DIR}/manifests/dev/data-generator.yaml"

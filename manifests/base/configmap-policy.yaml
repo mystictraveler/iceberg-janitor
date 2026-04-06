@@ -19,20 +19,117 @@ data:
 
     policy:
       default_policy:
+        # --- Compaction thresholds ---
         max_small_file_ratio: 0.3
         small_file_threshold_bytes: 8388608    # 8 MB
         target_file_size_bytes: 134217728      # 128 MB
         max_file_count: 10000
+
+        # --- Snapshot expiration ---
         max_snapshots: 100
         snapshot_retention_hours: 168           # 7 days
         min_snapshots_to_keep: 5
+
+        # --- Orphan cleanup ---
         orphan_retention_hours: 72             # 3 days
+
+        # --- Manifest rewriting ---
         max_manifest_count: 500
+
+        # --- Trigger configuration ---
+        # Mode: "auto" (continuous), "manual" (CLI only), "scheduled" (window only)
+        trigger_mode: auto
+
+        # Fire after N commits since last compaction (0 to disable)
+        commit_count_trigger_threshold: 50
+
+        # Fire when small file count exceeds this (0 to disable)
+        file_count_trigger_threshold: 500
+
+        # Fire at least every N minutes (0 to disable)
+        time_trigger_interval_minutes: 30
+
+        # Fire when uncompacted data exceeds this in bytes (0 to disable)
+        size_trigger_threshold_bytes: 1073741824  # 1 GiB
+
+        # --- Maintenance windows (UTC, HH:MM) ---
+        # Uncomment to restrict maintenance to off-peak hours:
+        # maintenance_window_start: "02:00"
+        # maintenance_window_end: "06:00"
+
+        # --- Rate limiting ---
+        max_concurrent_compactions: 2
 
       # Per-table overrides
       table_overrides:
-        # Example: high-throughput events table gets more aggressive compaction
+        # Example: high-throughput events table gets aggressive compaction
         # default.events:
+        #   trigger_mode: auto
+        #   commit_count_trigger_threshold: 20
+        #   file_count_trigger_threshold: 200
+        #   time_trigger_interval_minutes: 15
+        #   size_trigger_threshold_bytes: 536870912  # 512 MB
         #   max_small_file_ratio: 0.2
         #   max_snapshots: 50
         #   snapshot_retention_hours: 24
+        #   max_concurrent_compactions: 1
+
+        # Example: low-priority analytics table — manual only
+        # analytics.pageviews:
+        #   trigger_mode: manual
+        #   enabled: true
+
+        # Example: scheduled maintenance during off-peak
+        # warehouse.inventory:
+        #   trigger_mode: scheduled
+        #   maintenance_window_start: "03:00"
+        #   maintenance_window_end: "05:00"
+        #   commit_count_trigger_threshold: 100
+        #   time_trigger_interval_minutes: 0   # disabled — rely on commit count
+
+      # -----------------------------------------------------------------
+      # Adaptive policy — access-frequency-based maintenance priority
+      # -----------------------------------------------------------------
+      # When enabled, the janitor tracks per-table query access patterns
+      # and dynamically adjusts compaction thresholds:
+      #   - Hot tables (heavily queried) → compact sooner, shorter retention
+      #   - Warm tables → default thresholds
+      #   - Cold tables (rarely queried) → compact less often, save resources
+      #
+      # This creates a self-correcting feedback loop where the tables that
+      # matter most for query performance get the most maintenance attention.
+      adaptive:
+        # Master switch — set to true to enable adaptive scheduling
+        adaptive_policy_enabled: false
+
+        # Classification thresholds (queries per hour)
+        hot_threshold_queries_per_hour: 100
+        warm_threshold_queries_per_hour: 10
+
+        # Threshold multipliers per tier:
+        #   hot_multiplier < 1.0  → more aggressive (compact sooner)
+        #   cold_multiplier > 1.0 → less aggressive (compact less often)
+        hot_multiplier: 0.5
+        warm_multiplier: 1.0
+        cold_multiplier: 3.0
+
+        # Self-correcting feedback loop — measures whether compaction actually
+        # improved query performance, and adjusts future aggressiveness:
+        #   High effectiveness → increase priority → compact even sooner
+        #   Low effectiveness  → decrease priority → avoid wasting resources
+        feedback_loop_enabled: false
+        effectiveness_lookback_hours: 24
+
+        # Persist access tracker state across restarts (JSON file path)
+        # access_state_persistence_path: /data/access-tracker-state.json
+
+        # Half-life for exponential decay of access counts (hours).
+        # After this period, old events contribute half as much to the score.
+        decay_half_life_hours: 6.0
+
+    # Strategy-level settings for the long-running controller
+    strategy:
+      poll_interval_seconds: 60
+      max_concurrent_compactions: 2
+      # maintenance_window_start: "02:00"
+      # maintenance_window_end: "06:00"

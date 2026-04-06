@@ -1,0 +1,59 @@
+apiVersion: serving.knative.dev/v1
+kind: Service
+metadata:
+  name: iceberg-janitor
+  namespace: iceberg-janitor
+  labels:
+    app: iceberg-janitor
+  annotations:
+    autoscaling.knative.dev/min-scale: "0"
+    autoscaling.knative.dev/max-scale: "3"
+    autoscaling.knative.dev/target: "5"
+spec:
+  template:
+    metadata:
+      labels:
+        app: iceberg-janitor
+      annotations:
+        autoscaling.knative.dev/min-scale: "0"
+        autoscaling.knative.dev/max-scale: "3"
+        autoscaling.knative.dev/target: "5"
+    spec:
+      containers:
+        - image: iceberg-janitor:latest
+          imagePullPolicy: IfNotPresent
+          command:
+            - uvicorn
+          args:
+            - iceberg_janitor.api.app:app
+            - --host
+            - "0.0.0.0"
+            - --port
+            - "8080"
+          ports:
+            - containerPort: 8080
+              protocol: TCP
+          env:
+            - name: AWS_ACCESS_KEY_ID
+              value: admin
+            - name: AWS_SECRET_ACCESS_KEY
+              value: password
+            - name: AWS_REGION
+              value: us-east-1
+            - name: JANITOR_CONFIG_PATH
+              value: /etc/janitor/config.yaml
+          volumeMounts:
+            - name: config
+              mountPath: /etc/janitor
+              readOnly: true
+          resources:
+            requests:
+              memory: 512Mi
+              cpu: 250m
+            limits:
+              memory: 1Gi
+              cpu: 1000m
+      volumes:
+        - name: config
+          configMap:
+            name: janitor-config

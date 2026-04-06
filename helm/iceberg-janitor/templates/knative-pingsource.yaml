@@ -1,0 +1,17 @@
+{{- if and .Values.knative.enabled .Values.knative.pingsource.enabled }}
+apiVersion: sources.knative.dev/v1
+kind: PingSource
+metadata:
+  name: {{ include "iceberg-janitor.fullname" . }}-ping
+  labels:
+    {{- include "iceberg-janitor.labels" . | nindent 4 }}
+spec:
+  schedule: {{ .Values.knative.pingsource.schedule | quote }}
+  contentType: application/json
+  data: {{ .Values.knative.pingsource.data | quote }}
+  sink:
+    ref:
+      apiVersion: serving.knative.dev/v1
+      kind: Service
+      name: {{ include "iceberg-janitor.fullname" . }}
+{{- end }}

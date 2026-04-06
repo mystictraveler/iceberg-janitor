@@ -1,4 +1,4 @@
-.PHONY: install dev test lint format docker-build kind-setup dev-up dev-down clean
+.PHONY: install dev test lint format docker-build kind-setup knative-setup kind-setup-knative dev-up dev-down clean
 
 CLUSTER_NAME ?= iceberg-janitor
 IMAGE_NAME ?= iceberg-janitor
@@ -32,6 +32,34 @@ docker-load: docker-build
 # Kubernetes
 kind-setup:
 	./scripts/kind-setup.sh $(CLUSTER_NAME)
+
+knative-setup:
+	@echo "==> Installing Knative into cluster..."
+	@KNATIVE_SERVING_VERSION=v1.17.0; \
+	KNATIVE_EVENTING_VERSION=v1.17.0; \
+	KNATIVE_KAFKA_VERSION=v1.17.0; \
+	echo "==> Installing Knative Serving CRDs + core ($${KNATIVE_SERVING_VERSION})..."; \
+	kubectl apply -f "https://github.com/knative/serving/releases/download/knative-$${KNATIVE_SERVING_VERSION}/serving-crds.yaml"; \
+	kubectl apply -f "https://github.com/knative/serving/releases/download/knative-$${KNATIVE_SERVING_VERSION}/serving-core.yaml"; \
+	echo "==> Installing Kourier networking layer..."; \
+	kubectl apply -f "https://github.com/knative/net-kourier/releases/download/knative-$${KNATIVE_SERVING_VERSION}/kourier.yaml"; \
+	kubectl patch configmap/config-network --namespace knative-serving --type merge \
+		--patch '{"data":{"ingress-class":"kourier.ingress.networking.knative.dev"}}'; \
+	echo "==> Configuring default domain..."; \
+	kubectl apply -f "https://github.com/knative/serving/releases/download/knative-$${KNATIVE_SERVING_VERSION}/serving-default-domain.yaml"; \
+	echo "==> Installing Knative Eventing CRDs + core ($${KNATIVE_EVENTING_VERSION})..."; \
+	kubectl apply -f "https://github.com/knative/eventing/releases/download/knative-$${KNATIVE_EVENTING_VERSION}/eventing-crds.yaml"; \
+	kubectl apply -f "https://github.com/knative/eventing/releases/download/knative-$${KNATIVE_EVENTING_VERSION}/eventing-core.yaml"; \
+	echo "==> Installing Knative Kafka source controller ($${KNATIVE_KAFKA_VERSION})..."; \
+	kubectl apply -f "https://github.com/knative-extensions/eventing-kafka-broker/releases/download/knative-$${KNATIVE_KAFKA_VERSION}/eventing-kafka-controller.yaml"; \
+	kubectl apply -f "https://github.com/knative-extensions/eventing-kafka-broker/releases/download/knative-$${KNATIVE_KAFKA_VERSION}/eventing-kafka-source.yaml"; \
+	echo "==> Waiting for Knative Serving pods..."; \
+	kubectl wait --for=condition=ready pod --all -n knative-serving --timeout=300s; \
+	echo "==> Waiting for Knative Eventing pods..."; \
+	kubectl wait --for=condition=ready pod --all -n knative-eventing --timeout=300s; \
+	echo "==> Knative installation complete!"
+
+kind-setup-knative: kind-setup knative-setup
 
 dev-up:
 	./scripts/dev-stack-up.sh

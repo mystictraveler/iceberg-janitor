@@ -1,0 +1,19 @@
+{{- if and .Values.knative.enabled .Values.knative.kafkasource.enabled }}
+apiVersion: sources.knative.dev/v1beta1
+kind: KafkaSource
+metadata:
+  name: {{ include "iceberg-janitor.fullname" . }}-kafka
+  labels:
+    {{- include "iceberg-janitor.labels" . | nindent 4 }}
+spec:
+  bootstrapServers:
+    {{- toYaml .Values.knative.kafkasource.bootstrapServers | nindent 4 }}
+  topics:
+    {{- toYaml .Values.knative.kafkasource.topics | nindent 4 }}
+  consumerGroup: {{ .Values.knative.kafkasource.consumerGroup }}
+  sink:
+    ref:
+      apiVersion: serving.knative.dev/v1
+      kind: Service
+      name: {{ include "iceberg-janitor.fullname" . }}
+{{- end }}

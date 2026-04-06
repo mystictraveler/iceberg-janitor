@@ -3,7 +3,7 @@ image:
   tag: latest
   pullPolicy: IfNotPresent
 
-# CronJob schedule (every 15 minutes)
+# CronJob schedule (every 15 minutes) — used when knative.enabled is false
 schedule: "*/15 * * * *"
 concurrencyPolicy: Forbid
 backoffLimit: 2
@@ -56,3 +56,38 @@ serviceMonitor:
   enabled: false
   interval: 60s
   namespace: monitoring
+
+# Knative configuration — when enabled, deploys a Knative Serving Service
+# with event sources instead of a CronJob
+knative:
+  enabled: false
+
+  serving:
+    # Scale-to-zero annotations
+    minScale: 0
+    maxScale: 3
+    target: 5
+    # Container command
+    command: ["uvicorn"]
+    args:
+      - "iceberg_janitor.api.app:app"
+      - "--host"
+      - "0.0.0.0"
+      - "--port"
+      - "8080"
+    containerPort: 8080
+    # Config path env var
+    configPath: /etc/janitor/config.yaml
+
+  pingsource:
+    enabled: true
+    schedule: "*/15 * * * *"
+    data: '{"trigger": "scheduled", "scope": "all_tables"}'
+
+  kafkasource:
+    enabled: false
+    bootstrapServers:
+      - kafka:9092
+    topics:
+      - iceberg-commits
+    consumerGroup: iceberg-janitor
