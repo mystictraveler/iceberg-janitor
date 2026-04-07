@@ -66,6 +66,23 @@ func (c *DirectoryCatalog) Close() error {
 	return nil
 }
 
+// Bucket returns the underlying gocloud.dev/blob.Bucket. Useful for
+// callers that need to do raw blob operations (readiness probes,
+// administrative inspection) against the same backend the catalog uses.
+func (c *DirectoryCatalog) Bucket() *blob.Bucket { return c.bucket }
+
+// WarehouseURL returns the URL the catalog was opened against.
+func (c *DirectoryCatalog) WarehouseURL() string { return c.warehouseURL }
+
+// Props returns a copy of the catalog's IO properties.
+func (c *DirectoryCatalog) Props() map[string]string {
+	out := make(map[string]string, len(c.props))
+	for k, v := range c.props {
+		out[k] = v
+	}
+	return out
+}
+
 // CatalogType returns the type identifier for this catalog implementation.
 func (c *DirectoryCatalog) CatalogType() icebergcat.Type {
 	return icebergcat.Type("directory")

@@ -10,17 +10,14 @@ package main
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
-	"iter"
+	"io"
+	"net/http"
 	"os"
 	"os/signal"
 	"strings"
 	"syscall"
-	"time"
 
-	"github.com/apache/arrow-go/v18/arrow"
-	icebergpkg "github.com/apache/iceberg-go"
 	icebergtable "github.com/apache/iceberg-go/table"
 	"gocloud.dev/blob"
 
@@ -31,7 +28,7 @@ import (
 
 	"github.com/mystictraveler/iceberg-janitor/go/pkg/analyzer"
 	"github.com/mystictraveler/iceberg-janitor/go/pkg/catalog"
-	"github.com/mystictraveler/iceberg-janitor/go/pkg/safety"
+	"github.com/mystictraveler/iceberg-janitor/go/pkg/janitor"
 )
 
 func main() {
@@ -260,28 +257,19 @@ func runAnalyze(args []string) error {
 	return nil
 }
 
-// runCompact reads all data from the table, rewrites it via iceberg-go's
-// transactional Overwrite, and runs the pre-commit master check (I1 row
-// count, I2 schema, I7 manifest references) before the transaction
-// commits.
+// runCompact compacts the named table. Two modes:
 //
-// Streaming compaction: we use Scan().ToArrowRecords() to get an
-// iterator of record batches, wrap it as an array.RecordReader, and
-// pass that to Transaction.Overwrite. iceberg-go consumes the reader
-// streaming-style, so peak memory is bounded to one record batch at a
-// time instead of the entire table. For a 10 GB table on a Lambda with
-// 10 GB RAM, this is the difference between OOM and success.
+//   1. If JANITOR_API_URL is set, dispatch to a running janitor-server
+//      via HTTP. The server runs the actual compaction with its own
+//      warehouse credentials; the operator only needs network access
+//      to the API.
+//   2. Otherwise, run the compaction in-process using the operator's
+//      warehouse credentials. This is the standalone fallback for
+//      laptop dev and emergency operator access.
 //
-// CAS-conflict retry: if another writer commits to v(N+1) before us,
-// the directory catalog returns catalog.ErrCASConflict. We reload the
-// table from the new current and retry from scratch. This is the
-// optimistic-concurrency model the design assumes — losers re-plan
-// against the new state, never merge in-flight work.
-//
-// This is still NOT the byte-level stitching binpack from the design
-// plan — the data is decoded from the source Parquet files and re-
-// encoded into new ones. True stitching (column-chunk byte copy via
-// parquet-go.CopyRowGroups) lands in a subsequent iteration.
+// Both modes call into the same pkg/janitor.Compact function and
+// produce the same CompactResult; the only difference is which process
+// holds the warehouse credentials.
 func runCompact(args []string) error {
 	var tablePath string
 	for _, a := range args {
@@ -300,216 +288,115 @@ func runCompact(args []string) error {
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 
-	const maxAttempts = 5
-	var attemptDelay = 100 * time.Millisecond
-
-	for attempt := 1; attempt <= maxAttempts; attempt++ {
-		err := tryCompactOnce(ctx, tablePath, attempt)
-		if err == nil {
-			return nil
-		}
-		if !errors.Is(err, catalog.ErrCASConflict) {
-			return err
-		}
-		fmt.Fprintf(os.Stderr, "  CAS conflict on attempt %d/%d (%v); reloading and retrying in %v\n",
-			attempt, maxAttempts, err, attemptDelay)
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-time.After(attemptDelay):
-		}
-		attemptDelay *= 2
+	if apiURL := os.Getenv("JANITOR_API_URL"); apiURL != "" {
+		return runCompactViaAPI(ctx, apiURL, tablePath)
 	}
-	return fmt.Errorf("compaction failed: exceeded %d CAS-retry attempts", maxAttempts)
+	return runCompactInProcess(ctx, tablePath)
 }
 
-// tryCompactOnce performs a single compaction attempt. It loads the
-// current table state, runs the streaming overwrite, runs the master
-// check, and commits. Returns ErrCASConflict if another writer beat us;
-// the caller retries from scratch.
-func tryCompactOnce(ctx context.Context, tablePath string, attempt int) error {
-	tbl, prefix, cleanup, err := resolveTable(ctx, tablePath)
+// runCompactInProcess runs the compaction directly against the
+// warehouse using the operator's credentials. This is the standalone
+// fallback path; in production an operator would normally hit the API
+// instead.
+func runCompactInProcess(ctx context.Context, tablePath string) error {
+	tablePath = strings.Trim(tablePath, "/")
+	url := os.Getenv("JANITOR_WAREHOUSE_URL")
+	if url == "" {
+		return fmt.Errorf("JANITOR_WAREHOUSE_URL is not set (and JANITOR_API_URL is not set either)")
+	}
+
+	cat, err := catalog.NewDirectoryCatalog(ctx, "janitor", url, propsFromEnv())
 	if err != nil {
 		return err
 	}
-	defer cleanup()
+	defer cat.Close()
 
-	beforeFiles, beforeBytes, beforeRows := snapshotFileStats(ctx, tbl)
-	if attempt == 1 {
-		fmt.Printf("compacting %s\n", prefix)
-	} else {
-		fmt.Printf("retrying %s (attempt %d)\n", prefix, attempt)
-	}
-	fmt.Printf("  before: %d data files, %s, %d rows\n", beforeFiles, humanBytes(beforeBytes), beforeRows)
-
-	// Streaming scan: ToArrowRecords returns the schema and an iterator
-	// of record batches. We wrap the iterator as an array.RecordReader
-	// so iceberg-go's Overwrite consumes one batch at a time without
-	// loading the whole table.
-	scan := tbl.Scan()
-	scanSchema, recordIter, err := scan.ToArrowRecords(ctx)
-	if err != nil {
-		return fmt.Errorf("opening scan: %w", err)
-	}
-	reader := newStreamingRecordReader(scanSchema, recordIter)
-	defer reader.Release()
-
-	// Open a transaction so we can stage the rewrite, run the master
-	// check on the staged result, and only then commit.
-	tx := tbl.NewTransaction()
-	if err := tx.Overwrite(ctx, reader, nil); err != nil {
-		return fmt.Errorf("staging streaming overwrite: %w", err)
-	}
-	if err := reader.Err(); err != nil {
-		return fmt.Errorf("scan iterator error: %w", err)
-	}
-	staged, err := tx.StagedTable()
-	if err != nil {
-		return fmt.Errorf("getting staged table: %w", err)
-	}
-
-	// Mandatory pre-commit master check. Non-bypassable.
-	verification, err := safety.VerifyCompactionConsistency(ctx, tbl, staged, propsFromEnv())
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "MASTER CHECK FAILED — refusing to commit\n")
-		fmt.Fprintf(os.Stderr, "  verification: %+v\n", verification)
-		return err
-	}
-	fmt.Printf("  master check: PASS (I1 in=%d out=%d  I2 schema=%d  I7 refs=%d/%d)\n",
-		verification.I1RowCount.In, verification.I1RowCount.Out,
-		verification.I2Schema.OutID,
-		verification.I7ManifestRefs.Passed, verification.I7ManifestRefs.Checked)
-
-	// Commit. CAS conflict propagates back as catalog.ErrCASConflict.
-	newTbl, err := tx.Commit(ctx)
+	ident, err := tablePathToIdentifier(tablePath)
 	if err != nil {
 		return err
 	}
 
-	afterFiles, afterBytes, afterRows := snapshotFileStats(ctx, newTbl)
-	fmt.Printf("  after:  %d data files, %s, %d rows\n", afterFiles, humanBytes(afterBytes), afterRows)
-	if newSnap := newTbl.CurrentSnapshot(); newSnap != nil {
-		fmt.Printf("  new snapshot: %d\n", newSnap.SnapshotID)
+	fmt.Printf("compacting %s (in-process; warehouse=%s)\n", tablePath, url)
+	result, err := janitor.Compact(ctx, cat, ident, janitor.CompactOptions{})
+	printCompactResult(tablePath, result, err)
+	return err
+}
+
+// runCompactViaAPI POSTs to a running janitor-server and prints the
+// returned CompactResult.
+func runCompactViaAPI(ctx context.Context, apiURL, tablePath string) error {
+	ident, err := tablePathToIdentifier(strings.Trim(tablePath, "/"))
+	if err != nil {
+		return err
 	}
-	if afterRows != beforeRows {
-		// Should be impossible since the master check passed, but defense in depth.
-		return fmt.Errorf("post-commit row count mismatch: before=%d after=%d", beforeRows, afterRows)
+	if len(ident) != 2 {
+		return fmt.Errorf("API mode currently supports only two-part identifiers (namespace, table); got %v", ident)
 	}
-	fmt.Printf("compaction complete: %d → %d files (%.1fx reduction)\n",
-		beforeFiles, afterFiles, float64(beforeFiles)/maxF(float64(afterFiles), 1))
+	endpoint := strings.TrimRight(apiURL, "/") + fmt.Sprintf("/v1/tables/%s/%s/compact", ident[0], ident[1])
+	fmt.Printf("compacting %s (via API; %s)\n", tablePath, endpoint)
+
+	req, err := http.NewRequestWithContext(ctx, "POST", endpoint, nil)
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Accept", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("calling janitor-server: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 400 {
+		body, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("janitor-server returned HTTP %d: %s", resp.StatusCode, string(body))
+	}
+	var result janitor.CompactResult
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return fmt.Errorf("decoding response: %w", err)
+	}
+	printCompactResult(tablePath, &result, nil)
 	return nil
 }
 
-// streamingRecordReader adapts an iter.Seq2[arrow.RecordBatch, error]
-// (the streaming scan iterator iceberg-go returns from ToArrowRecords)
-// into the array.RecordReader interface that Transaction.Overwrite
-// expects. It pulls one batch at a time via iter.Pull2 — no buffering,
-// no whole-table-in-memory.
-//
-// This is the load-bearing piece for memory-bounded compaction. With
-// the previous ToArrowTable approach, peak memory was proportional to
-// total table size; with this reader it's proportional to a single
-// record batch (default ~64K rows, kilobytes to a few MB).
-type streamingRecordReader struct {
-	schema  *arrow.Schema
-	next    func() (arrow.RecordBatch, error, bool)
-	stop    func()
-	current arrow.RecordBatch
-	err     error
-	refs    int64
-}
-
-func newStreamingRecordReader(schema *arrow.Schema, seq iter.Seq2[arrow.RecordBatch, error]) *streamingRecordReader {
-	next, stop := iter.Pull2(seq)
-	return &streamingRecordReader{
-		schema: schema,
-		next:   next,
-		stop:   stop,
-		refs:   1,
-	}
-}
-
-func (r *streamingRecordReader) Schema() *arrow.Schema { return r.schema }
-
-func (r *streamingRecordReader) Next() bool {
-	if r.err != nil {
-		return false
-	}
-	if r.current != nil {
-		r.current.Release()
-		r.current = nil
-	}
-	rec, err, ok := r.next()
-	if !ok {
-		return false
-	}
-	if err != nil {
-		r.err = err
-		return false
-	}
-	r.current = rec
-	return true
-}
-
-func (r *streamingRecordReader) RecordBatch() arrow.RecordBatch { return r.current }
-func (r *streamingRecordReader) Record() arrow.RecordBatch      { return r.current }
-func (r *streamingRecordReader) Err() error                     { return r.err }
-
-func (r *streamingRecordReader) Retain() {
-	r.refs++
-}
-
-func (r *streamingRecordReader) Release() {
-	r.refs--
-	if r.refs > 0 {
+// printCompactResult writes a human-readable summary of the result to
+// stdout. Used by both the in-process and API paths.
+func printCompactResult(tablePath string, r *janitor.CompactResult, runErr error) {
+	if r == nil {
 		return
 	}
-	if r.current != nil {
-		r.current.Release()
-		r.current = nil
+	fmt.Printf("  before: %d data files, %s, %d rows (snapshot %d)\n",
+		r.BeforeFiles, humanBytes(r.BeforeBytes), r.BeforeRows, r.BeforeSnapshotID)
+	if r.Verification != nil {
+		v := r.Verification
+		fmt.Printf("  master check: %s (I1 in=%d out=%d  I2 schema=%d  I7 refs=%d/%d)\n",
+			strings.ToUpper(v.Overall),
+			v.I1RowCount.In, v.I1RowCount.Out,
+			v.I2Schema.OutID,
+			v.I7ManifestRefs.Passed, v.I7ManifestRefs.Checked)
 	}
-	if r.stop != nil {
-		r.stop()
-		r.stop = nil
+	if runErr != nil {
+		fmt.Fprintf(os.Stderr, "compaction failed after %d attempt(s): %v\n", r.Attempts, runErr)
+		return
 	}
+	fmt.Printf("  after:  %d data files, %s, %d rows (snapshot %d)\n",
+		r.AfterFiles, humanBytes(r.AfterBytes), r.AfterRows, r.AfterSnapshotID)
+	reduction := float64(r.BeforeFiles) / maxF(float64(r.AfterFiles), 1)
+	fmt.Printf("compaction complete: %d → %d files (%.1fx reduction) in %d attempt(s), %dms\n",
+		r.BeforeFiles, r.AfterFiles, reduction, r.Attempts, r.DurationMs)
 }
 
-// snapshotFileStats walks the current snapshot's manifests and returns
-// (data file count, total bytes, total rows).
-func snapshotFileStats(ctx context.Context, tbl *icebergtable.Table) (files int, bytes int64, rows int64) {
-	snap := tbl.CurrentSnapshot()
-	if snap == nil {
-		return 0, 0, 0
+// tablePathToIdentifier converts a janitor-style path ("mvp.db/events")
+// into an iceberg-go Identifier (["mvp", "events"]). The leading
+// namespace component is stripped of its ".db" suffix because that
+// suffix is iceberg-go's default location-provider convention, not
+// part of the namespace name.
+func tablePathToIdentifier(tablePath string) (icebergtable.Identifier, error) {
+	parts := strings.Split(tablePath, "/")
+	if len(parts) < 2 {
+		return nil, fmt.Errorf("table path %q must be at least <namespace>.db/<table>", tablePath)
 	}
-	fs, err := tbl.FS(ctx)
-	if err != nil {
-		return 0, 0, 0
-	}
-	manifests, err := snap.Manifests(fs)
-	if err != nil {
-		return 0, 0, 0
-	}
-	for _, m := range manifests {
-		mf, err := fs.Open(m.FilePath())
-		if err != nil {
-			continue
-		}
-		entries, err := icebergpkg.ReadManifest(m, mf, true)
-		mf.Close()
-		if err != nil {
-			continue
-		}
-		for _, e := range entries {
-			df := e.DataFile()
-			if df == nil || df.ContentType() != icebergpkg.EntryContentData {
-				continue
-			}
-			files++
-			bytes += df.FileSizeBytes()
-			rows += df.Count()
-		}
-	}
-	return files, bytes, rows
+	ns := strings.TrimSuffix(parts[0], ".db")
+	rest := parts[1:]
+	return icebergtable.Identifier(append([]string{ns}, rest...)), nil
 }
 
 func maxF(a, b float64) float64 {

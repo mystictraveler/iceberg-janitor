@@ -1,0 +1,519 @@
+openapi: 3.1.0
+info:
+  title: iceberg-janitor (Go) — janitor-server HTTP API
+  version: 0.1.0
+  description: |
+    HTTP adapter for the Go janitor's `pkg/janitor.Core` entry points.
+    Same code path as `cmd/janitor-cli` (in-process mode) — both
+    binaries call into the same shared library, the only difference is
+    which process holds the warehouse credentials.
+
+    ## Auth model
+
+    The server itself does **NOT** enforce identity. Auth is delegated
+    to the deployment platform:
+
+    - **Knative + Kourier**: front the service with an authenticated
+      ingress (oauth2-proxy, Kourier+JWT, Istio AuthN policy)
+    - **AWS Lambda**: front with API Gateway + Cognito or IAM auth
+    - **Self-hosted**: front with nginx/envoy + your auth provider
+
+    This matches Knative conventions and keeps the server's surface
+    minimal. The server trusts the platform to have authenticated the
+    caller.
+
+    ## Multi-cloud
+
+    The server uses `gocloud.dev/blob` so the same binary serves an
+    S3 / MinIO / GCS / Azure Blob / local-filesystem warehouse. Backend
+    selection is purely a function of the `JANITOR_WAREHOUSE_URL` env
+    var the server was started with. There is no per-cloud build.
+
+    ## Relationship to the Iceberg REST Catalog spec
+
+    This is **NOT** a re-implementation of the Iceberg REST Catalog
+    spec (`iceberg-open-api`). The intended overlap is small — see
+    `go/openapi/iceberg-overlap.md` for the full discussion. TL;DR:
+    Iceberg REST Catalog is a **catalog protocol** (load tables, commit
+    metadata, list namespaces); the janitor is a **maintenance
+    operator** that reads + writes tables but does not provide a
+    catalog service. The janitor explicitly takes the no-catalog-service
+    architectural position: the Iceberg metadata files in object
+    storage ARE the catalog.
+
+  license:
+    name: Apache-2.0
+    url: https://www.apache.org/licenses/LICENSE-2.0
+  contact:
+    name: iceberg-janitor
+    url: https://github.com/mystictraveler/iceberg-janitor
+
+servers:
+  - url: http://localhost:8080
+    description: local development (file:// or MinIO warehouse)
+
+tags:
+  - name: health
+    description: Liveness and readiness probes (Kubernetes / Knative)
+  - name: catalog
+    description: Read-only catalog operations (no auth required for read-only roles)
+  - name: maintenance
+    description: Mutating maintenance operations (require warehouse-write IAM on the server)
+
+paths:
+  /v1/healthz:
+    get:
+      tags: [health]
+      summary: Liveness probe
+      description: |
+        Returns 200 if the server process is running and the catalog
+        connection was successfully opened at startup. Does NOT touch
+        the warehouse — this is a cheap process-level check suitable
+        for Kubernetes `livenessProbe`.
+      responses:
+        '200':
+          description: Server is alive
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [status, uptime_seconds, warehouse]
+                properties:
+                  status:
+                    type: string
+                    enum: [ok]
+                  uptime_seconds:
+                    type: number
+                    format: double
+                  warehouse:
+                    type: string
+                    description: The configured JANITOR_WAREHOUSE_URL
+
+  /v1/readyz:
+    get:
+      tags: [health]
+      summary: Readiness probe (warehouse-reachable)
+      description: |
+        Returns 200 if the server can list the warehouse root prefix.
+        Returns 503 if the warehouse is unreachable. Use as the
+        Kubernetes `readinessProbe` so Knative removes the pod from
+        rotation when the underlying object store is having an outage.
+      responses:
+        '200':
+          description: Warehouse reachable
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [status]
+                properties:
+                  status:
+                    type: string
+                    enum: [ready]
+        '503':
+          description: Warehouse unreachable
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /v1/tables:
+    get:
+      tags: [catalog]
+      summary: List Iceberg tables in the warehouse
+      description: |
+        Walks the warehouse object store and returns every directory
+        that contains a `metadata/v*.metadata.json` file. This is the
+        directory-catalog discovery primitive — no catalog service is
+        consulted.
+
+        Tables are identified by their `Prefix` (bucket-relative path,
+        e.g. `mvp.db/events`). The `CurrentMetadata` field is the
+        bucket-relative path to the highest-numbered metadata.json file.
+
+        For very large warehouses, pass `?prefix=` to scope the walk
+        to a subtree.
+      parameters:
+        - name: prefix
+          in: query
+          required: false
+          schema:
+            type: string
+          description: Optional bucket-relative prefix to scope the discovery
+      responses:
+        '200':
+          description: List of discovered tables
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [count, tables]
+                properties:
+                  count:
+                    type: integer
+                  tables:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/TableLocation'
+
+  /v1/tables/{namespace}/{name}/health:
+    get:
+      tags: [catalog]
+      summary: Compute a HealthReport for a single table
+      description: |
+        Loads the table via the directory catalog and returns the
+        analyzer's HealthReport. This is read-only — no commits, no
+        modifications. Suitable for `read-only` operator roles.
+
+        The report includes the H1 metadata-to-data ratio (CB3, the
+        crown axiom: metadata bytes should never exceed a small fraction
+        of data bytes). When the ratio is critical, the analyzer marks
+        the table as needing attention but does not act.
+      parameters:
+        - $ref: '#/components/parameters/Namespace'
+        - $ref: '#/components/parameters/TableName'
+      responses:
+        '200':
+          description: HealthReport
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HealthReport'
+        '404':
+          description: Table not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '500':
+          description: Internal error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /v1/tables/{namespace}/{name}/compact:
+    post:
+      tags: [maintenance]
+      summary: Compact a table (full table, no partition scope, MVP)
+      description: |
+        Reads all data from the table, rewrites it via streaming
+        Overwrite (one record batch at a time, memory-bounded), runs
+        the mandatory pre-commit master check (I1 row count, I2 schema,
+        I7 manifest references), and commits via the directory
+        catalog's atomic CAS path.
+
+        On a CAS conflict (another writer beat us to v(N+1)), the
+        server reloads the table and retries from scratch up to 5
+        attempts with exponential backoff. The optimistic-concurrency
+        retry happens server-side; the client just sees the final
+        result.
+
+        ## Master check is mandatory
+
+        If the master check fails, the server returns **HTTP 412
+        Precondition Failed** with the failing invariant in the
+        verification record. The commit is aborted, the new files
+        become orphans (cleanable on the next orphan run), and the
+        table is left untouched. There is no `--force` bypass.
+
+        ## CAS exhaustion
+
+        If the retry loop exhausts MaxAttempts, the server returns
+        **HTTP 409 Conflict** with the result so far.
+
+        ## MVP scope
+
+        - Full table only — no partition scoping yet
+        - Streaming overwrite (decode/encode), not byte-level stitching
+        - I1+I2+I7 of the 9 planned master check invariants
+
+        Each gap is tracked in the design plan and lands in a
+        subsequent release.
+      parameters:
+        - $ref: '#/components/parameters/Namespace'
+        - $ref: '#/components/parameters/TableName'
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CompactRequest'
+      responses:
+        '200':
+          description: Compaction succeeded; full result
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CompactResult'
+        '404':
+          description: Table not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '409':
+          description: |
+            CAS-retry exhausted. Another writer kept beating the
+            server to v(N+1). The result so far is included in the
+            response body.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CompactErrorResponse'
+        '412':
+          description: |
+            Master check failed. The verification record in the
+            response body shows which invariant failed. The commit
+            was aborted; the table is unchanged.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CompactErrorResponse'
+        '500':
+          description: Internal error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CompactErrorResponse'
+
+components:
+  parameters:
+    Namespace:
+      name: namespace
+      in: path
+      required: true
+      schema:
+        type: string
+      description: |
+        Iceberg namespace, with or without the `.db` suffix iceberg-go
+        uses for default location-provider paths. e.g. `mvp` or `mvp.db`.
+
+    TableName:
+      name: name
+      in: path
+      required: true
+      schema:
+        type: string
+      description: Table name (no namespace prefix)
+
+  schemas:
+    TableLocation:
+      type: object
+      required: [Prefix, CurrentMetadata, CurrentVersion]
+      properties:
+        Prefix:
+          type: string
+          description: Bucket-relative path of the table directory
+          example: mvp.db/events
+        CurrentMetadata:
+          type: string
+          description: Bucket-relative path to the highest-numbered metadata.json
+          example: mvp.db/events/metadata/00015-deadbeef-...metadata.json
+        CurrentVersion:
+          type: integer
+          description: Integer version parsed from the metadata.json filename
+          example: 15
+
+    HealthReport:
+      type: object
+      description: Output of pkg/analyzer.Assess
+      properties:
+        TableLocation:
+          type: string
+        TableUUID:
+          type: string
+          format: uuid
+        FormatVersion:
+          type: integer
+          description: Iceberg table format version (1, 2, or 3)
+        CurrentSnapshotID:
+          type: integer
+          format: int64
+        SnapshotCount:
+          type: integer
+        LiveSnapshotCount:
+          type: integer
+        LastUpdatedMillis:
+          type: integer
+          format: int64
+        DataFileCount:
+          type: integer
+        DataBytes:
+          type: integer
+          format: int64
+        TotalRowCount:
+          type: integer
+          format: int64
+        SmallFileThreshold:
+          type: integer
+          format: int64
+          description: Per-file size below which a file counts as "small"
+        SmallFileCount:
+          type: integer
+        SmallFileBytes:
+          type: integer
+          format: int64
+        SmallFileRatio:
+          type: number
+          format: double
+          minimum: 0
+          maximum: 1
+        ManifestCount:
+          type: integer
+        ManifestBytes:
+          type: integer
+          format: int64
+        AvgManifestBytes:
+          type: integer
+          format: int64
+        MetadataBytes:
+          type: integer
+          format: int64
+        MetadataDataRatio:
+          type: number
+          format: double
+          description: |
+            **The H1 axiom (CB3).** Metadata bytes divided by data
+            bytes. Healthy < 5%, warning at 5-10%, CRITICAL > 10%.
+            When this exceeds the critical threshold, the janitor
+            refuses to add more metadata to the table — it switches
+            to metadata-shrinking mode (expire + manifest rewrite).
+        IsHealthy:
+          type: boolean
+        NeedsAttention:
+          type: boolean
+        IsCritical:
+          type: boolean
+        AttentionReason:
+          type: string
+
+    CompactRequest:
+      type: object
+      description: |
+        Request body for POST /v1/tables/{ns}/{name}/compact. All
+        fields optional in the MVP. Future iterations will add
+        partition_filter, since_snapshot, target_file_size_bytes,
+        force, dry_run, etc.
+      properties:
+        max_attempts:
+          type: integer
+          minimum: 1
+          maximum: 10
+          default: 5
+          description: CAS-retry cap before giving up
+        initial_backoff_ms:
+          type: integer
+          minimum: 1
+          default: 100
+          description: First-retry wait, doubles each attempt
+
+    CompactResult:
+      type: object
+      required: [identifier, attempts, before_files, after_files, verification]
+      properties:
+        identifier:
+          type: array
+          items:
+            type: string
+          example: [mvp, events]
+        attempts:
+          type: integer
+          description: Number of CAS attempts (1 on the happy path)
+        before_snapshot_id:
+          type: integer
+          format: int64
+        before_files:
+          type: integer
+        before_bytes:
+          type: integer
+          format: int64
+        before_rows:
+          type: integer
+          format: int64
+        after_snapshot_id:
+          type: integer
+          format: int64
+        after_files:
+          type: integer
+        after_bytes:
+          type: integer
+          format: int64
+        after_rows:
+          type: integer
+          format: int64
+        verification:
+          $ref: '#/components/schemas/Verification'
+        duration_ms:
+          type: integer
+          format: int64
+
+    Verification:
+      type: object
+      description: |
+        Output of pkg/safety.VerifyCompactionConsistency. Implemented
+        invariants: I1 (row count), I2 (schema), I7 (manifest
+        references). I3-I6, I8, I9 land in subsequent releases.
+        This record is committed to the Iceberg snapshot summary so
+        it's queryable forever via `<table>.snapshots`.
+      required: [scheme_version, checked_at, checker_version, overall]
+      properties:
+        scheme_version:
+          type: integer
+          example: 1
+        checked_at:
+          type: string
+          format: date-time
+        checker_version:
+          type: string
+          example: iceberg-janitor-go MVP
+        input_snapshot_id:
+          type: integer
+          format: int64
+        output_snapshot_id:
+          type: integer
+          format: int64
+        I1_row_count:
+          type: object
+          properties:
+            in: { type: integer, format: int64 }
+            dvs: { type: integer, format: int64 }
+            out: { type: integer, format: int64 }
+            result: { type: string, enum: [pass, fail] }
+            reason: { type: string }
+        I2_schema:
+          type: object
+          properties:
+            in_id: { type: integer }
+            out_id: { type: integer }
+            result: { type: string, enum: [pass, fail] }
+            reason: { type: string }
+        I7_manifest_refs:
+          type: object
+          properties:
+            checked: { type: integer }
+            passed: { type: integer }
+            result: { type: string, enum: [pass, fail] }
+            reason: { type: string }
+        overall:
+          type: string
+          enum: [pass, fail]
+
+    ErrorResponse:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: string
+        detail:
+          type: string
+
+    CompactErrorResponse:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: string
+        result:
+          $ref: '#/components/schemas/CompactResult'
+          description: Partial result up to the point of failure
