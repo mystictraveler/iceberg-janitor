@@ -39,6 +39,8 @@ Phase 1 shipped + naive Phase 3: blob layer, directory catalog read AND write, a
 
 **Measured benchmark results live at [BENCHMARKS.md](BENCHMARKS.md)** and are updated every time a new build phase lands. That file is the single source of truth for "how well does it actually work right now?"
 
+**For an architectural comparison against [Confluent Tableflow](https://www.confluent.io/product/tableflow/)'s compaction subsystem**, see [TABLEFLOW_COMPARISON.md](TABLEFLOW_COMPARISON.md). TL;DR: same correctness story with stronger guarantees (mandatory master check, snapshot-internal audit), no managed control plane, multi-cloud by construction, zero idle cost, and an open-source compaction algorithm you can audit in an afternoon.
+
 ## MVP test loop
 
 See [test/mvp/MVP.md](test/mvp/MVP.md) for the runbook. TL;DR:

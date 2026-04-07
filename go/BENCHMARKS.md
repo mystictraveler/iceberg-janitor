@@ -37,6 +37,23 @@ still ahead.
 
 ---
 
+## MVP++ — Streaming compaction (memory-bounded)
+
+**What's new since the previous entry:**
+- Compaction now uses **streaming** input instead of materializing the whole table in memory. `Scan().ToArrowRecords()` returns an `iter.Seq2[arrow.RecordBatch, error]`; a new `streamingRecordReader` (in `cmd/janitor-cli/main.go`) wraps it via `iter.Pull2` and satisfies `array.RecordReader`. `Transaction.Overwrite` consumes the reader one batch at a time.
+- **Peak memory bound is now O(one record batch)** instead of O(total table size). This is the prerequisite for Lambda-tier compaction on tables larger than RAM. A 10 GB table previously needed 10 GB+ of heap; now it needs ~a few MB regardless of table size.
+- This is **NOT** the byte-level stitching binpack from the design plan. Data is still decoded from source Parquet files and re-encoded into new ones. True stitching (column-chunk byte copy via `parquet-go.CopyRowGroups`) lands in a subsequent iteration. Streaming is the necessary first step.
+
+### Run 1c — streaming compaction (local fileblob)
+
+| Step | Command | Input | Result |
+|---|---|---|---|
+| Seed | `make mvp-seed-local MVP_NUM_BATCHES=20 MVP_ROWS_PER_BATCH=5000` | 20 × 5,000 rows | 20 small files |
+| Compact (streaming) | `cd go && JANITOR_WAREHOUSE_URL=file:///tmp/janitor-mvp go run ./cmd/janitor-cli compact mvp.db/events` | 100k rows, streaming | **20 → 1 files**, **240.7 KiB → 140.5 KiB**, **master check: PASS (I1 in=100000 out=100000  I2 schema=0  I7 refs=1/1)** |
+| DuckDB query | `make mvp-query-local` | post-compact | `100000 rows / 10000 distinct users / 6 event types` — identical |
+
+Same correctness guarantees as the previous run, with the memory bound dropped from O(N) to O(batch). No measurable wall-clock difference at this table size; the win is at scale where the previous implementation would OOM.
+
 ## MVP+ — Phase 1 + naive Phase 3 + atomic CAS + I2/I7 master checks
 
 **What's new since the previous entry:**

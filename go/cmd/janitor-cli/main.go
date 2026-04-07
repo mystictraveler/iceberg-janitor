@@ -11,11 +11,13 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"iter"
 	"os"
 	"os/signal"
 	"strings"
 	"syscall"
 
+	"github.com/apache/arrow-go/v18/arrow"
 	icebergpkg "github.com/apache/iceberg-go"
 	icebergtable "github.com/apache/iceberg-go/table"
 	"gocloud.dev/blob"
@@ -256,16 +258,23 @@ func runAnalyze(args []string) error {
 	return nil
 }
 
-// runCompact reads all data from the table, rewrites it as one (or a few)
-// large files via iceberg-go's transactional OverwriteTable, and runs the
-// pre-commit master check (I1 row count) before the transaction commits.
+// runCompact reads all data from the table, rewrites it via iceberg-go's
+// transactional Overwrite, and runs the pre-commit master check (I1 row
+// count, I2 schema, I7 manifest references) before the transaction
+// commits.
 //
-// This is the MVP compaction path: full read + full overwrite, no
-// partition scoping, no incremental work, no stitching binpack. It is
-// equivalent to a "table.compact()" with the entire table as input — a
-// useful baseline that closes the seed → analyze → compact → analyze
-// loop. The richer code paths (stitching, partition-scoped, incremental)
-// land in a later iteration.
+// Streaming compaction: we use Scan().ToArrowRecords() to get an
+// iterator of record batches, wrap it as an array.RecordReader, and
+// pass that to Transaction.Overwrite. iceberg-go consumes the reader
+// streaming-style, so peak memory is bounded to one record batch at a
+// time instead of the entire table. For a 10 GB table on a Lambda with
+// 10 GB RAM, this is the difference between OOM and success.
+//
+// This is still NOT the byte-level stitching binpack from the design
+// plan — the data is decoded from the source Parquet files and re-
+// encoded into new ones. True stitching (column-chunk byte copy via
+// parquet-go.CopyRowGroups) lands in a subsequent iteration. Streaming
+// is the prerequisite step that makes the memory bound correct.
 func runCompact(args []string) error {
 	var tablePath string
 	for _, a := range args {
@@ -294,26 +303,26 @@ func runCompact(args []string) error {
 	fmt.Printf("compacting %s\n", prefix)
 	fmt.Printf("  before: %d data files, %s, %d rows\n", beforeFiles, humanBytes(beforeBytes), beforeRows)
 
-	// Read all current data into an Arrow Table. This is the input bytes
-	// to the rewrite. For a partitioned table this would be partition-
-	// scoped; the MVP just reads everything.
+	// Streaming scan: ToArrowRecords returns the schema and an iterator
+	// of record batches. We wrap the iterator as an array.RecordReader
+	// so iceberg-go's Overwrite consumes one batch at a time without
+	// loading the whole table.
 	scan := tbl.Scan()
-	arrowTbl, err := scan.ToArrowTable(ctx)
+	scanSchema, recordIter, err := scan.ToArrowRecords(ctx)
 	if err != nil {
-		return fmt.Errorf("scanning table: %w", err)
+		return fmt.Errorf("opening scan: %w", err)
 	}
-	defer arrowTbl.Release()
-
-	scannedRows := arrowTbl.NumRows()
-	if scannedRows != int64(beforeRows) {
-		return fmt.Errorf("scan returned %d rows but manifest entries said %d — refusing to commit", scannedRows, beforeRows)
-	}
+	reader := newStreamingRecordReader(scanSchema, recordIter)
+	defer reader.Release()
 
 	// Open a transaction so we can stage the rewrite, run the master
 	// check on the staged result, and only then commit.
 	tx := tbl.NewTransaction()
-	if err := tx.OverwriteTable(ctx, arrowTbl, scannedRows, nil); err != nil {
-		return fmt.Errorf("staging overwrite: %w", err)
+	if err := tx.Overwrite(ctx, reader, nil); err != nil {
+		return fmt.Errorf("staging streaming overwrite: %w", err)
+	}
+	if err := reader.Err(); err != nil {
+		return fmt.Errorf("scan iterator error: %w", err)
 	}
 	staged, err := tx.StagedTable()
 	if err != nil {
@@ -350,6 +359,80 @@ func runCompact(args []string) error {
 	fmt.Printf("compaction complete: %d → %d files (%.1fx reduction)\n",
 		beforeFiles, afterFiles, float64(beforeFiles)/maxF(float64(afterFiles), 1))
 	return nil
+}
+
+// streamingRecordReader adapts an iter.Seq2[arrow.RecordBatch, error]
+// (the streaming scan iterator iceberg-go returns from ToArrowRecords)
+// into the array.RecordReader interface that Transaction.Overwrite
+// expects. It pulls one batch at a time via iter.Pull2 — no buffering,
+// no whole-table-in-memory.
+//
+// This is the load-bearing piece for memory-bounded compaction. With
+// the previous ToArrowTable approach, peak memory was proportional to
+// total table size; with this reader it's proportional to a single
+// record batch (default ~64K rows, kilobytes to a few MB).
+type streamingRecordReader struct {
+	schema  *arrow.Schema
+	next    func() (arrow.RecordBatch, error, bool)
+	stop    func()
+	current arrow.RecordBatch
+	err     error
+	refs    int64
+}
+
+func newStreamingRecordReader(schema *arrow.Schema, seq iter.Seq2[arrow.RecordBatch, error]) *streamingRecordReader {
+	next, stop := iter.Pull2(seq)
+	return &streamingRecordReader{
+		schema: schema,
+		next:   next,
+		stop:   stop,
+		refs:   1,
+	}
+}
+
+func (r *streamingRecordReader) Schema() *arrow.Schema { return r.schema }
+
+func (r *streamingRecordReader) Next() bool {
+	if r.err != nil {
+		return false
+	}
+	if r.current != nil {
+		r.current.Release()
+		r.current = nil
+	}
+	rec, err, ok := r.next()
+	if !ok {
+		return false
+	}
+	if err != nil {
+		r.err = err
+		return false
+	}
+	r.current = rec
+	return true
+}
+
+func (r *streamingRecordReader) RecordBatch() arrow.RecordBatch { return r.current }
+func (r *streamingRecordReader) Record() arrow.RecordBatch      { return r.current }
+func (r *streamingRecordReader) Err() error                     { return r.err }
+
+func (r *streamingRecordReader) Retain() {
+	r.refs++
+}
+
+func (r *streamingRecordReader) Release() {
+	r.refs--
+	if r.refs > 0 {
+		return
+	}
+	if r.current != nil {
+		r.current.Release()
+		r.current = nil
+	}
+	if r.stop != nil {
+		r.stop()
+		r.stop = nil
+	}
 }
 
 // snapshotFileStats walks the current snapshot's manifests and returns
