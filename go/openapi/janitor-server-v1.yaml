@@ -452,8 +452,12 @@ components:
       type: object
       description: |
         Output of pkg/safety.VerifyCompactionConsistency. Implemented
-        invariants: I1 (row count), I2 (schema), I7 (manifest
-        references). I3-I6, I8, I9 land in subsequent releases.
+        invariants: I1 (row count), I2 (schema by id), I3 (per-column
+        value count), I4 (per-column null count), I5 (per-column bounds
+        presence), I7 (manifest reference existence). I6 (V3 row
+        lineage), I8 (manifest set equality), I9 (content hash) land
+        alongside the maintenance ops that need them.
+
         This record is committed to the Iceberg snapshot summary so
         it's queryable forever via `<table>.snapshots`.
       required: [scheme_version, checked_at, checker_version, overall]
@@ -486,6 +490,39 @@ components:
           properties:
             in_id: { type: integer }
             out_id: { type: integer }
+            result: { type: string, enum: [pass, fail] }
+            reason: { type: string }
+        I3_value_counts:
+          type: object
+          properties:
+            checked: { type: integer }
+            passed: { type: integer }
+            failed_columns:
+              type: array
+              items: { type: integer }
+            result: { type: string, enum: [pass, fail] }
+            reason: { type: string }
+        I4_null_counts:
+          type: object
+          properties:
+            checked: { type: integer }
+            passed: { type: integer }
+            failed_columns:
+              type: array
+              items: { type: integer }
+            result: { type: string, enum: [pass, fail] }
+            reason: { type: string }
+        I5_bounds:
+          type: object
+          properties:
+            in_columns: { type: integer }
+            out_columns: { type: integer }
+            missing_in_out:
+              type: array
+              items: { type: integer }
+            spurious_in_out:
+              type: array
+              items: { type: integer }
             result: { type: string, enum: [pass, fail] }
             reason: { type: string }
         I7_manifest_refs:

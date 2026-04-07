@@ -21,8 +21,10 @@ import (
 
 // Verification is the structured result of running the master check on a
 // pending commit. Implemented invariants: I1 (row count), I2 (schema by
-// id), I7 (manifest reference existence). I3-I6, I8, I9 land as the
-// relevant maintenance ops do (sort, V3 row lineage, manifest rewrite).
+// id), I3 (per-column value count), I4 (per-column null count), I5
+// (per-column bounds presence + cardinality), I7 (manifest reference
+// existence). I6 (V3 row lineage), I8 (manifest set equality), and I9
+// (content hash) land alongside the maintenance ops that need them.
 type Verification struct {
 	SchemeVersion  int    `json:"scheme_version"`
 	CheckedAt      string `json:"checked_at"`
@@ -31,10 +33,13 @@ type Verification struct {
 	InputSnapshotID  int64 `json:"input_snapshot_id"`
 	OutputSnapshotID int64 `json:"output_snapshot_id"`
 
-	I1RowCount        RowCountCheck         `json:"I1_row_count"`
-	I2Schema          SchemaCheck           `json:"I2_schema"`
-	I7ManifestRefs    ManifestRefsCheck     `json:"I7_manifest_refs"`
-	// I3..I6, I8, I9 will be added by subsequent iterations.
+	I1RowCount     RowCountCheck     `json:"I1_row_count"`
+	I2Schema       SchemaCheck       `json:"I2_schema"`
+	I3ValueCounts  ColumnCountsCheck `json:"I3_value_counts"`
+	I4NullCounts   ColumnCountsCheck `json:"I4_null_counts"`
+	I5Bounds       BoundsCheck       `json:"I5_bounds"`
+	I7ManifestRefs ManifestRefsCheck `json:"I7_manifest_refs"`
+	// I6, I8, I9 will be added by subsequent iterations.
 
 	Overall string `json:"overall"` // "pass" | "fail"
 }
@@ -52,6 +57,35 @@ type SchemaCheck struct {
 	OutID  int    `json:"out_id"`
 	Result string `json:"result"`
 	Reason string `json:"reason,omitempty"`
+}
+
+// ColumnCountsCheck reports the result of summing a per-column count
+// (value count for I3, null count for I4) across all input data files
+// vs all staged data files. `Checked` is the number of columns
+// compared, `Passed` is the number that matched. On failure, the
+// `FailedColumns` slice lists the column IDs whose totals diverged.
+type ColumnCountsCheck struct {
+	Checked       int    `json:"checked"`
+	Passed        int    `json:"passed"`
+	FailedColumns []int  `json:"failed_columns,omitempty"`
+	Result        string `json:"result"`
+	Reason        string `json:"reason,omitempty"`
+}
+
+// BoundsCheck reports the result of the I5 column bounds presence
+// check. For the MVP, we verify that the SET of column IDs with
+// bounds present is identical between input and staged — the staged
+// snapshot must have bounds for every column the input had bounds
+// for, and not have spurious bounds for columns the input didn't.
+// The full byte-level (output ⊆ input) comparison lands alongside
+// sort / zorder compaction, which needs schema-typed decoding.
+type BoundsCheck struct {
+	InColumns      int    `json:"in_columns"`
+	OutColumns     int    `json:"out_columns"`
+	MissingInOut   []int  `json:"missing_in_out,omitempty"`
+	SpuriousInOut  []int  `json:"spurious_in_out,omitempty"`
+	Result         string `json:"result"`
+	Reason         string `json:"reason,omitempty"`
 }
 
 type ManifestRefsCheck struct {
@@ -88,23 +122,27 @@ func VerifyCompactionConsistency(ctx context.Context, before *icebergtable.Table
 		v.OutputSnapshotID = stagedSnap.SnapshotID
 	}
 
-	beforeRows, err := totalDataRows(ctx, before, props)
+	// Aggregate per-file stats for both before and staged in one walk
+	// each. We need rows (I1) plus per-column value counts, null
+	// counts, and bounds presence (I3, I4, I5).
+	beforeAgg, err := aggregateDataStats(ctx, before, props)
 	if err != nil {
-		return v, fmt.Errorf("counting rows in pre-compaction snapshot: %w", err)
+		return v, fmt.Errorf("aggregating pre-compaction stats: %w", err)
 	}
-	stagedRows, err := totalDataRows(ctx, staged.Table, props)
+	stagedAgg, err := aggregateDataStats(ctx, staged.Table, props)
 	if err != nil {
-		return v, fmt.Errorf("counting rows in staged snapshot: %w", err)
+		return v, fmt.Errorf("aggregating staged stats: %w", err)
 	}
 
+	// I1: total row count.
 	v.I1RowCount = RowCountCheck{
-		In:  beforeRows,
+		In:  beforeAgg.totalRows,
 		DVs: 0, // MVP: no deletion vectors yet
-		Out: stagedRows,
+		Out: stagedAgg.totalRows,
 	}
-	if beforeRows != stagedRows {
+	if beforeAgg.totalRows != stagedAgg.totalRows {
 		v.I1RowCount.Result = "fail"
-		v.I1RowCount.Reason = fmt.Sprintf("input rows %d != staged rows %d", beforeRows, stagedRows)
+		v.I1RowCount.Reason = fmt.Sprintf("input rows %d != staged rows %d", beforeAgg.totalRows, stagedAgg.totalRows)
 		v.Overall = "fail"
 		return v, fmt.Errorf("MASTER CHECK FAILED (I1 row count): %s", v.I1RowCount.Reason)
 	}
@@ -130,6 +168,32 @@ func VerifyCompactionConsistency(ctx context.Context, before *icebergtable.Table
 		return v, fmt.Errorf("MASTER CHECK FAILED (I2 schema): %s", v.I2Schema.Reason)
 	}
 	v.I2Schema.Result = "pass"
+
+	// I3: per-column value count. For each column id present in the
+	// input data files, the sum of value counts across all input data
+	// files must equal the sum across all staged data files.
+	v.I3ValueCounts = compareColumnCounts(beforeAgg.valueCounts, stagedAgg.valueCounts)
+	if v.I3ValueCounts.Result == "fail" {
+		v.Overall = "fail"
+		return v, fmt.Errorf("MASTER CHECK FAILED (I3 value counts): %s", v.I3ValueCounts.Reason)
+	}
+
+	// I4: per-column null count. Same shape as I3.
+	v.I4NullCounts = compareColumnCounts(beforeAgg.nullCounts, stagedAgg.nullCounts)
+	if v.I4NullCounts.Result == "fail" {
+		v.Overall = "fail"
+		return v, fmt.Errorf("MASTER CHECK FAILED (I4 null counts): %s", v.I4NullCounts.Reason)
+	}
+
+	// I5: column bounds presence. Every column with bounds in the
+	// input must also have bounds in the staged output. The full
+	// byte-level (output ⊆ input) check requires schema-typed decoding
+	// and lands alongside sort/zorder compaction.
+	v.I5Bounds = compareBoundsPresence(beforeAgg.boundsCols, stagedAgg.boundsCols)
+	if v.I5Bounds.Result == "fail" {
+		v.Overall = "fail"
+		return v, fmt.Errorf("MASTER CHECK FAILED (I5 bounds): %s", v.I5Bounds.Reason)
+	}
 
 	// I7: manifest reference existence. Every data file referenced by
 	// the staged snapshot's manifests must actually exist in object
@@ -199,12 +263,29 @@ func verifyManifestReferences(ctx context.Context, tbl *icebergtable.Table, prop
 	return checked, passed, nil
 }
 
-// totalDataRows walks the current snapshot's manifests and sums the row
-// counts of every data file. Delete files are ignored — MVP scope.
-func totalDataRows(ctx context.Context, tbl *icebergtable.Table, props map[string]string) (int64, error) {
+// dataStats aggregates per-column counts and bounds presence across
+// all data files in a snapshot. The maps are keyed by column id.
+type dataStats struct {
+	totalRows   int64
+	valueCounts map[int]int64 // sum of DataFile.ValueCounts across all files
+	nullCounts  map[int]int64 // sum of DataFile.NullValueCounts
+	boundsCols  map[int]bool  // column ids that have bounds set in at least one file
+}
+
+// aggregateDataStats walks the current snapshot's manifests, reads
+// every data file's per-column statistics from the manifest entry, and
+// returns the aggregate. Delete files are ignored — MVP scope. Cost is
+// the same as totalDataRows used to be: it's a single walk over the
+// manifest entries with no extra I/O.
+func aggregateDataStats(ctx context.Context, tbl *icebergtable.Table, props map[string]string) (*dataStats, error) {
+	out := &dataStats{
+		valueCounts: map[int]int64{},
+		nullCounts:  map[int]int64{},
+		boundsCols:  map[int]bool{},
+	}
 	snap := tbl.CurrentSnapshot()
 	if snap == nil {
-		return 0, nil
+		return out, nil
 	}
 	fs, err := tbl.FS(ctx)
 	if err != nil {
@@ -212,33 +293,113 @@ func totalDataRows(ctx context.Context, tbl *icebergtable.Table, props map[strin
 		// back to opening one from the metadata location and the props.
 		fs, err = openFS(ctx, tbl.MetadataLocation(), props)
 		if err != nil {
-			return 0, fmt.Errorf("opening table FS: %w", err)
+			return nil, fmt.Errorf("opening table FS: %w", err)
 		}
 	}
 	manifests, err := snap.Manifests(fs)
 	if err != nil {
-		return 0, fmt.Errorf("listing manifests: %w", err)
+		return nil, fmt.Errorf("listing manifests: %w", err)
 	}
-	var total int64
 	for _, m := range manifests {
 		mf, err := fs.Open(m.FilePath())
 		if err != nil {
-			return 0, fmt.Errorf("opening manifest %s: %w", m.FilePath(), err)
+			return nil, fmt.Errorf("opening manifest %s: %w", m.FilePath(), err)
 		}
 		entries, err := icebergpkg.ReadManifest(m, mf, true)
 		mf.Close()
 		if err != nil {
-			return 0, fmt.Errorf("reading manifest %s: %w", m.FilePath(), err)
+			return nil, fmt.Errorf("reading manifest %s: %w", m.FilePath(), err)
 		}
 		for _, e := range entries {
 			df := e.DataFile()
 			if df == nil || df.ContentType() != icebergpkg.EntryContentData {
 				continue
 			}
-			total += df.Count()
+			out.totalRows += df.Count()
+			for col, n := range df.ValueCounts() {
+				out.valueCounts[col] += n
+			}
+			for col, n := range df.NullValueCounts() {
+				out.nullCounts[col] += n
+			}
+			for col := range df.LowerBoundValues() {
+				out.boundsCols[col] = true
+			}
+			for col := range df.UpperBoundValues() {
+				out.boundsCols[col] = true
+			}
 		}
 	}
-	return total, nil
+	return out, nil
+}
+
+// compareColumnCounts is the I3/I4 worker: it compares two per-column
+// sum maps and returns a structured ColumnCountsCheck. The check is
+// strict equality on every column id present in either map.
+func compareColumnCounts(in, out map[int]int64) ColumnCountsCheck {
+	result := ColumnCountsCheck{}
+	cols := unionKeys(in, out)
+	result.Checked = len(cols)
+	for _, col := range cols {
+		if in[col] == out[col] {
+			result.Passed++
+		} else {
+			result.FailedColumns = append(result.FailedColumns, col)
+		}
+	}
+	if len(result.FailedColumns) == 0 {
+		result.Result = "pass"
+		return result
+	}
+	result.Result = "fail"
+	result.Reason = fmt.Sprintf("%d/%d columns mismatched (column ids: %v)",
+		len(result.FailedColumns), result.Checked, result.FailedColumns)
+	return result
+}
+
+// compareBoundsPresence is the I5 worker (MVP scope: presence + set
+// equality, not byte-level bounds intersection). The set of column
+// ids that have bounds in the input must equal the set in the staged
+// output, modulo columns that legitimately have no values (whose bounds
+// can't be computed).
+func compareBoundsPresence(in, out map[int]bool) BoundsCheck {
+	result := BoundsCheck{
+		InColumns:  len(in),
+		OutColumns: len(out),
+	}
+	for col := range in {
+		if !out[col] {
+			result.MissingInOut = append(result.MissingInOut, col)
+		}
+	}
+	for col := range out {
+		if !in[col] {
+			result.SpuriousInOut = append(result.SpuriousInOut, col)
+		}
+	}
+	if len(result.MissingInOut) == 0 && len(result.SpuriousInOut) == 0 {
+		result.Result = "pass"
+		return result
+	}
+	result.Result = "fail"
+	result.Reason = fmt.Sprintf("bounds set mismatch: missing_in_out=%v spurious_in_out=%v",
+		result.MissingInOut, result.SpuriousInOut)
+	return result
+}
+
+func unionKeys(a, b map[int]int64) []int {
+	seen := map[int]struct{}{}
+	for k := range a {
+		seen[k] = struct{}{}
+	}
+	for k := range b {
+		seen[k] = struct{}{}
+	}
+	out := make([]int, 0, len(seen))
+	for k := range seen {
+		out = append(out, k)
+	}
+	return out
 }
 
 func openFS(ctx context.Context, location string, props map[string]string) (icebergio.IO, error) {

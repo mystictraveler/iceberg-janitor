@@ -149,12 +149,18 @@ mvp-analyze-local:
 	cd go && JANITOR_WAREHOUSE_URL='$(MVP_WAREHOUSE_LOCAL)' \
 		go run ./cmd/janitor-cli analyze $(MVP_NAMESPACE).db/$(MVP_TABLE)
 
-# DuckDB query benchmark — runs after seed (and after compaction, when implemented)
-# Reads the same Iceberg table the Go janitor maintains, via the iceberg_scan
-# function from DuckDB's iceberg extension. We pass the explicit metadata.json
-# path because DuckDB refuses to "guess" the current version in the absence of
-# a version-hint.text file (it considers max-version scan unsafe in
-# multi-writer scenarios). The path is the latest one we just produced.
+# DuckDB query benchmark — runs after seed (and after compaction).
+# Reads the same Iceberg table the Go janitor maintains, via DuckDB's
+# iceberg extension. Round-trip verification: an independent query
+# engine MUST see the same data the Go writer wrote and the Go janitor
+# rewrote.
+#
+# DuckDB refuses to "guess" the current metadata version without an
+# explicit path (it considers max-version scan unsafe under multi-writer
+# concurrency). For local fileblob we resolve the path with `ls`. For
+# MinIO we set unsafe_enable_version_guessing because the MVP test loop
+# is single-writer and we want a flag-free experience for the operator.
+
 mvp-query-local:
 	@meta=$$(ls -1 /tmp/janitor-mvp/mvp.db/events/metadata/*.metadata.json | sort | tail -1) && \
 	echo "metadata: $$meta" && \
@@ -162,6 +168,21 @@ mvp-query-local:
 		SELECT count(*) AS row_count, count(DISTINCT user_id) AS distinct_users, \
 		       count(DISTINCT event_type) AS event_types \
 		FROM iceberg_scan('$$meta');"
+
+# Round-trip query against the MinIO warehouse via DuckDB's httpfs +
+# iceberg extensions. Requires MinIO to be running (`make mvp-up`) and
+# a seeded table (`make mvp-seed`).
+mvp-query:
+	@duckdb -c "INSTALL httpfs; LOAD httpfs; \
+		INSTALL iceberg; LOAD iceberg; \
+		CREATE OR REPLACE SECRET minio_secret ( \
+			TYPE S3, KEY_ID 'minioadmin', SECRET 'minioadmin', \
+			ENDPOINT 'localhost:9000', URL_STYLE 'path', USE_SSL false); \
+		SET unsafe_enable_version_guessing = true; \
+		SELECT count(*) AS row_count, \
+		       count(DISTINCT user_id) AS distinct_users, \
+		       count(DISTINCT event_type) AS event_types \
+		FROM iceberg_scan('s3://warehouse/$(MVP_NAMESPACE).db/$(MVP_TABLE)');"
 
 # Cleanup
 clean:

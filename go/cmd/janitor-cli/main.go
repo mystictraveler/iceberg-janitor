@@ -367,11 +367,19 @@ func printCompactResult(tablePath string, r *janitor.CompactResult, runErr error
 		r.BeforeFiles, humanBytes(r.BeforeBytes), r.BeforeRows, r.BeforeSnapshotID)
 	if r.Verification != nil {
 		v := r.Verification
-		fmt.Printf("  master check: %s (I1 in=%d out=%d  I2 schema=%d  I7 refs=%d/%d)\n",
-			strings.ToUpper(v.Overall),
-			v.I1RowCount.In, v.I1RowCount.Out,
-			v.I2Schema.OutID,
-			v.I7ManifestRefs.Passed, v.I7ManifestRefs.Checked)
+		fmt.Printf("  master check: %s\n", strings.ToUpper(v.Overall))
+		fmt.Printf("    I1 row count:   in=%d out=%d (%s)\n",
+			v.I1RowCount.In, v.I1RowCount.Out, v.I1RowCount.Result)
+		fmt.Printf("    I2 schema:      id=%d (%s)\n",
+			v.I2Schema.OutID, v.I2Schema.Result)
+		fmt.Printf("    I3 value cnts:  %d/%d cols (%s)\n",
+			v.I3ValueCounts.Passed, v.I3ValueCounts.Checked, v.I3ValueCounts.Result)
+		fmt.Printf("    I4 null cnts:   %d/%d cols (%s)\n",
+			v.I4NullCounts.Passed, v.I4NullCounts.Checked, v.I4NullCounts.Result)
+		fmt.Printf("    I5 bounds:      in=%d out=%d cols (%s)\n",
+			v.I5Bounds.InColumns, v.I5Bounds.OutColumns, v.I5Bounds.Result)
+		fmt.Printf("    I7 manif refs:  %d/%d files (%s)\n",
+			v.I7ManifestRefs.Passed, v.I7ManifestRefs.Checked, v.I7ManifestRefs.Result)
 	}
 	if runErr != nil {
 		fmt.Fprintf(os.Stderr, "compaction failed after %d attempt(s): %v\n", r.Attempts, runErr)

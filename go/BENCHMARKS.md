@@ -37,6 +37,41 @@ still ahead.
 
 ---
 
+## MVP++++ — DuckDB-against-MinIO round-trip + I3/I4/I5 master check
+
+**What's new since the previous entry:**
+- **`make mvp-query` works against MinIO.** DuckDB's `httpfs` + `iceberg` extensions read the same Iceberg table the Go janitor compacted, with the connection configured via `CREATE SECRET (TYPE S3, ENDPOINT 'localhost:9000', URL_STYLE 'path', USE_SSL false)`. `unsafe_enable_version_guessing=true` is set because the MVP test loop is single-writer; production deployments should pass an explicit metadata path.
+- **Master check now runs SIX of nine planned invariants.** Three new invariants landed: I3 per-column value count, I4 per-column null count, I5 per-column bounds presence. All read from `DataFile.ValueCounts() / NullValueCounts() / LowerBoundValues() / UpperBoundValues()` — no extra I/O beyond what the existing manifest walk already does.
+
+### Run 2b — full MinIO round-trip with DuckDB query
+
+| Step | Command | Result |
+|---|---|---|
+| Bring up MinIO | `make mvp-up` | docker compose; bucket auto-created |
+| Seed | `make mvp-seed MVP_NUM_BATCHES=10 MVP_ROWS_PER_BATCH=2000` | 10 small files in 162 ms |
+| Pre-compact query | `make mvp-query` | `20000 rows / 10000 distinct users / 6 event types` |
+| Compact via CLI | `JANITOR_WAREHOUSE_URL='s3://warehouse?...' ... go run ./cmd/janitor-cli compact mvp.db/events` | **10 → 1 files**, 67.2 KiB → 36.0 KiB, master check PASS, 116 ms |
+| Post-compact query | `make mvp-query` | `20000 rows / 10000 distinct users / 6 event types` — **identical** |
+
+This is the **complete cloud-side round trip**: Go writer → S3 → Go reader → S3 → Go compactor → S3 → DuckDB reader. Three independent code paths converge on the same Iceberg table layout against MinIO with no catalog service.
+
+### Run 1d — six-invariant master check (local fileblob)
+
+| Step | Command | Result |
+|---|---|---|
+| Seed | `make mvp-seed-local MVP_NUM_BATCHES=15 MVP_ROWS_PER_BATCH=3000` | 15 × 3,000 rows |
+| Compact | `cd go && JANITOR_WAREHOUSE_URL=file:///tmp/janitor-mvp go run ./cmd/janitor-cli compact mvp.db/events` | **15 → 1 files**, 131.3 KiB → 81.0 KiB |
+| Master check (all 6 ran pre-commit) | | |
+| &nbsp;&nbsp;I1 row count | | in=45000 out=45000 (pass) |
+| &nbsp;&nbsp;I2 schema | | id=0 (pass) |
+| &nbsp;&nbsp;I3 per-col value cnts | | 5/5 cols (pass) |
+| &nbsp;&nbsp;I4 per-col null cnts | | 5/5 cols (pass) |
+| &nbsp;&nbsp;I5 col bounds presence | | in=5 out=5 cols (pass) |
+| &nbsp;&nbsp;I7 manifest refs | | 1/1 files (pass) |
+| Total wall time | | 50 ms |
+
+The 5-column count matches the synthetic schema (`event_id`, `event_type`, `user_id`, `payload`, `event_time`). The bounds check is a presence + cardinality check — the input has bounds for all 5 columns and the output has bounds for all 5 columns. The full byte-level (output ⊆ input) bounds intersection check requires schema-typed decoding and lands alongside sort/zorder compaction.
+
 ## MVP++ — Streaming compaction (memory-bounded)
 
 **What's new since the previous entry:**
@@ -122,7 +157,8 @@ The MVP intentionally uses the simplest possible compaction implementation (`Tra
 | Workload classifier (streaming vs batch) | Streaming tables get 5-min cadence and 60s write-buffer; batch tables stay on hourly cadence | Not yet implemented |
 | Adaptive tier dispatch via feedback loop | Per-table convergence on warm vs task tier without operator tuning | Not yet implemented |
 | Master check invariants I2 (schema), I7 (manifest references) | Catches schema drift and dangling manifest entries pre-commit | ✅ Shipped |
-| Master check invariants I3–I6, I8, I9 (value/null counts, bounds, V3 row lineage, manifest set equality, content hash) | Catches the rest of the failure modes — finer-grained than I1 | Not yet implemented |
+| Master check invariants I3 (per-column value counts), I4 (per-column null counts), I5 (per-column bounds presence) | Catches per-column row loss, null/non-null drift, dropped statistics | ✅ Shipped |
+| Master check invariants I6 (V3 row lineage), I8 (manifest set equality), I9 (content hash) | The remaining three invariants — V3-specific, manifest-rewrite-specific, stitching-specific | Not yet implemented |
 | Atomic CAS commit (local POSIX `os.Link`, cloud `IfNotExist`) | Multi-writer safety without an external coordination service | ✅ Shipped, verified by `cas_test.go` (32-goroutine race, 5/5 runs, exactly 1 winner) |
 | Circuit breakers (CB1–CB11) and three-tier kill switch | Self-recognition and runaway prevention | Not yet implemented |
 
