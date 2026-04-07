@@ -141,6 +141,18 @@ The Go implementation has shipped an end-to-end MVP loop. Reproducible commands 
 - **End-to-end loop verified** against both local fileblob and MinIO over docker. **DuckDB independently reads the same Iceberg table the Go janitor wrote** and returns identical results — the round-trip proof that the directory catalog is correct.
 - **Three-implementation convergence**: Go writer (iceberg-go via SqlCatalog), Go reader (DirectoryCatalog), and DuckDB reader all converge on the same Iceberg table layout without any catalog service. That's the validation of the architectural bet.
 
+### Known security caveat for the Go MVP
+
+**Today, `janitor-cli` is a thick client.** It opens its own connection to the warehouse object store using the credentials in its environment (`AWS_ACCESS_KEY_ID`, `S3_ENDPOINT`, etc.). It does **not** call any API on a running janitor service — it IS the janitor for the duration of the command. This is fine for local development and the MVP test loop, but it has real implications for production:
+
+- The operator running `janitor-cli compact` needs **warehouse-level read+write IAM** to reach the data and metadata files. That's a sensitive credential to give an operator.
+- A panic-button operator with warehouse-write credentials on their laptop is a security surface.
+- There's no rate-limiting, no quota, and no centralized audit beyond what the cloud provider's native audit logs capture.
+
+**The intended production split** is read-only commands (`analyze`, `discover`, `status`, `history`, `inspect`, `plan`) running standalone with read-only IAM, and **mutating commands** (`compact`, `expire`, `cleanup`, `force`, `pause`, `cancel`) hitting a running `cmd/janitor-server` via an authenticated HTTP API. The server has the warehouse-write IAM; the operator has a session-scoped API token. The Python implementation already has this surface (FastAPI, 9 endpoints). The Go implementation hasn't built `cmd/janitor-server` yet — it's in the planned list below.
+
+The architectural plan is for the CLI to become a **dual-mode** binary: if `JANITOR_API_URL` is set, the CLI dispatches mutating commands to that endpoint; otherwise it falls back to opening the warehouse directly (the current behavior, useful for laptop dev and emergency access). Read-only commands work either way. This is decision #20 in the plan ("Operator CLI as the only control plane") refined with the explicit two-mode dispatch.
+
 ### Planned (next iterations)
 
 Tracked in [`/Users/jp/.claude/plans/async-plotting-cake.md`](/Users/jp/.claude/plans/async-plotting-cake.md), the 27-decision design plan:
