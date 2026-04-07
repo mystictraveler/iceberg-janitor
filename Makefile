@@ -184,6 +184,29 @@ mvp-query:
 		       count(DISTINCT event_type) AS event_types \
 		FROM iceberg_scan('s3://warehouse/$(MVP_NAMESPACE).db/$(MVP_TABLE)');"
 
+# === TPC-DS streaming benchmark (with-janitor vs without-janitor) ===
+# Drives two parallel warehouses, streams identical TPC-DS micro-batches
+# into both, periodically runs janitor compact on the with-janitor side,
+# runs the 10 canonical TPC-DS queries via DuckDB at intervals, records
+# results to CSV, prints a comparison report.
+#
+# Defaults: 5 minutes, local fileblob, no Docker. For AWS, set
+# WAREHOUSE_BASE=s3://your-bucket and provide AWS credentials.
+
+bench-tpcds:
+	@./go/test/bench/bench-tpcds.sh
+
+bench-tpcds-quick:
+	@DURATION_SECONDS=60 QUERY_INTERVAL_SECONDS=15 MAINTENANCE_INTERVAL_SECONDS=20 \
+		./go/test/bench/bench-tpcds.sh
+
+bench-tpcds-aws:
+	@WAREHOUSE_BASE=$${WAREHOUSE_BASE:?set WAREHOUSE_BASE to s3://your-bucket} \
+		DURATION_SECONDS=$${DURATION_SECONDS:-1800} \
+		QUERY_INTERVAL_SECONDS=$${QUERY_INTERVAL_SECONDS:-120} \
+		MAINTENANCE_INTERVAL_SECONDS=$${MAINTENANCE_INTERVAL_SECONDS:-180} \
+		./go/test/bench/bench-tpcds.sh
+
 # Cleanup
 clean:
 	rm -rf dist/ build/ *.egg-info src/*.egg-info

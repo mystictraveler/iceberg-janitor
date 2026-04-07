@@ -38,3 +38,6 @@ Thumbs.db
 # Environment
 .env
 .env.local
+
+# Bench harness output (regenerable; large; never commit)
+bench-results/

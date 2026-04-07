@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"iter"
+	"strings"
 	"time"
 
 	"github.com/apache/arrow-go/v18/arrow"
@@ -14,6 +15,54 @@ import (
 	"github.com/mystictraveler/iceberg-janitor/go/pkg/catalog"
 	"github.com/mystictraveler/iceberg-janitor/go/pkg/safety"
 )
+
+// IsRetryableConcurrencyError reports whether `err` represents an
+// optimistic-concurrency conflict that the caller should respond to by
+// reloading the table and retrying from scratch (rather than treating
+// as a hard failure).
+//
+// There are TWO layers at which a janitor commit can lose a
+// concurrent-write race, and both should drive a retry:
+//
+//  1. Our directory catalog's per-key conditional write fails with
+//     catalog.ErrCASConflict because another writer committed
+//     v(N+1).metadata.json before us. This is the case our retry loop
+//     was originally designed for.
+//
+//  2. iceberg-go's Transaction.Commit calls Requirement.Validate
+//     against the current metadata BEFORE our DirectoryCatalog.
+//     CommitTable is even invoked. If the streamer commits between our
+//     stage and our commit, the staged transaction's branch-snapshot
+//     requirement no longer matches and validation fails with a
+//     "requirement failed: branch main has changed: expected id X,
+//     found Y" error (and several similar variants for other
+//     requirement types — schema id changed, last assigned field id
+//     changed, default spec id changed, etc).
+//
+// The iceberg-go errors are plain fmt.Errorf strings with no
+// exported sentinel, so we string-match on the consistent
+// "has changed" substring. All six requirement-validation failure
+// messages in iceberg-go's table/requirements.go contain it (case
+// varies, so we lowercase first). The match is intentionally narrow:
+// we only retry on concurrency-conflict errors, NOT on other
+// requirement failures like assertTableUuid mismatches (which would
+// indicate a programming bug, not a race).
+//
+// This helper is the fix for github.com/mystictraveler/iceberg-janitor#1.
+func IsRetryableConcurrencyError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, catalog.ErrCASConflict) {
+		return true
+	}
+	msg := strings.ToLower(err.Error())
+	if strings.Contains(msg, "has changed") &&
+		(strings.Contains(msg, "requirement failed") || strings.Contains(msg, "requirement validation failed")) {
+		return true
+	}
+	return false
+}
 
 // CompactOptions configure a single Compact call. The MVP exposes only
 // the bare minimum; partition scoping, sort order, ROI estimate, and
@@ -87,7 +136,10 @@ func Compact(ctx context.Context, cat *catalog.DirectoryCatalog, ident icebergta
 			result.DurationMs = time.Since(started).Milliseconds()
 			return result, nil
 		}
-		if !errors.Is(err, catalog.ErrCASConflict) {
+		// Retry on either layer of optimistic-concurrency conflict:
+		// our directory catalog's CAS or iceberg-go's requirement
+		// validation. See IsRetryableConcurrencyError for details.
+		if !IsRetryableConcurrencyError(err) {
 			result.DurationMs = time.Since(started).Milliseconds()
 			return result, err
 		}
@@ -100,7 +152,7 @@ func Compact(ctx context.Context, cat *catalog.DirectoryCatalog, ident icebergta
 		backoff *= 2
 	}
 	result.DurationMs = time.Since(started).Milliseconds()
-	return result, fmt.Errorf("compaction failed: exceeded %d CAS-retry attempts", opts.MaxAttempts)
+	return result, fmt.Errorf("compaction failed: exceeded %d concurrency-retry attempts", opts.MaxAttempts)
 }
 
 // compactOnce performs a single compaction attempt. It loads the table
