@@ -78,6 +78,7 @@ import (
 	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/apache/arrow-go/v18/arrow/array"
 	icebergpkg "github.com/apache/iceberg-go"
+	icebergcat "github.com/apache/iceberg-go/catalog"
 	icebergsql "github.com/apache/iceberg-go/catalog/sql"
 	icebergtable "github.com/apache/iceberg-go/table"
 
@@ -86,6 +87,50 @@ import (
 
 	"github.com/mystictraveler/iceberg-janitor/go/pkg/tpcds"
 )
+
+// factPartitionSpec declares the partition spec the streamer applies
+// to each fact table at create time. We use IDENTITY transforms on
+// columns with good uniformity rather than bucket transforms because
+// identity-partitioned columns can be directly filtered by row-level
+// predicates (iceberg.EqualTo(iceberg.Reference("ss_store_sk"), 5)),
+// which is what pkg/janitor.Compact's RowFilter expects. Bucket
+// transforms produce a partition-field name that isn't in the row
+// schema, so iceberg-go's predicate binder can't bind to it.
+//
+// Partition cardinality:
+//   store_sales:   ss_store_sk        → 50 partitions (50 stores)
+//   store_returns: sr_store_sk        → 50 partitions
+//   catalog_sales: cs_call_center_sk  → 10 partitions (10 call centers)
+//
+// SourceID values match the field IDs in pkg/tpcds/schemas.go:
+// ss_store_sk is field 8 of store_sales, sr_store_sk is field 8 of
+// store_returns, cs_call_center_sk is field 12 of catalog_sales.
+func factPartitionSpec(table string) icebergpkg.PartitionSpec {
+	switch table {
+	case "store_sales":
+		return icebergpkg.NewPartitionSpec(icebergpkg.PartitionField{
+			SourceID:  8,
+			FieldID:   1000,
+			Name:      "ss_store_sk",
+			Transform: icebergpkg.IdentityTransform{},
+		})
+	case "store_returns":
+		return icebergpkg.NewPartitionSpec(icebergpkg.PartitionField{
+			SourceID:  8,
+			FieldID:   1000,
+			Name:      "sr_store_sk",
+			Transform: icebergpkg.IdentityTransform{},
+		})
+	case "catalog_sales":
+		return icebergpkg.NewPartitionSpec(icebergpkg.PartitionField{
+			SourceID:  12,
+			FieldID:   1000,
+			Name:      "cs_call_center_sk",
+			Transform: icebergpkg.IdentityTransform{},
+		})
+	}
+	return *icebergpkg.UnpartitionedSpec
+}
 
 type config struct {
 	WarehouseURL         string
@@ -265,7 +310,11 @@ func run(ctx context.Context, cfg config) error {
 	// === Phase 2: stream facts (continuous, micro-batch) ===
 	fmt.Println("Phase 2: streaming facts")
 
-	// Make sure each fact table exists.
+	// Make sure each fact table exists. Apply a per-fact partition spec
+	// at create time so the bench can compact one partition at a time
+	// — the smaller-scope-per-compaction fix for the writer-fight
+	// pathology that mystictraveler/iceberg-janitor#1 only partially
+	// addressed.
 	factTables := map[string]*icebergtable.Table{}
 	for name, schema := range tpcds.FactTables {
 		ident := icebergtable.Identifier{cfg.Namespace, name}
@@ -274,7 +323,8 @@ func run(ctx context.Context, cfg config) error {
 		}
 		tbl, err := cat.LoadTable(ctx, ident)
 		if err != nil {
-			tbl, err = cat.CreateTable(ctx, ident, schema)
+			spec := factPartitionSpec(name)
+			tbl, err = cat.CreateTable(ctx, ident, schema, icebergcat.WithPartitionSpec(&spec))
 			if err != nil {
 				return fmt.Errorf("creating %s: %w", name, err)
 			}

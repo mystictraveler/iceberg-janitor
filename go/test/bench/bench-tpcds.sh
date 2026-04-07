@@ -396,13 +396,30 @@ EOF
   rm -f "$setup_file" "$sql_file"
 }
 
+## run_janitor_compact rotates through partitions on each invocation
+## rather than compacting the whole table. This is the
+## smaller-scope-per-compaction primitive: each invocation only
+## conflicts with streamer commits to the one partition we touch, so
+## the writer-fight rate (catalog.ErrCASConflict + iceberg-go branch
+## requirement validation failures) drops by ~1/N where N is the
+## partition count. The streamer partitions store_sales/store_returns
+## on the store key (50 values) and catalog_sales on the call-center
+## key (10 values); the column names in --partition match the source
+## column directly because we use IdentityTransform partition specs.
+COMPACT_ROUND=0
 run_janitor_compact() {
   local warehouse_url="$1"
-  log "running janitor compact on with-janitor warehouse"
-  for table in store_sales store_returns catalog_sales; do
-    JANITOR_WAREHOUSE_URL="$warehouse_url" /tmp/janitor-cli compact "${NAMESPACE}.db/${table}" \
-      >> "$JANITOR_LOG" 2>&1 || log "  warning: compact ${table} returned non-zero (this is OK if the streamer was mid-commit)"
-  done
+  COMPACT_ROUND=$((COMPACT_ROUND + 1))
+  local ss_part=$(( (COMPACT_ROUND % 50) + 1 ))
+  local sr_part=$(( (COMPACT_ROUND % 50) + 1 ))
+  local cs_part=$(( (COMPACT_ROUND % 10) + 1 ))
+  log "running janitor compact (round ${COMPACT_ROUND}: ss_store_sk=${ss_part}, sr_store_sk=${sr_part}, cs_call_center_sk=${cs_part})"
+  JANITOR_WAREHOUSE_URL="$warehouse_url" /tmp/janitor-cli compact "${NAMESPACE}.db/store_sales" --partition "ss_store_sk=${ss_part}" \
+    >> "$JANITOR_LOG" 2>&1 || log "  warning: compact store_sales partition returned non-zero"
+  JANITOR_WAREHOUSE_URL="$warehouse_url" /tmp/janitor-cli compact "${NAMESPACE}.db/store_returns" --partition "sr_store_sk=${sr_part}" \
+    >> "$JANITOR_LOG" 2>&1 || log "  warning: compact store_returns partition returned non-zero"
+  JANITOR_WAREHOUSE_URL="$warehouse_url" /tmp/janitor-cli compact "${NAMESPACE}.db/catalog_sales" --partition "cs_call_center_sk=${cs_part}" \
+    >> "$JANITOR_LOG" 2>&1 || log "  warning: compact catalog_sales partition returned non-zero"
 }
 
 # === Phase 3: main loop ===

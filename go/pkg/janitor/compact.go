@@ -5,16 +5,48 @@ import (
 	"errors"
 	"fmt"
 	"iter"
+	"os"
+	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/apache/arrow-go/v18/arrow"
 	icebergpkg "github.com/apache/iceberg-go"
+	icebergconfig "github.com/apache/iceberg-go/config"
 	icebergtable "github.com/apache/iceberg-go/table"
 
 	"github.com/mystictraveler/iceberg-janitor/go/pkg/catalog"
 	"github.com/mystictraveler/iceberg-janitor/go/pkg/safety"
 )
+
+// applyIcebergMaxWorkersOverride sets iceberg-go's package-level
+// config.EnvConfig.MaxWorkers from JANITOR_ICEBERG_MAX_WORKERS, if set.
+// This is the diagnostic switch for github.com/mystictraveler/iceberg-janitor#4
+// (master check fails under concurrent writes — suspected
+// partitionedFanoutWriter race). Setting this to 1 forces single-worker
+// fanout. If the master check failures vanish at MaxWorkers=1 but
+// reappear at MaxWorkers=5 (the iceberg-go default), the writer race
+// is confirmed and we file upstream against apache/iceberg-go.
+//
+// EnvConfig is a package-level var with no exported setter, so we
+// mutate it directly. We do this once per process under a sync.Once
+// because EnvConfig has no concurrent-write protection of its own.
+var icebergMaxWorkersOnce sync.Once
+
+func applyIcebergMaxWorkersOverride() {
+	icebergMaxWorkersOnce.Do(func() {
+		v := os.Getenv("JANITOR_ICEBERG_MAX_WORKERS")
+		if v == "" {
+			return
+		}
+		n, err := strconv.Atoi(v)
+		if err != nil || n <= 0 {
+			return
+		}
+		icebergconfig.EnvConfig.MaxWorkers = n
+	})
+}
 
 // IsRetryableConcurrencyError reports whether `err` represents an
 // optimistic-concurrency conflict that the caller should respond to by
@@ -64,20 +96,65 @@ func IsRetryableConcurrencyError(err error) bool {
 	return false
 }
 
-// CompactOptions configure a single Compact call. The MVP exposes only
-// the bare minimum; partition scoping, sort order, ROI estimate, and
-// the rest land as the relevant maintenance ops do.
+// CompactOptions configure a single Compact call.
 type CompactOptions struct {
 	// MaxAttempts caps the CAS-conflict retry loop. Default 5.
 	MaxAttempts int
 	// InitialBackoff is the wait between the first failed attempt and
 	// the second. Doubles each time. Default 100ms.
 	InitialBackoff time.Duration
+	// RowFilter, if non-nil, scopes the compaction to only the rows
+	// (and therefore only the data files) matching the predicate.
+	// This is the smaller-scope-per-compaction primitive for the
+	// writer-fight pathology: instead of compacting the whole table
+	// in one big atomic transaction (which races the streamer for
+	// every file the streamer wrote since we started planning), we
+	// compact one partition's worth of files in a smaller transaction
+	// that only conflicts with the streamer's commits to that one
+	// partition.
+	//
+	// The filter MUST align with a partition predicate of the table
+	// — e.g. iceberg.EqualTo(iceberg.Reference("ss_store_bucket"), 5).
+	// Iceberg's overwrite-with-filter semantics:
+	//   - Files where ALL rows match the filter are completely deleted
+	//   - Files where SOME rows match are rewritten to keep only
+	//     non-matching rows
+	//   - Files where NO rows match are kept unchanged
+	// For partition predicates, all rows in a file have the same
+	// partition value, so each file is either fully matched or fully
+	// non-matched and the rewrite-partial path doesn't fire.
+	//
+	// nil means "compact the whole table" (the previous behavior).
+	RowFilter icebergpkg.BooleanExpression
+
+	// PartitionTuple is the parquet-go-path equivalent of RowFilter.
+	// The CLI sets BOTH from a single --partition col=value flag:
+	// RowFilter is the iceberg.BooleanExpression form (used by the
+	// legacy compactOnce path that still calls iceberg-go's scan
+	// API), PartitionTuple is the bare map form (used by
+	// compactOnceReplace, which walks manifests directly without
+	// going through iceberg-go's scan / classifier and so doesn't
+	// want a BooleanExpression to walk). Both must agree if both are
+	// set; both being nil means "whole table".
+	//
+	// Map key is the schema column name (e.g. "ss_store_sk"); value
+	// is the typed Go value (int64 for the int columns we currently
+	// support). compactOnceReplace looks up the column's iceberg
+	// field id from the table schema, then matches against
+	// DataFile.Partition()[partition_field_id].
+	PartitionTuple map[string]any
 }
 
 func (o *CompactOptions) defaults() {
 	if o.MaxAttempts <= 0 {
-		o.MaxAttempts = 5
+		// 15 attempts at exponential backoff (100ms doubling) gives
+		// us ~50s of patience under writer-fight, which is enough
+		// for the streamer to leave a quiet window between commit
+		// bursts on the partition we're touching. Was 5 originally;
+		// bumped after the parquet-go-direct compaction path
+		// eliminated the row-loss bug and surfaced retry exhaustion
+		// as the next-largest failure mode under streaming load.
+		o.MaxAttempts = 15
 	}
 	if o.InitialBackoff <= 0 {
 		o.InitialBackoff = 100 * time.Millisecond
@@ -125,13 +202,24 @@ type CompactResult struct {
 // True stitching (column-chunk byte copy) lands later.
 func Compact(ctx context.Context, cat *catalog.DirectoryCatalog, ident icebergtable.Identifier, opts CompactOptions) (*CompactResult, error) {
 	opts.defaults()
+	applyIcebergMaxWorkersOverride()
 	started := time.Now()
 	result := &CompactResult{Identifier: ident}
+
+	// Dispatch: JANITOR_COMPACT_USE_REPLACE=1 selects the architectural
+	// fix path (compactOnceReplace) for #4 / apache/iceberg-go#860.
+	// Default still uses the legacy compactOnce path so existing
+	// callers see no change until the new path is proven under load.
+	useReplace := os.Getenv("JANITOR_COMPACT_USE_REPLACE") == "1"
+	once := compactOnce
+	if useReplace {
+		once = compactOnceReplace
+	}
 
 	backoff := opts.InitialBackoff
 	for attempt := 1; attempt <= opts.MaxAttempts; attempt++ {
 		result.Attempts = attempt
-		err := compactOnce(ctx, cat, ident, result)
+		err := once(ctx, cat, ident, opts, result)
 		if err == nil {
 			result.DurationMs = time.Since(started).Milliseconds()
 			return result, nil
@@ -159,10 +247,40 @@ func Compact(ctx context.Context, cat *catalog.DirectoryCatalog, ident icebergta
 // fresh, opens a transaction, stages a streaming overwrite, runs the
 // master check, and commits. The before/after counts are written into
 // `result` so the caller has structured stats even on failure.
-func compactOnce(ctx context.Context, cat *catalog.DirectoryCatalog, ident icebergtable.Identifier, result *CompactResult) error {
+//
+// If opts.RowFilter is non-nil, the scan and the overwrite both use it
+// — the staging set is restricted to rows / files matching the filter.
+// This is the partition-scoped compaction code path.
+func compactOnce(ctx context.Context, cat *catalog.DirectoryCatalog, ident icebergtable.Identifier, opts CompactOptions, result *CompactResult) error {
 	tbl, err := cat.LoadTable(ctx, ident)
 	if err != nil {
 		return fmt.Errorf("loading table %v: %w", ident, err)
+	}
+
+	// Guard: row-filter scoping is only safe on partitioned tables.
+	// Iceberg's overwrite-with-filter semantics rely on each data file
+	// being either fully matched or fully non-matched by the filter,
+	// which holds for partition predicates but NOT for row predicates
+	// against an unpartitioned table. On an unpartitioned table, every
+	// file would contain a mix of matching and non-matching rows, so
+	// iceberg-go would fall into the partial-rewrite path and rewrite
+	// EVERY file in the table — strictly worse than a plain whole-table
+	// compaction (we'd pay the I/O of rewriting non-matching rows for
+	// no benefit). The master check would still pass — it's not a
+	// correctness bug, it's a wasted-work bug — but the whole point
+	// of partition-scoped compaction is to do LESS work, so reject
+	// the request loudly rather than silently doing more.
+	//
+	// We don't try to validate that the filter column actually aligns
+	// with a partition field. That's a janitor-internal interface;
+	// the operator who passes --partition is expected to know the
+	// table's partition spec. The unpartitioned check catches the
+	// most common footgun (forgetting that the table isn't partitioned
+	// at all).
+	if opts.RowFilter != nil {
+		if spec := tbl.Spec(); spec.NumFields() == 0 {
+			return fmt.Errorf("partition-scoped compaction requested but table %v is unpartitioned; pass no --partition filter to compact the whole table", ident)
+		}
 	}
 
 	if snap := tbl.CurrentSnapshot(); snap != nil {
@@ -170,7 +288,15 @@ func compactOnce(ctx context.Context, cat *catalog.DirectoryCatalog, ident icebe
 	}
 	result.BeforeFiles, result.BeforeBytes, result.BeforeRows = SnapshotFileStats(ctx, tbl)
 
-	scan := tbl.Scan()
+	// Build the scan, applying the row filter if one was provided.
+	// iceberg-go's Scan handles partition pruning at PlanFiles time
+	// — files whose partition values don't satisfy the predicate are
+	// not even read.
+	var scanOpts []icebergtable.ScanOption
+	if opts.RowFilter != nil {
+		scanOpts = append(scanOpts, icebergtable.WithRowFilter(opts.RowFilter))
+	}
+	scan := tbl.Scan(scanOpts...)
 	scanSchema, recordIter, err := scan.ToArrowRecords(ctx)
 	if err != nil {
 		return fmt.Errorf("opening scan: %w", err)
@@ -178,8 +304,15 @@ func compactOnce(ctx context.Context, cat *catalog.DirectoryCatalog, ident icebe
 	reader := newStreamingRecordReader(scanSchema, recordIter)
 	defer reader.Release()
 
+	// Build the overwrite, applying the same row filter so iceberg-go's
+	// commit machinery deletes only the files in the matching partition
+	// rather than every data file in the table.
+	var owOpts []icebergtable.OverwriteOption
+	if opts.RowFilter != nil {
+		owOpts = append(owOpts, icebergtable.WithOverwriteFilter(opts.RowFilter))
+	}
 	tx := tbl.NewTransaction()
-	if err := tx.Overwrite(ctx, reader, nil); err != nil {
+	if err := tx.Overwrite(ctx, reader, nil, owOpts...); err != nil {
 		return fmt.Errorf("staging streaming overwrite: %w", err)
 	}
 	if err := reader.Err(); err != nil {

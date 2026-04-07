@@ -15,9 +15,11 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strconv"
 	"strings"
 	"syscall"
 
+	icebergpkg "github.com/apache/iceberg-go"
 	icebergtable "github.com/apache/iceberg-go/table"
 	"gocloud.dev/blob"
 
@@ -267,38 +269,61 @@ func runAnalyze(args []string) error {
 //      warehouse credentials. This is the standalone fallback for
 //      laptop dev and emergency operator access.
 //
+// Optional flag: --partition <col>=<int_value> scopes the compaction
+// to a single partition (the smaller-scope-per-compaction feature).
+// Example: --partition ss_store_bucket=5
+//
 // Both modes call into the same pkg/janitor.Compact function and
 // produce the same CompactResult; the only difference is which process
 // holds the warehouse credentials.
 func runCompact(args []string) error {
 	var tablePath string
-	for _, a := range args {
-		if strings.HasPrefix(a, "--") {
+	var partitionFilter string
+	for i := 0; i < len(args); i++ {
+		a := args[i]
+		switch {
+		case a == "--partition" && i+1 < len(args):
+			partitionFilter = args[i+1]
+			i++
+		case strings.HasPrefix(a, "--partition="):
+			partitionFilter = strings.TrimPrefix(a, "--partition=")
+		case strings.HasPrefix(a, "--"):
 			return fmt.Errorf("unknown flag %q", a)
+		default:
+			if tablePath != "" {
+				return fmt.Errorf("multiple table paths provided")
+			}
+			tablePath = a
 		}
-		if tablePath != "" {
-			return fmt.Errorf("multiple table paths provided")
-		}
-		tablePath = a
 	}
 	if tablePath == "" {
-		return fmt.Errorf("usage: janitor-cli compact <table_path>")
+		return fmt.Errorf("usage: janitor-cli compact <table_path> [--partition col=value]")
 	}
 
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 
 	if apiURL := os.Getenv("JANITOR_API_URL"); apiURL != "" {
+		// API mode doesn't yet support partition filters; warn if the
+		// operator passed one with --partition.
+		if partitionFilter != "" {
+			fmt.Fprintln(os.Stderr, "warning: --partition is ignored in API mode (not yet supported by janitor-server)")
+		}
 		return runCompactViaAPI(ctx, apiURL, tablePath)
 	}
-	return runCompactInProcess(ctx, tablePath)
+	return runCompactInProcess(ctx, tablePath, partitionFilter)
 }
 
 // runCompactInProcess runs the compaction directly against the
 // warehouse using the operator's credentials. This is the standalone
 // fallback path; in production an operator would normally hit the API
 // instead.
-func runCompactInProcess(ctx context.Context, tablePath string) error {
+//
+// If partitionFilter is non-empty (e.g. "ss_store_bucket=5") it's
+// parsed into an iceberg.EqualTo predicate and threaded through to
+// pkg/janitor.Compact via CompactOptions.RowFilter, scoping the
+// compaction to a single partition.
+func runCompactInProcess(ctx context.Context, tablePath, partitionFilter string) error {
 	tablePath = strings.Trim(tablePath, "/")
 	url := os.Getenv("JANITOR_WAREHOUSE_URL")
 	if url == "" {
@@ -316,10 +341,48 @@ func runCompactInProcess(ctx context.Context, tablePath string) error {
 		return err
 	}
 
-	fmt.Printf("compacting %s (in-process; warehouse=%s)\n", tablePath, url)
-	result, err := janitor.Compact(ctx, cat, ident, janitor.CompactOptions{})
+	opts := janitor.CompactOptions{}
+	if partitionFilter != "" {
+		filter, tuple, err := parsePartitionFilter(partitionFilter)
+		if err != nil {
+			return fmt.Errorf("parsing --partition: %w", err)
+		}
+		opts.RowFilter = filter
+		opts.PartitionTuple = tuple
+	}
+
+	scope := "full table"
+	if partitionFilter != "" {
+		scope = "partition " + partitionFilter
+	}
+	fmt.Printf("compacting %s (in-process; warehouse=%s; scope=%s)\n", tablePath, url, scope)
+	result, err := janitor.Compact(ctx, cat, ident, opts)
 	printCompactResult(tablePath, result, err)
 	return err
+}
+
+// parsePartitionFilter parses a "col=value" string into BOTH the
+// iceberg equality predicate (for the legacy compactOnce path that
+// uses tx.Overwrite + WithRowFilter) and the bare map form (for
+// the compactOnceReplace path that walks manifests directly).
+// Only int64 values are supported in the MVP. The --partition flag
+// will be removed entirely once AutoCompact reads the partition
+// spec from manifest discovery; this dual-output is interim.
+func parsePartitionFilter(s string) (icebergpkg.BooleanExpression, map[string]any, error) {
+	eq := strings.Index(s, "=")
+	if eq < 0 {
+		return nil, nil, fmt.Errorf("expected col=value, got %q", s)
+	}
+	col := strings.TrimSpace(s[:eq])
+	valStr := strings.TrimSpace(s[eq+1:])
+	if col == "" || valStr == "" {
+		return nil, nil, fmt.Errorf("expected col=value, got %q", s)
+	}
+	val, err := strconv.ParseInt(valStr, 10, 64)
+	if err != nil {
+		return nil, nil, fmt.Errorf("partition value %q is not an integer: %w", valStr, err)
+	}
+	return icebergpkg.EqualTo(icebergpkg.Reference(col), val), map[string]any{col: val}, nil
 }
 
 // runCompactViaAPI POSTs to a running janitor-server and prints the
