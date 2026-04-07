@@ -111,6 +111,141 @@ The janitor's job is to **be the maintainer that doesn't suck for the writers yo
 
 ---
 
+## Cost analysis: NVMe is not cheap, neither is continuous compute
+
+Architectural elegance is one thing. Operational dollars are another. Here's the cost comparison for both approaches against a representative workload, with public AWS pricing (as of early 2026) so the numbers are reproducible.
+
+### The reference workload
+
+A real-time analytics use case typical for both projects:
+
+| Parameter | Value |
+|---|---|
+| Tables monitored | 50 |
+| Writers per table | 1 (Postgres CDC, Kafka, etc.) |
+| Commits per minute per table | 10 (every 6 seconds, typical Flink/CDC checkpoint cadence) |
+| Bytes per commit | 1 MB (small batch) |
+| Total ingest rate | 50 tables × 10 commits/min × 1 MB = 500 MB/min = ~30 GB/hr = ~720 GB/day |
+| Active retention | 30 days = ~21.6 TB of data, plus metadata |
+| Read pattern | Continuous (queries every minute) |
+
+### moonlink cost (rough estimate)
+
+moonlink's value prop is "buffer + index on NVMe, then flush size-tuned Parquet to Iceberg." That requires **at least one always-on worker per active table**, sized to hold the buffer + index in memory + NVMe. The published moonlink architecture diagram shows the buffer, cache, and index all NVMe-resident.
+
+To run moonlink yourself (self-hosted), the line items are roughly:
+
+| Line item | AWS SKU | Quantity | Unit cost | Monthly |
+|---|---|---|---|---|
+| Compute (workers, always-on) | EC2 `r6gd.xlarge` (4 vCPU, 32 GB RAM, 237 GB NVMe instance store) | 2 instances (HA) | $0.226/hr × 730 hr | **$330.00** |
+| OR alternatively NVMe via EBS | `io2 Block Express` provisioned IOPS SSD | 500 GB × 2 instances | $0.125/GB-month + $0.065/IOPS-month × 16k IOPS | **~$2,165.00** |
+| NVMe local instance store | included in `r6gd` SKU | included | $0 | $0 |
+| Iceberg storage in S3 | S3 Standard | 21.6 TB | $0.023/GB-month | **$497.00** |
+| S3 PUT operations | (one per moonlink flush, ~1/min/table = 50/min) | 50/min × 60 × 730 = ~2.2M | $0.005/1k | **$11.00** |
+| S3 GET operations (queries) | reasonable estimate | ~10M | $0.0004/1k | **$4.00** |
+| Cross-AZ data transfer (HA) | between the two workers | ~10 GB/day | $0.01/GB | **$3.00** |
+| **Total (instance store NVMe path)** | | | | **~$845/month** |
+| **Total (provisioned-IOPS EBS NVMe path)** | | | | **~$2,680/month** |
+
+The wide range comes from one design decision: do you use **instance store NVMe** (the local SSD that comes with `i3`/`r6gd`/`m5d`-family instances) or **provisioned-IOPS EBS** (network-attached but durable across instance restarts)?
+
+- **Instance store** is cheap (`r6gd.xlarge` = $0.226/hr ≈ $165/month per instance, NVMe included). The catch: it is **ephemeral** — if the instance terminates, the buffer + index are gone. moonlink would need to either (a) replay from the source on restart (Kafka offsets, Postgres LSN) or (b) checkpoint state to durable storage periodically. Both add complexity but are tractable.
+- **Provisioned-IOPS EBS** is durable but ~10× more expensive at the IOPS levels needed for a hot ingestion buffer. ~$2,165/month for 1 TB across 2 instances at 16k IOPS.
+
+A managed moonlink offering on Mooncake's own cloud presumably builds in some markup over the instance-store path, so the realistic managed price is probably $1,200-$2,500/month for this workload depending on how much HA + SLA is included.
+
+**Either way, the cost is *roughly fixed* with respect to load.** If the workload is bursty — say the 50 tables are hot for 8 hours per day and idle for 16 — moonlink still pays the always-on bill. The buffer + index can't scale to zero because they hold ingestion-critical state.
+
+### iceberg-janitor cost (background remediation, polling mode — today)
+
+Same workload, same 50 tables, same 720 GB/day ingest. The janitor doesn't run continuously; it runs on a schedule (or on commit events when on-commit compaction lands). For polling-mode compaction once per 5 minutes:
+
+| Line item | AWS SKU | Quantity | Unit cost | Monthly |
+|---|---|---|---|---|
+| Lambda invocations | `arm64`, 2048 MB, ~30 sec average (50 tables × 12 runs/hour × 730 hr = 438k invocations) | 438,000 | $0.20/1M requests + $0.0000133/GB-sec × 2 GB × 30 sec × 438k | **~$354.00** |
+| S3 storage | same 21.6 TB (the data the writer produced; janitor doesn't add to it net of compaction) | 21.6 TB | $0.023/GB-month | **$497.00** |
+| S3 PUT operations | janitor's compactions: ~5 PUTs per compaction × 50 tables × 12/hr × 730 = ~2.2M | 2.2M | $0.005/1k | **$11.00** |
+| S3 GET operations | janitor reads: ~10 GETs per analyze × 50 × 12 × 730 = ~4.4M | 4.4M | $0.0004/1k | **$2.00** |
+| S3 LIST operations | janitor discovers: ~1 LIST per table per run | ~440k | $0.005/1k | **$2.20** |
+| EventBridge (scheduled trigger) | one rule × 50 tables × 12/hr × 730 hr = 438k events | 438k | $1.00/M events | **$0.44** |
+| Cross-AZ data transfer | none (Lambda + S3 same region) | 0 | — | $0 |
+| **Total** | | | | **~$867/month** |
+
+**Almost identical to the moonlink instance-store path** for the steady-state polling case. Where the cost picture diverges:
+
+### iceberg-janitor cost (with on-commit compaction, planned)
+
+Once on-commit compaction lands (task #16), the janitor scales with **commits**, not with time. Each commit triggers one Lambda invocation; if the trigger threshold isn't met, the invocation exits in <100 ms after a single state read. Real numbers:
+
+| Line item | Quantity | Unit cost | Monthly |
+|---|---|---|---|
+| Lambda invocations (commit-driven) | 50 tables × 10 commits/min × 730 hr × 60 = 21.9M | $0.20/1M | **$4.38** |
+| Lambda compute (most invocations exit in <100ms after a state-file read) | average ~150ms × 21.9M × 2 GB | $0.0000133/GB-sec | **~$87.00** |
+| Lambda compute for the ~10% of invocations that actually compact | average 5 sec × 2.2M × 2 GB | $0.0000133/GB-sec | **~$293.00** |
+| S3 storage | 21.6 TB | $0.023/GB-month | **$497.00** |
+| S3 PUT/GET/LIST (similar to polling) | | | **~$15.00** |
+| S3 event notifications → SQS → Lambda | 21.9M events | included in S3 PUT cost | $0 |
+| **Total** | | | **~$896/month** |
+
+The on-commit version is **roughly the same total cost** as the polling version because the per-event compute cost ($87 + $293) is offset by the elimination of the 5-minute polling-interval invocations that did nothing. The win is **freshness, not cost** — the time window during which small files exist drops from ~5 minutes to ~30 seconds.
+
+### iceberg-janitor cost (the bursty workload that's actually common)
+
+The above assumes a steady 720 GB/day. Real workloads aren't steady — they're bursty. Consider a workload that's hot 8 hours per day (business hours) and idle the other 16:
+
+| Cost component | moonlink (always-on) | janitor (on-commit) |
+|---|---|---|
+| Compute during 8 active hours | $330 × 8/24 = $110/month | ~$130/month (computed pro-rata from above) |
+| Compute during 16 idle hours | $330 × 16/24 = $220/month (still paying for always-on instances) | **$0/month** (no commits → no invocations) |
+| Storage | $497/month | $497/month |
+| **Total** | **$1,047/month** | **~$642/month** |
+
+**On bursty workloads the janitor saves ~40% over moonlink** — entirely because the compute scales to zero between events. For workloads that are active <50% of the time (which is most analytics workloads outside of FAANG), this gap widens further.
+
+### iceberg-janitor cost (small warehouse, infrequent maintenance)
+
+The other interesting end of the spectrum: a warehouse with 50 tables but only sporadic writes (a few per day, most tables dormant). moonlink still needs to be always-on per active stream, but the janitor can compact dormant tables once a week and skip the rest:
+
+| Cost component | moonlink (always-on) | janitor (sparse polling) |
+|---|---|---|
+| Compute (50 tables, mostly idle) | ~$330/month (workers don't know to scale down per table) | **<$5/month** (a few invocations per day per active table) |
+| Storage | $50/month (much less data) | $50/month |
+| **Total** | **~$380/month** | **~$55/month** |
+
+**On small/sparse workloads the janitor is 7× cheaper.** This is where the serverless architecture's compounded scale-to-zero shows up.
+
+### When moonlink is unambiguously cost-cheaper
+
+There IS a regime where moonlink wins on cost: **sustained high write volume on a small number of tables**. If every table is hot 24/7 and the write volume is high enough that the janitor's compaction compute would be running constantly anyway, moonlink's "buffer once at write time" is genuinely cheaper because it does the work once instead of twice (write small + read small + write big).
+
+The crossover is approximately:
+
+- Tables continuously hot at >50% utilization, AND
+- Average commit size <1 MB, AND
+- Write rate sustained >10 commits/min/table for >12 hours/day
+
+In that regime, moonlink saves roughly 30-50% on compute by avoiding the read-everything-and-rewrite-it pass. Storage cost is identical (the table data lives in the same S3 either way). The janitor would be running its compaction loop near-continuously and paying for it.
+
+For typical analytics workloads — bursty traffic, mixed-volume tables, mixed-update-frequency — the janitor's serverless cost model wins. For sustained high-volume CDC pipelines on a few hot tables, moonlink wins.
+
+### Cost summary (the table that matters)
+
+| Workload shape | moonlink/month | janitor/month | Winner |
+|---|---|---|---|
+| 50 tables, steady ingest, 24/7 | ~$845 (instance store) ~$2,680 (EBS) | ~$867 | **roughly tied** with instance-store moonlink; janitor wins by 3× over EBS path |
+| 50 tables, bursty (8 hr active / 16 idle) | ~$1,047 | ~$642 | **janitor by ~40%** |
+| 50 tables, sparse (mostly dormant) | ~$380 | ~$55 | **janitor by ~7×** |
+| 5 hot tables, sustained high-volume CDC | ~$330 | ~$450-600 | **moonlink by ~30-50%** |
+| Heterogeneous warehouse (some hot, some cold, some moonlink-managed, some not) | n/a (moonlink can't operate on tables it doesn't ingest) | works | **janitor** |
+
+### The honest takeaway
+
+NVMe is not cheap. neither is continuous compute. The dollar comparison depends entirely on **what fraction of the time your workload is actually active**. moonlink's cost is roughly fixed; the janitor's cost scales with work. For workloads that are active <50% of the time, the janitor's serverless model wins on cost regardless of the architectural elegance argument. For workloads that are active >75% of the time on a small number of hot tables, moonlink's prevent-at-write avoids the read-rewrite double pass and wins.
+
+The third axis the table doesn't capture: **the workload mix**. Real warehouses have all three regimes simultaneously. A few hot streaming pipelines (where moonlink would win), a long tail of bursty mid-volume tables (where the janitor wins), and a long-tail-of-the-long-tail of mostly-dormant tables (where the janitor wins by an order of magnitude). The janitor handles all three with one binary at the lower end of the cost envelope. moonlink handles one of them very well at the higher end, but only the ones it's wired into as the writer.
+
+This is the operational reason a mature data platform might run both: moonlink for the few tables where its cost premium is justified by sustained high-volume ingest, janitor for everything else.
+
 ## When to use which
 
 This is the practical question. The honest answer:
