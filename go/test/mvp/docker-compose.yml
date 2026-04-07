@@ -1,0 +1,47 @@
+# Minimal docker-compose for the iceberg-janitor Go MVP test loop.
+#
+# Brings up a single MinIO instance with one bucket pre-created. The Python
+# seed script writes a real Iceberg table into it; the Go janitor reads
+# the same bucket via its no-catalog-service directory catalog.
+#
+# Usage:
+#   docker compose -f go/test/mvp/docker-compose.yml up -d
+#   make mvp-seed       # in repo root
+#   make mvp-analyze    # in repo root
+#   docker compose -f go/test/mvp/docker-compose.yml down -v
+
+services:
+  minio:
+    image: minio/minio:latest
+    container_name: janitor-mvp-minio
+    ports:
+      - "9000:9000"  # S3 API
+      - "9001:9001"  # console
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    command: server /data --console-address ":9001"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    volumes:
+      - minio-data:/data
+
+  # One-shot init container that creates the warehouse bucket.
+  minio-init:
+    image: minio/mc:latest
+    container_name: janitor-mvp-minio-init
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: >
+      /bin/sh -c "
+        mc alias set local http://minio:9000 minioadmin minioadmin &&
+        mc mb -p local/warehouse &&
+        echo 'warehouse bucket created'
+      "
+
+volumes:
+  minio-data:

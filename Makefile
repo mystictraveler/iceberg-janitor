@@ -1,4 +1,4 @@
-.PHONY: install dev test lint format docker-build kind-setup knative-setup kind-setup-knative dev-up dev-down clean
+.PHONY: install dev test lint format docker-build kind-setup knative-setup kind-setup-knative dev-up dev-down clean go-build go-test go-vet go-tidy go-clean mvp-up mvp-down mvp-seed mvp-seed-local mvp-analyze mvp-analyze-local mvp-discover
 
 CLUSTER_NAME ?= iceberg-janitor
 IMAGE_NAME ?= iceberg-janitor
@@ -73,6 +73,95 @@ generate-data:
 # Flink
 flink-build:
 	cd flink-jobs && mvn clean package -DskipTests
+
+# Go (sibling implementation under go/)
+go-build:
+	cd go && go build ./...
+
+go-test:
+	cd go && go test ./...
+
+go-vet:
+	cd go && go vet ./...
+
+go-tidy:
+	cd go && go mod tidy
+
+go-clean:
+	cd go && rm -rf bin/
+
+# === Go MVP test loop ===
+# Two paths to test the MVP:
+#   (a) docker MinIO + S3 — closer to production, requires Docker running
+#   (b) local fileblob    — no infrastructure, just a /tmp directory
+# Both use the same seed binary and the same Go janitor.
+
+MVP_WAREHOUSE_LOCAL ?= file:///tmp/janitor-mvp
+MVP_WAREHOUSE_S3    ?= s3://warehouse?endpoint=http://localhost:9000&s3ForcePathStyle=true&region=us-east-1
+MVP_NAMESPACE       ?= mvp
+MVP_TABLE           ?= events
+MVP_NUM_BATCHES     ?= 100
+MVP_ROWS_PER_BATCH  ?= 200
+
+mvp-up:
+	docker compose -f go/test/mvp/docker-compose.yml up -d
+	@echo "MinIO console: http://localhost:9001  (minioadmin/minioadmin)"
+
+mvp-down:
+	docker compose -f go/test/mvp/docker-compose.yml down -v
+
+# Seed against MinIO (requires mvp-up first).
+mvp-seed:
+	cd go && JANITOR_WAREHOUSE_URL='s3://warehouse' \
+		S3_ENDPOINT=http://localhost:9000 \
+		S3_ACCESS_KEY=minioadmin S3_SECRET_KEY=minioadmin \
+		NAMESPACE=$(MVP_NAMESPACE) TABLE=$(MVP_TABLE) \
+		NUM_BATCHES=$(MVP_NUM_BATCHES) ROWS_PER_BATCH=$(MVP_ROWS_PER_BATCH) \
+		CATALOG_DB=/tmp/janitor-mvp-catalog.db \
+		go run ./cmd/janitor-seed
+
+# Seed against the local filesystem (no Docker).
+mvp-seed-local:
+	rm -rf /tmp/janitor-mvp /tmp/janitor-mvp-catalog.db
+	cd go && JANITOR_WAREHOUSE_URL='file:///tmp/janitor-mvp' \
+		NAMESPACE=$(MVP_NAMESPACE) TABLE=$(MVP_TABLE) \
+		NUM_BATCHES=$(MVP_NUM_BATCHES) ROWS_PER_BATCH=$(MVP_ROWS_PER_BATCH) \
+		CATALOG_DB=/tmp/janitor-mvp-catalog.db \
+		go run ./cmd/janitor-seed
+
+mvp-discover:
+	cd go && JANITOR_WAREHOUSE_URL='$(MVP_WAREHOUSE_S3)' \
+		AWS_ACCESS_KEY_ID=minioadmin AWS_SECRET_ACCESS_KEY=minioadmin \
+		S3_ENDPOINT=http://localhost:9000 S3_REGION=us-east-1 \
+		go run ./cmd/janitor-cli discover
+
+mvp-discover-local:
+	cd go && JANITOR_WAREHOUSE_URL='$(MVP_WAREHOUSE_LOCAL)' \
+		go run ./cmd/janitor-cli discover
+
+mvp-analyze:
+	cd go && JANITOR_WAREHOUSE_URL='$(MVP_WAREHOUSE_S3)' \
+		AWS_ACCESS_KEY_ID=minioadmin AWS_SECRET_ACCESS_KEY=minioadmin \
+		S3_ENDPOINT=http://localhost:9000 S3_REGION=us-east-1 \
+		go run ./cmd/janitor-cli analyze $(MVP_NAMESPACE).db/$(MVP_TABLE)
+
+mvp-analyze-local:
+	cd go && JANITOR_WAREHOUSE_URL='$(MVP_WAREHOUSE_LOCAL)' \
+		go run ./cmd/janitor-cli analyze $(MVP_NAMESPACE).db/$(MVP_TABLE)
+
+# DuckDB query benchmark — runs after seed (and after compaction, when implemented)
+# Reads the same Iceberg table the Go janitor maintains, via the iceberg_scan
+# function from DuckDB's iceberg extension. We pass the explicit metadata.json
+# path because DuckDB refuses to "guess" the current version in the absence of
+# a version-hint.text file (it considers max-version scan unsafe in
+# multi-writer scenarios). The path is the latest one we just produced.
+mvp-query-local:
+	@meta=$$(ls -1 /tmp/janitor-mvp/mvp.db/events/metadata/*.metadata.json | sort | tail -1) && \
+	echo "metadata: $$meta" && \
+	duckdb -c "INSTALL iceberg; LOAD iceberg; \
+		SELECT count(*) AS row_count, count(DISTINCT user_id) AS distinct_users, \
+		       count(DISTINCT event_type) AS event_types \
+		FROM iceberg_scan('$$meta');"
 
 # Cleanup
 clean:
