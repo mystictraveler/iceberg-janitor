@@ -519,7 +519,12 @@ iceberg-janitor/
 | [`README.md`](README.md) | This file: project identity, what's stable, what's new, quick start |
 | [`go/README.md`](go/README.md) | Go-specific README with package layout and quick reference |
 | [`go/BENCHMARKS.md`](go/BENCHMARKS.md) | **Live measured numbers from each Go build phase** with reproducible commands |
+| [`go/COST_ANALYSIS.md`](go/COST_ANALYSIS.md) | **Quantitative cost analysis** vs moonlink across four representative workload shapes; AWS pricing line items so operators can re-run the math |
+| [`go/MIDDLE_PATH.md`](go/MIDDLE_PATH.md) | **The architectural design that takes the best of both worlds**: event-driven on-commit compaction triggered by writer commits in real time. moonlink-class freshness without owning the writer or running NVMe |
+| [`go/MOONCAKE_COMPARISON.md`](go/MOONCAKE_COMPARISON.md) | Architectural + cost comparison vs pg_mooncake / moonlink (the prevent-at-write approach) |
 | [`go/TABLEFLOW_COMPARISON.md`](go/TABLEFLOW_COMPARISON.md) | Side-by-side architectural comparison vs Confluent Tableflow's compaction |
+| [`go/openapi/janitor-server-v1.yaml`](go/openapi/janitor-server-v1.yaml) | OpenAPI 3.1 spec for the Go janitor-server (5 endpoints) |
+| [`go/openapi/iceberg-overlap.md`](go/openapi/iceberg-overlap.md) | Endpoint-by-endpoint mapping vs the Iceberg REST Catalog spec |
 | [`go/test/mvp/MVP.md`](go/test/mvp/MVP.md) | Runbook for the Go MVP test loop (local fileblob and MinIO) |
 | [`/Users/jp/.claude/plans/async-plotting-cake.md`](/Users/jp/.claude/plans/async-plotting-cake.md) | The 27-decision design plan with full rationale, alternatives, tradeoffs |
 | [`docs/multiregion-strategy.md`](docs/multiregion-strategy.md) | Cost analysis: local compaction vs cross-region shipping |
