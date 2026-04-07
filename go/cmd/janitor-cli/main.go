@@ -457,6 +457,9 @@ func printReport(tablePath string, r *analyzer.HealthReport) {
 	fmt.Printf("Current snapshot:    %d\n", r.CurrentSnapshotID)
 	fmt.Printf("Snapshot count:      %d\n", r.SnapshotCount)
 	fmt.Println()
+	fmt.Printf("Workload class:      %s (foreign commits: %d in last 24h, %d in last 7d)\n",
+		r.Workload.Class, r.Workload.ForeignCommitsLast24h, r.Workload.ForeignCommitsLast7d)
+	fmt.Println()
 	fmt.Printf("Data files:          %d\n", r.DataFileCount)
 	fmt.Printf("Data bytes:          %s (%d)\n", humanBytes(r.DataBytes), r.DataBytes)
 	fmt.Printf("Total rows:          %d\n", r.TotalRowCount)

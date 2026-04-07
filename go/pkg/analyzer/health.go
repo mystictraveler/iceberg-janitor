@@ -9,6 +9,8 @@ import (
 
 	icebergpkg "github.com/apache/iceberg-go"
 	icebergtable "github.com/apache/iceberg-go/table"
+
+	"github.com/mystictraveler/iceberg-janitor/go/pkg/strategy/classify"
 )
 
 // HealthReport summarizes a single Iceberg table's current state in the
@@ -51,6 +53,12 @@ type HealthReport struct {
 	NeedsAttention      bool   // ratio > 5% OR small file ratio > 30%
 	IsCritical          bool   // ratio > 10% OR small file ratio > 60%
 	AttentionReason     string // human-readable summary if NeedsAttention
+
+	// Workload classification (auto-detected from foreign commit rate
+	// over the last 24h). Drives per-class trigger thresholds and is
+	// the prerequisite for the middle-path on-commit compaction
+	// dispatcher.
+	Workload classify.Result `json:"workload"`
 }
 
 // AnalyzerOptions configures HealthReport computation.
@@ -183,6 +191,12 @@ func Assess(ctx context.Context, tbl *icebergtable.Table, opts AnalyzerOptions) 
 	if report.DataBytes > 0 {
 		report.MetadataDataRatio = float64(report.MetadataBytes) / float64(report.DataBytes)
 	}
+
+	// Workload classification — auto-detected from snapshot history.
+	// Zero extra I/O: the snapshot history is already in the loaded
+	// metadata.json. Excludes janitor-attributed commits so the
+	// classifier isn't distorted by our own activity.
+	report.Workload = classify.Classify(tbl)
 
 	// Health flags.
 	switch {
