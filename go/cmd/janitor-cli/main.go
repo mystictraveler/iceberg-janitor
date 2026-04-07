@@ -10,12 +10,14 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"iter"
 	"os"
 	"os/signal"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/apache/arrow-go/v18/arrow"
 	icebergpkg "github.com/apache/iceberg-go"
@@ -270,11 +272,16 @@ func runAnalyze(args []string) error {
 // time instead of the entire table. For a 10 GB table on a Lambda with
 // 10 GB RAM, this is the difference between OOM and success.
 //
+// CAS-conflict retry: if another writer commits to v(N+1) before us,
+// the directory catalog returns catalog.ErrCASConflict. We reload the
+// table from the new current and retry from scratch. This is the
+// optimistic-concurrency model the design assumes — losers re-plan
+// against the new state, never merge in-flight work.
+//
 // This is still NOT the byte-level stitching binpack from the design
 // plan — the data is decoded from the source Parquet files and re-
 // encoded into new ones. True stitching (column-chunk byte copy via
-// parquet-go.CopyRowGroups) lands in a subsequent iteration. Streaming
-// is the prerequisite step that makes the memory bound correct.
+// parquet-go.CopyRowGroups) lands in a subsequent iteration.
 func runCompact(args []string) error {
 	var tablePath string
 	for _, a := range args {
@@ -293,6 +300,34 @@ func runCompact(args []string) error {
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 
+	const maxAttempts = 5
+	var attemptDelay = 100 * time.Millisecond
+
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		err := tryCompactOnce(ctx, tablePath, attempt)
+		if err == nil {
+			return nil
+		}
+		if !errors.Is(err, catalog.ErrCASConflict) {
+			return err
+		}
+		fmt.Fprintf(os.Stderr, "  CAS conflict on attempt %d/%d (%v); reloading and retrying in %v\n",
+			attempt, maxAttempts, err, attemptDelay)
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(attemptDelay):
+		}
+		attemptDelay *= 2
+	}
+	return fmt.Errorf("compaction failed: exceeded %d CAS-retry attempts", maxAttempts)
+}
+
+// tryCompactOnce performs a single compaction attempt. It loads the
+// current table state, runs the streaming overwrite, runs the master
+// check, and commits. Returns ErrCASConflict if another writer beat us;
+// the caller retries from scratch.
+func tryCompactOnce(ctx context.Context, tablePath string, attempt int) error {
 	tbl, prefix, cleanup, err := resolveTable(ctx, tablePath)
 	if err != nil {
 		return err
@@ -300,7 +335,11 @@ func runCompact(args []string) error {
 	defer cleanup()
 
 	beforeFiles, beforeBytes, beforeRows := snapshotFileStats(ctx, tbl)
-	fmt.Printf("compacting %s\n", prefix)
+	if attempt == 1 {
+		fmt.Printf("compacting %s\n", prefix)
+	} else {
+		fmt.Printf("retrying %s (attempt %d)\n", prefix, attempt)
+	}
 	fmt.Printf("  before: %d data files, %s, %d rows\n", beforeFiles, humanBytes(beforeBytes), beforeRows)
 
 	// Streaming scan: ToArrowRecords returns the schema and an iterator
@@ -329,7 +368,7 @@ func runCompact(args []string) error {
 		return fmt.Errorf("getting staged table: %w", err)
 	}
 
-	// Mandatory pre-commit master check (I1 row count). Non-bypassable.
+	// Mandatory pre-commit master check. Non-bypassable.
 	verification, err := safety.VerifyCompactionConsistency(ctx, tbl, staged, propsFromEnv())
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "MASTER CHECK FAILED — refusing to commit\n")
@@ -341,10 +380,10 @@ func runCompact(args []string) error {
 		verification.I2Schema.OutID,
 		verification.I7ManifestRefs.Passed, verification.I7ManifestRefs.Checked)
 
-	// Commit.
+	// Commit. CAS conflict propagates back as catalog.ErrCASConflict.
 	newTbl, err := tx.Commit(ctx)
 	if err != nil {
-		return fmt.Errorf("committing transaction: %w", err)
+		return err
 	}
 
 	afterFiles, afterBytes, afterRows := snapshotFileStats(ctx, newTbl)

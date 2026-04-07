@@ -1,153 +1,398 @@
 # iceberg-janitor
 
-**Knative-powered, catalog-only Iceberg table maintenance with adaptive scheduling, Flink-based compaction, and a self-correcting feedback loop.**
+**Catalog-less, multi-cloud, serverless maintenance for Apache Iceberg tables, with mandatory pre-commit verification and zero operator touch in normal operation.**
 
-Solves the small-file, snapshot explosion, and metadata bloat problems that occur when streaming data (Flink, Spark, etc.) continuously writes to Apache Iceberg tables. The janitor acts as a **maintenance cluster** — orchestrating health assessment, policy evaluation, and compaction execution — with the only hard dependency being the Iceberg catalog (REST, AWS Glue, Hive, or any PyIceberg-supported backend).
+The janitor solves the small-file, snapshot-explosion, and metadata-bloat problems that occur whenever streaming engines (Flink, Spark, Kafka Connect, Tableflow) continuously write to Iceberg tables. It runs as a stateless serverless workload over an existing Iceberg warehouse — drop it onto any S3, MinIO, GCS, or Azure Blob bucket holding Iceberg tables and it'll start maintaining them, no catalog service required, no managed control plane, no per-GB pricing.
+
+This repository contains **two sibling implementations**:
+
+| | Language | Status | Purpose |
+|---|---|---|---|
+| **`src/iceberg_janitor/`** | Python | Production-tested at TPC-DS scale | The original implementation. Knative-deployed, polymorphic across catalog backends (REST, Glue, Hive, SQL), with Flink as the heavy-compute escape hatch. Stays in place as the parity oracle for the Go rewrite. |
+| **`go/`** | Go | MVP shipped, active development | The forward direction. Catalog-less directory catalog over `gocloud.dev/blob`, atomic conditional-write commits, mandatory pre-commit master check, designed for sub-200ms cold starts on Knative scale-to-zero and AWS Lambda. Built around a 27-decision design plan that retires Flink in favor of Lambda+Fargate (or equivalents) tiers. |
+
+**The architectural identity is the same across both implementations.** The Python project has been audited and found to be already polymorphic across catalog backends (zero hard REST dependency); it just defaults to REST in dev. The Go project takes the architectural commitment further by removing the catalog service entirely.
 
 ---
 
 ## Table of Contents
 
-- [The Problem](#the-problem)
-- [Architecture](#architecture)
-- [How It Works](#how-it-works)
-- [Benchmark Results](#benchmark-results)
+- [The Architecture in One Picture](#the-architecture-in-one-picture)
+- [What's New, What's Stable](#whats-new-whats-stable)
 - [Quick Start](#quick-start)
-- [CLI Reference](#cli-reference)
-- [Configuration](#configuration)
-- [Execution Model](#execution-model)
-- [Adaptive Feedback Loop](#adaptive-feedback-loop)
-- [REST API](#rest-api)
-- [TPC-DS Test Suite](#tpc-ds-test-suite)
-- [Project Structure](#project-structure)
-- [Design Decisions](#design-decisions)
-- [Research](#research)
+  - [Go MVP loop (local fileblob, no Docker)](#go-mvp-loop-local-fileblob-no-docker)
+  - [Go MVP loop (MinIO via Docker)](#go-mvp-loop-minio-via-docker)
+  - [Python TPC-DS benchmark](#python-tpc-ds-benchmark)
+- [Load-Bearing Design Decisions](#load-bearing-design-decisions)
+- [The Master Check](#the-master-check)
+- [Self-Recognition: How the Janitor Knows When It's Doing Too Much](#self-recognition-how-the-janitor-knows-when-its-doing-too-much)
+- [Operating Principle: Zero Operator Touch in Normal Operation](#operating-principle-zero-operator-touch-in-normal-operation)
+- [Comparison Against Confluent Tableflow](#comparison-against-confluent-tableflow)
+- [Benchmark Results](#benchmark-results)
+- [Repository Layout](#repository-layout)
+- [Documentation Index](#documentation-index)
+- [Evolution](#evolution)
+- [License](#license)
 
 ---
 
-## The Problem
+## The Architecture in One Picture
 
-When streaming engines write to Iceberg tables, each micro-batch commit creates:
+```
+                                ┌────────────────────────────────────────┐
+                                │   Iceberg warehouse on object storage  │
+                                │                                        │
+                                │   <warehouse>/db.events/                │
+                                │   ├── data/      (Parquet, by anyone)   │
+                                │   ├── metadata/  (.json + manifests)    │
+                                │   └── _janitor/                         │
+                                │       ├── state/<table>.json            │
+                                │       ├── leases/<table>.lease          │
+                                │       ├── control/{paused,force,...}    │
+                                │       ├── recycle/<run_id>/             │
+                                │       └── results/<run_id>.json         │
+                                └──────────────────┬─────────────────────┘
+                                                   │
+                                                   │ multi-cloud blob
+                                                   │ (s3, gs, azblob, minio, file)
+                                                   │
+            ┌──────────────────────────────────────┼──────────────────────────────────────┐
+            │                                      │                                      │
+            ▼                                      ▼                                      ▼
+   ┌──────────────────┐                 ┌──────────────────┐                 ┌──────────────────┐
+   │  Knative pod /   │                 │   AWS Lambda     │                 │  Fargate /       │
+   │  Cloud Run       │                 │  (Graviton)      │                 │  Cloud Run Job / │
+   │                  │                 │                  │                 │  Container Apps  │
+   │  warm path       │                 │  warm path       │                 │  long-running    │
+   │  ~200ms cold     │                 │  ~200ms cold     │                 │  no timeout      │
+   └────────┬─────────┘                 └────────┬─────────┘                 └────────┬─────────┘
+            │                                    │                                    │
+            └────────────────────┬───────────────┴────────────────────────────────────┘
+                                 │
+                                 │  same Go binary, three thin wrappers
+                                 │
+                                 ▼
+                       ┌──────────────────────┐
+                       │   pkg/janitor.Core   │
+                       │                      │
+                       │  ProcessTable(ctx,   │
+                       │    table,            │
+                       │    priorState)       │
+                       │                      │
+                       │  → pure function     │
+                       └──────┬───────────────┘
+                              │
+       ┌──────────────────────┼──────────────────────┐
+       │                      │                      │
+       ▼                      ▼                      ▼
+┌────────────┐        ┌────────────┐         ┌────────────┐
+│  classify  │        │  policy +  │         │ master     │
+│ (workload  │        │  feedback  │         │ check      │
+│  class)    │        │ (per-class │         │ (I1..I9)   │
+│            │        │  defaults) │         │ MANDATORY  │
+└────────────┘        └────────────┘         └────────────┘
+       │                      │                      │
+       └──────────────────────┴──────────────────────┘
+                              │
+                              ▼
+                       ┌──────────────┐
+                       │  catalog.    │
+                       │  AtomicCommit│
+                       │              │
+                       │  conditional │
+                       │  write CAS   │
+                       │              │
+                       │  no service  │
+                       └──────────────┘
+```
 
-| Symptom | Cause | Impact |
+The load-bearing claim is in the bottom-right box: **the Iceberg metadata files in the warehouse object store ARE the catalog**. There is no catalog service. There is no metastore. There is no DynamoDB / Glue / Hive Metastore / REST Catalog dependency. Discovery happens by listing object-store prefixes; the current metadata pointer is the highest-numbered `metadata/v*.metadata.json`; commit is a per-key conditional write that the cloud provider linearizes for free. Multi-writer correctness comes from the same `If-None-Match` primitive every distributed lock library on object storage uses.
+
+---
+
+## What's New, What's Stable
+
+### Stable (Python implementation, `src/iceberg_janitor/`)
+
+- **TPC-DS-validated compaction** with 15-22% query latency improvement on real multi-table joins (see [Benchmark Results](#benchmark-results))
+- **Polymorphic across catalog backends** — REST Catalog, AWS Glue, Hive Metastore, SQL — verified by code inspection: every catalog construction goes through PyIceberg's generic `load_catalog()`, no hard REST coupling anywhere
+- **Knative deployment** with PingSource and KafkaSource event triggers
+- **Adaptive scheduling** with hot/warm/cold access classification and feedback-loop priority adjustment
+- **Smart execution router** (in-process for small tables, Flink for large) with Karpenter autoscaling
+- **9-endpoint REST API** mapped 1:1 to Iceberg's canonical maintenance actions
+- **Multi-region strategy** documented with cost-analysis simulation (see [Multi-Region Considerations](#multi-region-considerations))
+
+### New (Go implementation, `go/`)
+
+The Go implementation has shipped an end-to-end MVP loop. Reproducible commands and exact numbers live at [`go/BENCHMARKS.md`](go/BENCHMARKS.md). What's working today:
+
+- **`pkg/catalog.DirectoryCatalog`** — implements `iceberg-go`'s `Catalog` interface against any `gocloud.dev/blob` warehouse, with **no catalog service**. Discovery via blob LIST + max-version scan, commit via per-key conditional write.
+- **Atomic CAS commits** — for cloud backends (s3/gcs/azblob) via `gocloud.dev/blob.WriterOptions{IfNotExist: true}`, which maps to the provider's native conditional write. For local fileblob (where gocloud.dev's `IfNotExist` has a TOCTOU race), the catalog bypasses fileblob and uses `os.Link(2)` directly, which is atomic on POSIX. Verified correct by `cas_test.go`: 32 goroutines race on the same key, exactly 1 winner, 5/5 runs.
+- **CAS-conflict retry loop** — `compact` reloads the table from the new current and retries from scratch on a CAS conflict, up to 5 attempts with exponential backoff. Optimistic concurrency, no merging of in-flight work.
+- **Streaming compaction** — `Scan().ToArrowRecords()` wrapped via `iter.Pull2` into an `array.RecordReader` and passed to `Transaction.Overwrite`. Peak memory is **bounded to one record batch** instead of total table size — the prerequisite for Lambda-tier compaction on tables larger than RAM.
+- **Mandatory pre-commit master check** (`pkg/safety.VerifyCompactionConsistency`) with three of nine planned invariants currently shipped:
+  - **I1** row count: `Σ(input rows) − Σ(deletes) == Σ(staged rows)`
+  - **I2** schema by id: schema cannot silently change across a maintenance op
+  - **I7** manifest references: HEAD-check every data file in the staged manifest list before commit
+  - I3–I6, I8, I9 land alongside the maintenance ops that exercise them
+- **`pkg/analyzer.Assess`** computing `HealthReport` with the **H1 metadata-to-data ratio axiom (CB3)**. The janitor refuses to add metadata to a table whose metadata already exceeds the configured ratio of data — and aggressively shrinks metadata via expire + manifest rewrite when the ratio is critical. This is the "metadata must never exceed data" invariant from the design plan, enforced as code.
+- **`cmd/janitor-cli`** with `discover`, `analyze`, `compact` subcommands. JSON output for agent/automation use.
+- **`cmd/janitor-seed`** — pure-Go fixture generator using `iceberg-go`'s `catalog/sql` with a pure-Go sqlite driver. Creates a real Iceberg table and `Append`-loops synthetic Arrow batches to simulate streaming churn. Replaces the rejected pyiceberg seed.
+- **End-to-end loop verified** against both local fileblob and MinIO over docker. **DuckDB independently reads the same Iceberg table the Go janitor wrote** and returns identical results — the round-trip proof that the directory catalog is correct.
+- **Three-implementation convergence**: Go writer (iceberg-go via SqlCatalog), Go reader (DirectoryCatalog), and DuckDB reader all converge on the same Iceberg table layout without any catalog service. That's the validation of the architectural bet.
+
+### Planned (next iterations)
+
+Tracked in [`/Users/jp/.claude/plans/async-plotting-cake.md`](/Users/jp/.claude/plans/async-plotting-cake.md), the 27-decision design plan:
+
+- **True byte-level stitching binpack** via `parquet-go.CopyRowGroups` — column-chunk byte copy with no decode/encode. Expected ~3-10× compaction speedup. Streaming (above) is the prerequisite that's already in.
+- **Master check I3–I6, I8, I9** — value counts, null counts, bounds, V3 row lineage, manifest set equality, content hash
+- **`pkg/safety/circuitbreaker.go`** — eleven CB rules (cooldown, loop detection, metadata budget, effectiveness floor, daily byte budget, consecutive failure, lifetime rewrite ratio, recursion guard, ROI estimate) and the three-tier kill switch (per-table self-pause, warehouse self-pause, operator panic button)
+- **`pkg/strategy/classify`** — workload classifier (`streaming` / `batch` / `slow_changing` / `dormant`) with per-class default thresholds, and the active-partition detection via time-partition + max sequence number for streaming tables
+- **Adaptive tier dispatch via the feedback loop** — per-table convergence on warm vs task tier without operator tuning
+- **`pkg/config`** — 12-factor env-var loader with `JANITOR_*` schema and secret-manager refs
+- **Three runtime adapters** (`cmd/janitor-server`, `cmd/janitor-lambda`, `cmd/janitor-task`) over the same `pkg/janitor.Core`
+- **Iceberg V3 features** — deletion vectors, row lineage, Puffin statistics files, partition stats files (the V3 statistics file system is the cache for table-level stats per the plan, not a private cache in `_janitor/state/`)
+- **Java Flink jar retired** — Fargate (and Cloud Run Jobs / Container Apps Jobs / `batch/v1.Job`) covers everything that doesn't fit Lambda; distributed compute is out of scope
+
+---
+
+## Quick Start
+
+### Go MVP loop (local fileblob, no Docker)
+
+This is the smallest possible end-to-end loop. No infrastructure required beyond Go and DuckDB CLI.
+
+```bash
+# 1. Build the Go binaries.
+make go-build go-test
+
+# 2. Seed an Iceberg table at /tmp/janitor-mvp with 20 small batches × 5,000 rows.
+make mvp-seed-local MVP_NUM_BATCHES=20 MVP_ROWS_PER_BATCH=5000
+
+# 3. Discover what the janitor sees.
+make mvp-discover-local
+
+# 4. Analyze: HealthReport with the H1 metadata/data ratio check.
+make mvp-analyze-local
+
+# 5. Compact: streaming overwrite + master check + atomic CAS commit.
+cd go && JANITOR_WAREHOUSE_URL=file:///tmp/janitor-mvp \
+    go run ./cmd/janitor-cli compact mvp.db/events
+
+# 6. Re-analyze: file count is now 1, ratio dropped, master check verified.
+make mvp-analyze-local
+
+# 7. DuckDB round-trip verification: independent engine reads the same table.
+make mvp-query-local
+```
+
+Expected compact output:
+```
+compacting mvp.db/events
+  before: 20 data files, 240.7 KiB, 100000 rows
+  master check: PASS (I1 in=100000 out=100000  I2 schema=0  I7 refs=1/1)
+  after:  1 data files, 140.5 KiB, 100000 rows
+  new snapshot: 7719394904328546388
+compaction complete: 20 → 1 files (20.0x reduction)
+```
+
+DuckDB round-trip:
+```
+┌───────────┬────────────────┬─────────────┐
+│ row_count │ distinct_users │ event_types │
+│   int64   │     int64      │    int64    │
+├───────────┼────────────────┼─────────────┤
+│    100000 │          10000 │           6 │
+└───────────┴────────────────┴─────────────┘
+```
+
+### Go MVP loop (MinIO via Docker)
+
+Same loop, against a MinIO bucket. Identical Go binaries — only the warehouse URL changes.
+
+```bash
+make mvp-up                # docker compose brings up MinIO + creates bucket
+make mvp-seed              # Go seed against s3://warehouse via MinIO endpoint
+make mvp-discover          # Go discover via gocloud.dev s3blob
+make mvp-analyze           # CRITICAL (metadata/data ratio elevated)
+cd go && JANITOR_WAREHOUSE_URL='s3://warehouse?endpoint=http://localhost:9000&s3ForcePathStyle=true&region=us-east-1' \
+    AWS_ACCESS_KEY_ID=minioadmin AWS_SECRET_ACCESS_KEY=minioadmin \
+    S3_ENDPOINT=http://localhost:9000 S3_REGION=us-east-1 \
+    go run ./cmd/janitor-cli compact mvp.db/events
+make mvp-analyze           # ratio dropped, file count = 1
+make mvp-down              # tear everything down
+```
+
+Full runbook: [`go/test/mvp/MVP.md`](go/test/mvp/MVP.md).
+
+### Python TPC-DS benchmark
+
+The Python implementation's TPC-DS benchmark is the parity oracle and the historical evidence base. To reproduce:
+
+```bash
+make kind-setup-knative              # kind cluster + Knative
+make docker-build && make docker-load
+make dev-up                          # MinIO, REST catalog, Kafka, Flink, Karpenter
+kubectl -n iceberg-janitor port-forward svc/minio 9000:9000 &
+kubectl -n iceberg-janitor port-forward svc/rest-catalog 8181:8181 &
+pip install -e ".[query,dev]"
+NUM_BATCHES=200 pytest tests/test_tpcds_benchmark.py -v -s
+```
+
+24 TPC-DS tables with 7 streaming fact tables, 200 micro-batches each (~10M rows). Runs the 10 benchmark queries before and after compaction and prints the latency comparison. See [Benchmark Results](#benchmark-results) for what to expect.
+
+---
+
+## Load-Bearing Design Decisions
+
+The full 27-entry decision log lives in the [plan file](/Users/jp/.claude/plans/async-plotting-cake.md). The seven that matter most architecturally:
+
+| # | Decision | Rationale |
 |---|---|---|
-| **Thousands of tiny files** | Each Flink checkpoint / Spark batch creates new Parquet files | Defeats columnar read benefits, explodes S3 API calls |
-| **Snapshot explosion** | Every commit = new snapshot | Metadata trees grow unbounded |
-| **Manifest bloat** | Deep manifest chains from frequent commits | Query planning slows to a crawl |
-| **Orphan files** | Failed writes, interrupted compaction | Storage costs grow silently |
-
-Without automated maintenance, **query performance degrades continuously** until manual intervention.
-
----
-
-## Architecture
-
-```
-┌────────────────────────────────────────────────────────────────────┐
-│                    Janitor Maintenance Cluster                      │
-│                       (Knative Serving)                             │
-│                                                                    │
-│  ┌──────────┐  ┌────────────┐  ┌──────────────┐  ┌────────────┐  │
-│  │ REST API │  │ CloudEvent │  │   Analyzer    │  │  Policy     │  │
-│  │ /v1/...  │  │ Handler    │  │ (catalog-only)│  │  Engine     │  │
-│  └──────────┘  └────────────┘  └──────────────┘  └────────────┘  │
-│                                                                    │
-│  ┌──────────────────────────────────────────────────────────────┐  │
-│  │                    Execution Router                           │  │
-│  │                                                              │  │
-│  │  table metadata ──→ size estimate ──→ route decision         │  │
-│  │                        │                    │                │  │
-│  │                   < threshold          > threshold           │  │
-│  │                        │                    │                │  │
-│  │                   LocalExecutor        FlinkExecutor         │  │
-│  │                   (in-process)         (REST API submit)     │  │
-│  └──────────────────────────────────────────────────────────────┘  │
-│                                                                    │
-│  ┌──────────────────────────────────────────────────────────────┐  │
-│  │                   Orchestrator (State Machine)                │  │
-│  │                                                              │  │
-│  │  IDLE → ANALYZING → SUBMITTING → RUNNING → POST_ANALYSIS    │  │
-│  │                                         → FAILED → RETRY    │  │
-│  │                                                              │  │
-│  │  + AccessTracker  + AdaptivePolicyEngine  + FeedbackLoop     │  │
-│  └──────────────────────────────────────────────────────────────┘  │
-│                                                                    │
-│  ┌──────────┐  ┌────────────┐  ┌──────────────┐                  │
-│  │ Triggers │  │ Scheduler  │  │  Prometheus   │                  │
-│  │ (commit, │  │ (priority, │  │  Metrics      │                  │
-│  │  time,   │  │  rate limit│  │               │                  │
-│  │  size)   │  │  windows)  │  │               │                  │
-│  └──────────┘  └────────────┘  └──────────────┘                  │
-└──────────────────────────┬─────────────────────────────────────────┘
-                           │
-          ┌────────────────┼────────────────────┐
-          │                │                    │
-     PingSource       KafkaSource          Manual CLI
-     (scheduled)      (Kafka commits)      (on-demand)
-                           │
-                           ▼
-              ┌─────────────────────────┐
-              │   Flink Cluster (K8s)    │
-              │   + Karpenter autoscale  │
-              │                         │
-              │  FlinkCompactionJob.java │
-              │  - rewriteDataFiles      │
-              │  - binpack/sort/zorder   │
-              │  - partition filters     │
-              └─────────────────────────┘
-                           │
-                           ▼
-              ┌─────────────────────────┐
-              │    Iceberg Catalog       │
-              │  (REST / Glue / Hive)    │
-              └──────────┬──────────────┘
-                         │
-                         ▼
-              ┌─────────────────────────┐
-              │   S3 / MinIO / GCS      │
-              └─────────────────────────┘
-```
+| **3** | **No catalog service** — the Iceberg metadata files in object storage ARE the catalog | Eliminates the only piece of infrastructure that isn't already needed. Multi-cloud by construction. Aligns with serverless cold-start goals. The Iceberg spec already permits this (Hadoop/directory catalog pattern) |
+| **5** | **Conditional-write CAS as the metadata commit primitive** | Genuinely atomic on all four target stores (S3 since Nov 2024 GA, GCS, Azure, MinIO). No external coordinator. Same primitive every distributed lock library uses |
+| **7** | **State in object storage under `_janitor/`, no KV store** | Same backend as the table data, 11-nines durability, multi-cloud, atomicity for free via CAS, zero new infrastructure. The performance gap (~30-100ms vs ~5-10ms for KV) does not matter at the per-invocation scales the janitor operates at |
+| **10** | **Three runtime tiers: Knative + Lambda + Fargate (per-cloud equivalents)** | Knative for warm self-hosted/Cloud Run, Lambda for warm AWS, Fargate / Cloud Run Job / Container Apps Job for the long tail. One Go binary, three thin entrypoint wrappers |
+| **11** | **Java Flink jar retired** | Fargate covers everything that doesn't fit Lambda. ZOrder and very large rewrites still work on a single Fargate task. Removes a whole language and a cluster from the operational story |
+| **24** | **Mandatory non-bypassable master check before every commit** | Strongest single safety primitive available without re-reading data. Catches lost rows, duplicated rows, schema drift, dangling manifest entries. `--force` cannot disable safety checks |
+| **25** | **Cloud-provider durability is the trust floor** | Sub-billionth-percent storage loss events are explicitly out of scope. The janitor trusts the same 11-nines durability that the table data already trusts |
 
 ---
 
-## How It Works
+## The Master Check
 
-### 1. Assess (catalog-only)
-The analyzer queries table health through the **Iceberg catalog API** — `table.scan().plan_files()` and `table.metadata.snapshots`. No DuckDB, no direct S3 access. Works identically with REST Catalog, AWS Glue, or Hive Metastore.
+Every maintenance op runs `pkg/safety.VerifyCompactionConsistency` **before** the catalog commit. The function returns a structured `Verification` record on success and an error on failure. **Failure aborts the commit, releases the lease, leaves the new files as orphans (cleanable on the next orphan run), and writes a fatal-level structured log.** There is no `--force` bypass.
 
-### 2. Decide (policy + triggers)
-The policy engine evaluates per-table thresholds. Triggers fire based on commit count, file count, elapsed time, or data size. The adaptive layer adjusts thresholds based on access patterns — hot tables compact sooner.
+The nine planned invariants:
 
-### 3. Route (smart execution)
-The execution router checks table size against a configurable threshold:
-- **Small tables** (< 1 GB default): compacted **in-process** within the janitor pod using PyIceberg
-- **Large tables** (> 1 GB): submitted to a **Flink cluster** via REST API with full execution context (catalog URI, credentials, strategy, partition filters)
+| ID | Invariant | Cost | Catches | Status |
+|----|-----------|------|---------|--------|
+| **I1** | `Σ(in.row_counts) − Σ(applied_DV.cardinality) == Σ(out.row_counts)` | free | Lost rows, duplicated rows, DV bugs | ✅ Shipped |
+| **I2** | `in.schema_by_id == out.schema_by_id` | free | Silent schema drift | ✅ Shipped |
+| **I3** | per-column value count match | free | Per-column row loss | Planned |
+| **I4** | per-column null count match | free | Null/non-null drift | Planned |
+| **I5** | per-column bounds (output ⊆ input) | free | Out-of-range encoding bugs | Planned |
+| **I6** | V3 row lineage `_row_id` min/max preserved | free | Lost or duplicated row identity | Planned |
+| **I7** | `∀f ∈ new_manifest_list: blob.Stat(f) succeeds` | N HEADs | Manifests pointing at non-existent files | ✅ Shipped |
+| **I8** | manifest set equality (manifest-rewrite only) | free | Regrouping silently dropping/adding files | Planned |
+| **I9** | content hash (stitching only) | free in stitching | Byte-level corruption during column-chunk copy | Planned |
 
-### 4. Measure (feedback loop)
-After compaction, the feedback loop records before/after metrics and computes effectiveness. High effectiveness → boost priority for next cycle. Low effectiveness → reduce priority to avoid wasting compute.
+The verification record is committed to TWO places on success:
+1. The Iceberg snapshot summary (table-internal, immutable, queryable forever via `<table>.snapshots`)
+2. `<warehouse>/_janitor/results/<run_id>.json` (cross-table query path via `janitor history`)
+
+This means **the audit trail is the table itself**: `SELECT * FROM mytable.snapshots` shows the entire janitor history with full provenance — which run, which action, which actor, which check passed, how many files in/out.
+
+---
+
+## Self-Recognition: How the Janitor Knows When It's Doing Too Much
+
+The user's instinct is correct: the **metadata-to-data ratio is the single most diagnostic Iceberg health metric**, and the janitor must enforce it on itself because every action it takes adds metadata. This is **CB3 / H1** in the design plan:
+
+- Compute `metadata_bytes / data_bytes` on every analyze pass
+- **At >5%** (yellow): warn, log, emit Prometheus metric
+- **At >10%** (red): refuse compaction; switch to **metadata-shrinking mode** (expire → manifest rewrite → stats consolidation in that order) until the ratio drops back below 4% (1% hysteresis)
+- **At >50%** (emergency): write `_janitor/control/EMERGENCY_STOP` and page the operator. The table is structurally broken and the janitor cannot safely repair it without human review
+
+This is one of eleven circuit breakers (CB1–CB11) tracked in the plan that detect runaway and pause work autonomously. The full set:
+
+| Rule | Catches |
+|---|---|
+| CB1 cooldown | Writer fight (janitor recompacts faster than the writer commits) |
+| CB2 loop detection | Compacting back to a previously-seen state (no progress) |
+| CB3 metadata budget | **The metadata-to-data axiom** |
+| CB4 effectiveness floor | Diminishing-returns churn |
+| CB5 expire-first ordering | Snapshot bloat |
+| CB6 manifest-rewrite-first ordering | Manifest explosion |
+| CB7 daily byte budget | Effort/benefit inversion |
+| CB8 consecutive failure pause | Zombie work — repeated retries on a broken table |
+| CB9 lifetime rewrite ratio | "We've rewritten this table 20× for no reason" canary |
+| CB10 recursion guard | Recursive maintenance triggering itself |
+| CB11 ROI estimate | Compaction cost exceeds query benefit |
+
+Plus the **three-tier kill switch**:
+
+| Tier | Trigger | Action |
+|---|---|---|
+| **T1 self-pause one table** | per-table circuit breaker trips | Write `_janitor/control/paused/<table_uuid>`; future runs skip this table |
+| **T2 self-pause warehouse** | warehouse-wide circuit breaker trips | Write `_janitor/control/paused.json` with `paused_by: janitor-circuit-breaker`; all future runs exit on preflight |
+| **T3 operator panic** | `janitor panic` from the CLI | Atomically write the global pause AND delete every active lease AND stop in-flight tasks (`ecs.StopTask` etc.) |
+
+The circuit breakers and kill switch are designed; CB3 (the H1 ratio check) is partially shipped via the analyzer; the rest land alongside the orchestrator in subsequent phases.
+
+---
+
+## Operating Principle: Zero Operator Touch in Normal Operation
+
+A pervasive design principle that justifies many specific decisions: **operators should not have to tune the janitor in normal operation. The janitor self-tunes, self-heals, and self-protects. Operator involvement is reserved for runbook-documented exceptional cases (failures, broken tables, force overrides) and for initial deployment.**
+
+Concretely:
+
+- **No per-table policy YAML required** for the common case. The auto-classifier (workload class), the adaptive feedback loop (tier dispatch and effectiveness), and per-class default thresholds together cover the vast majority of tables out of the box.
+- **No threshold tuning** for the common case. Cooldown intervals, file-count triggers, time triggers, and daily byte budgets are all set per workload class with reasonable defaults; the feedback loop refines them per table over time.
+- **Operator overrides exist** as files in `_janitor/control/` and CLI commands (`pause`, `force`, `panic`), but they are documented as **exceptional remediation paths**, not routine knobs.
+- **Failure is autopilot first.** The circuit breakers detect runaway and pause tables/warehouses without operator intervention. The operator's job is to investigate and clear, not to detect.
+- **The runbook** explicitly documents the cases that justify manual intervention: H1 ratio in critical/emergency, persistent CB8 consecutive failures, T2 self-pause warehouse, manual format upgrades, recycle restoration after a verification false-negative.
+
+This is what allows the janitor to scale to thousands of tables across many warehouses without proportional operator headcount.
+
+---
+
+## Comparison Against Confluent Tableflow
+
+A side-by-side architectural comparison against Confluent Tableflow's compaction subsystem lives at [`go/TABLEFLOW_COMPARISON.md`](go/TABLEFLOW_COMPARISON.md). The TL;DR:
+
+| | Tableflow | iceberg-janitor (Go) |
+|---|---|---|
+| **Scope** | Vertical: Kafka topic → Iceberg table → managed maintenance | Horizontal: any existing Iceberg warehouse, regardless of who writes to it |
+| **Catalog** | Confluent's catalog (proprietary control plane) | **No catalog service.** The Iceberg metadata files ARE the catalog |
+| **Cloud support** | Single-cloud per Tableflow instance | Multi-cloud by abstraction (`gocloud.dev/blob` behind one interface) |
+| **Pricing model** | Per managed GB | Compute time only. Zero idle cost in serverless |
+| **Audit trail** | Confluent's logs (proprietary) | Four stacking layers, all on by construction; the Iceberg snapshot summary IS the audit log |
+| **Source availability** | Closed source, proprietary | Open source, vendor-neutral, reproducible from `go build` |
+| **Pre-commit verification** | Opaque to user | Mandatory non-bypassable master check (9 invariants) committed to the snapshot summary forever |
+| **Runaway prevention** | Implicit in Confluent's algorithms | 11 explicit circuit breakers + 3-tier kill switch |
+
+Honest about scope: Tableflow is a much bigger product that also handles Kafka ingestion, Schema Registry integration, exactly-once semantics, and managed SRE — none of which the janitor tries to do. The janitor compares against the **compaction subsystem** of Tableflow, not the whole product.
 
 ---
 
 ## Benchmark Results
 
-TPC-DS benchmark with 24 Iceberg tables, 7 streaming fact tables, 10 complex join queries:
+### Go (live, reproducible)
+
+Every measured number from the Go MVP — with the exact `make` command that produces it — lives at [`go/BENCHMARKS.md`](go/BENCHMARKS.md). Each row of that file is a real run of the binaries, not a projection. Sample current numbers (Run 1c — streaming compaction with 3-invariant master check):
 
 ```
-PERFORMANCE COMPARISON: BEFORE vs AFTER COMPACTION
-======================================================================
-  Query                                        Before      After     Change
-  ---------------------------------------- ---------- ---------- ----------
-  q7_promo_impact (5-table join)              134.2ms     72.3ms   -46.1% faster
-  q25_cross_channel_returns (7-table join)    142.4ms    103.5ms   -27.4% faster
-  q1_top_return_customers (4-table join)       76.5ms     61.9ms   -19.1% faster
-  q3_brand_revenue (3-table join)              53.8ms     44.4ms   -17.5% faster
-  q13_demo_store_sales (6-table join)          86.4ms     72.9ms   -15.6% faster
-  q43_weekly_store_sales (3-table join)        54.3ms     46.1ms   -15.0% faster
-  ---------------------------------------- ---------- ---------- ----------
-  TOTAL                                       858.4ms    685.6ms   -20.1%
+Seed:    20 batches × 5,000 rows = 100,000 rows  in 53 ms
+Compact: 20 → 1 files, 240.7 KiB → 140.5 KiB
+         master check: PASS (I1 in=100000 out=100000  I2 schema=0  I7 refs=1/1)
+DuckDB:  100000 rows / 10000 distinct users / 6 event types — identical to pre-compact
+CAS:     32-goroutine race on the same key → exactly 1 winner, 5/5 runs (cas_test.go)
 ```
 
-### 10M Row Benchmark (200 micro-batches)
+H1 metadata-to-data ratio dropped from **31.36% (CRITICAL)** to **6.38%** in a single compaction. With realistic file sizes the ratio settles well under 1%.
+
+### Python (TPC-DS, historical)
+
+The Python implementation has been benchmarked against TPC-DS at multiple scales. All numbers reproducible via the steps in [Quick Start → Python TPC-DS](#python-tpc-ds-benchmark).
+
+**87K row benchmark (50 micro-batches per fact table):**
+
+```
+Query                                        Before      After     Change
+---------------------------------------- ---------- ---------- ----------
+q7_promo_impact (5-table join)              134.2ms     72.3ms   -46.1% faster
+q25_cross_channel_returns (7-table join)    142.4ms    103.5ms   -27.4% faster
+q1_top_return_customers (4-table join)       76.5ms     61.9ms   -19.1% faster
+q3_brand_revenue (3-table join)              53.8ms     44.4ms   -17.5% faster
+q13_demo_store_sales (6-table join)          86.4ms     72.9ms   -15.6% faster
+q43_weekly_store_sales (3-table join)        54.3ms     46.1ms   -15.0% faster
+TOTAL                                       858.4ms    685.6ms   -20.1%
+```
+
+**10M row benchmark (200 micro-batches per fact table):**
 
 | Query | Before | After | Change |
 |---|---|---|---|
@@ -157,350 +402,26 @@ PERFORMANCE COMPARISON: BEFORE vs AFTER COMPACTION
 | q25_cross_channel_returns (7-table join) | 400.5ms | 310.5ms | **-22.5%** |
 | **TOTAL** | **1842.9ms** | **1439.5ms** | **-21.9%** |
 
-### Performance Test Results
+**Compaction impact increases with data volume.** Average file size grew from ~100 KB to ~10 MB, reducing S3 API calls by 99%.
 
+Full benchmark run logs (Python):
 - [50-batch benchmark (87K rows)](https://gist.github.com/mystictraveler/190206e73d6c8cca29aac40211673b38) — 20.1% improvement, 51 → 1 files per table
 - [200-batch benchmark (10M rows)](https://gist.github.com/mystictraveler/8cfbfae0bc10a26513a8b3a30ff70cf4) — 21.9% improvement, 201 → 1 files per table
 
-Compaction impact **increases with data volume**. Average file size grew from ~100KB to ~10MB, reducing S3 API calls by 99%.
-
----
-
-## Quick Start
-
-### Prerequisites
-- Docker, kubectl, minikube or kind
-- Python 3.11+
-
-### Local Development
-
-```bash
-# 1. Cluster with Knative
-make kind-setup-knative    # or: minikube start + make knative-setup
-
-# 2. Build and deploy
-make docker-build && make docker-load
-make dev-up
-
-# 3. Port-forward services
-kubectl -n iceberg-janitor port-forward svc/minio 9000:9000 &
-kubectl -n iceberg-janitor port-forward svc/rest-catalog 8181:8181 &
-
-# 4. Run TPC-DS benchmark (creates tables, streams data, compacts, compares)
-pip install -e ".[query,dev]"
-NUM_BATCHES=50 pytest tests/test_tpcds_benchmark.py -v -s
-
-# 5. Run feedback loop validation
-pytest tests/test_feedback_loop.py -v -s
-```
-
-### Catalog Configuration
-
-```bash
-# REST Catalog (local dev)
-janitor analyze db.events --catalog-uri http://rest-catalog:8181 --warehouse s3://warehouse/
-
-# AWS Glue
-janitor analyze db.events --catalog-uri glue:// --warehouse s3://my-bucket/
-
-# Hive Metastore
-janitor analyze db.events --catalog-uri thrift://hive:9083 --warehouse s3://my-bucket/
-```
-
----
-
-## CLI Reference
-
-```bash
-# Health assessment
-janitor analyze <table_id> --catalog-uri ... --warehouse ...
-
-# Full policy-based maintenance
-janitor maintain <table_id> --catalog-uri ... --warehouse ... [--dry-run]
-
-# Manual overrides (immediate execution)
-janitor compact <table_id> --catalog-uri ... --warehouse ... [--partition X] [--dry-run]
-janitor expire-snapshots <table_id> --catalog-uri ... [--retention-hours 168]
-janitor cleanup-orphans <table_id> --catalog-uri ... [--dry-run]
-
-# Inspect trigger state
-janitor trigger-status <table_id> --catalog-uri ... --warehouse ...
-
-# Long-running controller
-janitor controller config.yaml
-```
-
----
-
-## Configuration
-
-### Policy (ConfigMap / Helm values)
-
-```yaml
-policy:
-  default_policy:
-    max_small_file_ratio: 0.3
-    small_file_threshold_bytes: 8388608     # 8 MB
-    target_file_size_bytes: 134217728       # 128 MB
-    max_snapshots: 100
-    snapshot_retention_hours: 168           # 7 days
-    trigger_mode: auto                     # auto | manual | scheduled
-    commit_count_trigger_threshold: 50
-    time_trigger_interval_minutes: 30
-
-  table_overrides:
-    high_volume.events:
-      trigger_mode: auto
-      max_small_file_ratio: 0.2
-      commit_count_trigger_threshold: 20
-```
-
-### Execution Routing
-
-```yaml
-execution:
-  executor: auto              # auto | local | flink
-  local_max_data_bytes: 1073741824  # 1 GB — below this, compact in-process
-  flink_rest_url: http://flink-jobmanager:8081
-  flink_default_parallelism: 4
-  flink_max_parallelism: 32
-  max_concurrent_jobs: 5
-  job_timeout_seconds: 3600
-```
-
-### Adaptive Policy
-
-```yaml
-adaptive:
-  enabled: true
-  hot_threshold_queries_per_hour: 100
-  warm_threshold_queries_per_hour: 10
-  hot_multiplier: 0.5       # Hot tables: compact 2x sooner
-  cold_multiplier: 3.0      # Cold tables: compact 3x less often
-  feedback_loop_enabled: true
-```
-
----
-
-## Execution Model
-
-### The Janitor as Maintenance Cluster
-
-The janitor is not just an orchestrator — it's a **maintenance cluster** that does real work:
-
-| Table Size | Where Compaction Runs | Why |
-|---|---|---|
-| **< 1 GB** | In the janitor pod (PyIceberg `table.overwrite()`) | Fast, no cluster overhead, sub-second latency |
-| **> 1 GB** | Flink cluster (`rewriteDataFiles` action) | Distributed compute, handles TB-scale tables |
-
-The execution router makes this decision automatically based on table metadata (no data scan needed — file sizes are in the catalog).
-
-### Flink Cluster Sizing (with Karpenter)
-
-The Flink cluster auto-scales via Karpenter:
-
-| Scenario | TaskManagers | TM Memory | Parallelism | Time |
-|---|---|---|---|---|
-| 10 GB table | 2 | 4 GB | 4 | ~2 min |
-| 100 GB table | 4 | 8 GB | 8 | ~10 min |
-| 1 TB table | 8-16 | 8 GB | 16-32 | ~30 min |
-
-**Karpenter strategy:**
-- Pending Flink TaskManager pods trigger node scale-up
-- Compute-optimized instances (c5/c6i) for compaction workloads
-- Nodes scale down after 5 min idle (consolidation policy)
-- Zero TaskManagers when no compaction is running → zero cost
-
-### Execution Context
-
-The janitor passes full execution context to Flink:
-
-```json
-{
-  "table_id": "analytics.events",
-  "catalog_uri": "http://rest-catalog:8181",
-  "warehouse": "s3://warehouse/",
-  "catalog_type": "rest",
-  "catalog_properties": {"s3.endpoint": "http://minio:9000", ...},
-  "strategy": "binpack",
-  "target_file_size_bytes": 134217728,
-  "partition_filter": "dt >= '2026-04-01'",
-  "estimated_data_size_bytes": 53687091200
-}
-```
-
-Flink executors receive this as program arguments, connect to the catalog independently, and execute `Actions.forTable(table).rewriteDataFiles()`.
-
----
-
-## Adaptive Feedback Loop
-
-The self-correcting cycle that gets smarter over time:
-
-```
-┌─────────────┐     ┌──────────────────┐     ┌────────────────┐
-│ Query Engine │────→│  AccessTracker   │────→│ Classification │
-│ (events API) │     │ (heat scoring)   │     │ hot/warm/cold  │
-└─────────────┘     └──────────────────┘     └───────┬────────┘
-                                                      │
-                    ┌──────────────────┐              │
-                    │  Adaptive Policy │◄─────────────┘
-                    │  (adjust thresh) │
-                    └───────┬──────────┘
-                            │
-                    ┌───────▼──────────┐
-                    │  Compaction      │
-                    │  (local / Flink) │
-                    └───────┬──────────┘
-                            │
-                    ┌───────▼──────────┐     ┌──────────────────┐
-                    │  FeedbackLoop    │────→│ Priority Adjust  │
-                    │  (effectiveness) │     │ (back to tracker)│
-                    └──────────────────┘     └──────────────────┘
-```
-
-| Access Pattern | Policy Adjustment | Compaction Behavior |
-|---|---|---|
-| **Hot** (>100 QPH) | 0.5x thresholds | Compact sooner, higher priority |
-| **Warm** (10-100 QPH) | 1.0x (default) | Normal maintenance |
-| **Cold** (<10 QPH) | 3.0x thresholds | Compact less, save resources |
-| **Effective compaction** | Boost priority | Keep compacting aggressively |
-| **Ineffective compaction** | Reduce priority | Skip next cycle, save compute |
-
----
-
-## REST API
-
-Simplified to 9 endpoints, mapped 1:1 to Iceberg's canonical maintenance actions:
-
-| Endpoint | Iceberg Action |
-|---|---|
-| `GET /v1/tables/{id}/health` | Health assessment (no Iceberg equivalent) |
-| `POST /v1/tables/{id}/rewrite-data-files` | `rewriteDataFiles` (binpack/sort/zorder) |
-| `POST /v1/tables/{id}/expire-snapshots` | `expireSnapshots` |
-| `POST /v1/tables/{id}/delete-orphan-files` | `deleteOrphanFiles` |
-| `POST /v1/tables/{id}/rewrite-manifests` | `rewriteManifests` |
-| `POST /v1/tables/{id}/rewrite-position-delete-files` | `rewritePositionDeleteFiles` (V2/V3) |
-| `POST /v1/tables/{id}/maintain` | All actions in recommended order |
-| `GET /v1/health` | Service health |
-| `GET /v1/metrics` | Prometheus metrics |
-
-Full OpenAPI 3.1 spec: [`openapi/iceberg-janitor-api-v2.yaml`](openapi/iceberg-janitor-api-v2.yaml)
-
----
-
-## TPC-DS Test Suite
-
-24 TPC-DS tables as Iceberg tables, with streaming micro-batch writes to 7 fact tables:
-
-```bash
-# Run with 50 micro-batches per fact table (~87K total rows)
-NUM_BATCHES=50 pytest tests/test_tpcds_benchmark.py -v -s
-
-# Run with 200 micro-batches (~10M total rows)
-NUM_BATCHES=200 pytest tests/test_tpcds_benchmark.py -v -s
-```
-
-**10 benchmark queries** with 3-7 table joins:
-- `q1`: Top customers by returns (4-table join)
-- `q7`: Promotion impact on sales (5-table join)
-- `q13`: Store sales by demographics (6-table join)
-- `q25`: Cross-channel return analysis (7-table join)
-- `q43`: Weekly store sales breakdown (3-table join)
-- `q46`: Customer spend by city (6-table join)
-- And 4 more...
-
-**Feedback loop tests** (22 tests):
-```bash
-pytest tests/test_feedback_loop.py -v -s
-```
-
----
-
-## Project Structure
-
-```
-iceberg-janitor/
-├── src/iceberg_janitor/
-│   ├── analyzer/          # Health assessment via catalog API (no DuckDB)
-│   ├── maintenance/       # Compaction, snapshot expiry, orphan cleanup
-│   ├── execution/         # Executor backends: local (PyIceberg), Flink (REST)
-│   │   ├── base.py        # Abstract CompactionExecutor + CompactionJob
-│   │   ├── local.py       # In-process executor for small tables
-│   │   ├── flink.py       # Flink REST API executor for large tables
-│   │   ├── router.py      # Smart routing based on table size
-│   │   └── orchestrator.py # State machine: analyze → submit → monitor → feedback
-│   ├── strategy/          # Triggers, scheduler, access tracker, feedback loop
-│   ├── policy/            # Per-table thresholds, trigger config, execution config
-│   ├── api/               # FastAPI REST API + CloudEvents handler
-│   ├── runner/            # Shared executor, cron entrypoint, controller
-│   ├── metrics/           # Prometheus instrumentation
-│   ├── cli/               # Click CLI with manual overrides
-│   └── catalog.py         # Catalog connection factory
-├── flink-jobs/            # Java: FlinkIcebergSink + FlinkCompactionJob
-├── manifests/dev/         # K8s: MinIO, Kafka, REST Catalog, Knative, Flink, Karpenter
-├── helm/                  # Helm chart (CronJob mode + Knative mode)
-├── openapi/               # OpenAPI 3.1 spec (v1 + v2 simplified)
-├── jmeter/                # DuckDB query benchmark suite
-├── scripts/               # TPC-DS schema, data generators, setup scripts
-├── tests/                 # TPC-DS benchmark + feedback loop + policy + analyzer tests
-└── docs/                  # Research: Tableflow comparison, Iceberg spec, Flink sizing
-```
-
----
-
-## Design Decisions
-
-| Decision | Rationale |
-|---|---|
-| **Catalog-only metadata** | Portability across REST, Glue, Hive. No S3 credentials in the maintenance layer. |
-| **DuckDB as optional extra** | Core maintenance doesn't need a query engine. DuckDB available for benchmarking via `pip install .[query]`. |
-| **K8s → Knative evolution** | Scale-to-zero saves cost. Event-driven (KafkaSource) beats polling. Helm supports both modes. |
-| **Janitor as maintenance cluster** | Small tables compact in-process (fast, no overhead). Large tables go to Flink (distributed, handles TBs). |
-| **Flink for heavy compute** | Iceberg's `rewriteDataFiles` Action API is production-proven. Karpenter scales compute to zero when idle. |
-| **Adaptive feedback loop** | Static thresholds fail in diverse enterprise environments. Self-correcting prioritization allocates compute where it matters. |
-| **API names match Iceberg actions** | `rewrite-data-files` not `compact`. Self-documenting for Iceberg users. |
-| **TPC-DS as benchmark** | Real-world query complexity with multi-table joins. Proves compaction impact on actual workloads. |
+The Go implementation will be benchmarked against the same TPC-DS workload as it reaches functional parity. Tracked in `go/BENCHMARKS.md`.
 
 ---
 
 ## Multi-Region Considerations
 
-When Iceberg tables are replicated across regions via S3 Cross-Region Replication (CRR), compaction creates a decision point: compact locally in each region, or compact once and ship the compacted files?
-
-### The Core Trade-Off
-
-**Cross-region transfer costs 20x more than local compute:**
+When Iceberg tables are replicated across regions, the right approach is **always compact locally, replicate metadata only**. Cross-region data transfer costs ~20× more than local compute.
 
 | | Cost per GB |
 |---|---|
-| Local compaction compute | **$0.001** |
-| Cross-region data transfer | **$0.02** |
+| Local compaction compute | $0.001 |
+| Cross-region data transfer | $0.02 |
 
-### Strategy Comparison
-
-| Data Size | Compact Both Regions | Compact Once + Ship | Winner |
-|---|---|---|---|
-| 1 GB | $0.002 | $0.021 | **Compact both** (10x cheaper) |
-| 10 GB | $0.020 | $0.210 | **Compact both** (10x cheaper) |
-| 100 GB | $0.200 | $2.100 | **Compact both** (10x cheaper) |
-| 1 TB | $2.000 | $21.000 | **Compact both** (10x cheaper) |
-
-### Query Latency Impact (Simulation Results)
-
-Simulated with 2 DuckDB instances querying 3 TPC-DS fact tables across 2 regions:
-
-| Strategy | Overall Query Improvement |
-|---|---|
-| Only Region A compacted | **-33.0%** faster (Region A fast, B unchanged) |
-| Both regions compacted | **-60.2%** faster (both regions benefit) |
-| Benefit of local compaction in B | **+27.2%** additional improvement |
-
-Compacting only one region leaves the other region serving queries against uncompacted data — a 27% performance gap that persists until CRR delivers the compacted files (seconds to minutes of lag).
-
-### Recommended Architecture: Metadata-Only Replication
-
-The key insight: **replicate metadata only, not data files.** Each region receives its own streaming data from its own Kafka/Flink pipeline and compacts locally. S3 CRR is scoped to `metadata/` prefixes only — no data file transfer between regions.
+**Recommended architecture:** Each region runs its own janitor against its own warehouse. S3 CRR (or equivalent) is scoped to `metadata/` prefixes only — schema, snapshots, table properties replicate; data files stay local. This works because Iceberg metadata is tiny (~MB) compared to data (~TB), and the janitor's directory catalog needs only the metadata files to operate.
 
 ```
 Region A (us-east)                          Region B (eu-west)
@@ -508,8 +429,7 @@ Region A (us-east)                          Region B (eu-west)
 │ Kafka → Flink → S3 (data/) │             │ Kafka → Flink → S3 (data/) │
 │ (own streaming writes)      │             │ (own streaming writes)      │
 │                             │             │                             │
-│ Janitor + Flink             │             │ Janitor + Flink             │
-│ (compacts locally)          │             │ (compacts locally)          │
+│ Janitor (compacts locally)  │             │ Janitor (compacts locally)  │
 └──────────┬──────────────────┘             └──────────┬──────────────────┘
            │                                           │
     s3://warehouse-east/                        s3://warehouse-west/
@@ -517,57 +437,101 @@ Region A (us-east)                          Region B (eu-west)
     └── data/     ✗ NOT replicated              data/ (own files)
 ```
 
-**S3 CRR rule configuration:**
+Full analysis with cost simulation: [`docs/multiregion-strategy.md`](docs/multiregion-strategy.md).
 
-```json
-{
-  "Rules": [{
-    "ID": "replicate-iceberg-metadata-only",
-    "Status": "Enabled",
-    "Filter": { "Prefix": "metadata/" },
-    "Destination": { "Bucket": "arn:aws:s3:::warehouse-eu-west" }
-  }]
-}
+---
+
+## Repository Layout
+
+```
+iceberg-janitor/
+├── README.md                       ← you are here
+│
+├── src/iceberg_janitor/            ← Python implementation (production-tested)
+│   ├── analyzer/                   Health assessment via PyIceberg catalog API
+│   ├── policy/                     TablePolicy + evaluation engine
+│   ├── strategy/                   Triggers, scheduler, access tracker, feedback loop
+│   ├── execution/                  Local + Flink executors, smart router, orchestrator
+│   ├── maintenance/                Compaction, expire snapshots, orphan removal
+│   ├── api/                        FastAPI REST API + CloudEvents handler
+│   ├── runner/                     Long-running controller, cron entrypoint
+│   ├── cli/                        Click CLI
+│   └── catalog.py                  Generic catalog factory (REST/Glue/Hive/SQL)
+│
+├── flink-jobs/                     Java FlinkCompactionJob (production today,
+│                                   retired in the Go design)
+│
+├── go/                             ← Go implementation (MVP shipped)
+│   ├── README.md                   Go-specific README
+│   ├── BENCHMARKS.md               ★ Live measured numbers from each phase
+│   ├── TABLEFLOW_COMPARISON.md     Architectural comparison vs Confluent Tableflow
+│   ├── go.mod                      Module: github.com/mystictraveler/iceberg-janitor/go
+│   ├── pkg/
+│   │   ├── catalog/                Directory catalog (LoadTable + atomic CommitTable)
+│   │   ├── analyzer/               HealthReport with H1 metadata-to-data axiom
+│   │   ├── safety/                 Master check (I1+I2+I7 today; +I3-I9 planned)
+│   │   ├── iceberg/                Thin loader over apache/iceberg-go
+│   │   ├── blob/                   Multi-cloud blob abstraction (placeholder; iceberg-go's IO covers reads)
+│   │   ├── policy/                 (planned) Per-table thresholds
+│   │   ├── strategy/               (planned) Triggers, scheduler, access tracker, feedback, classifier
+│   │   ├── maintenance/            (planned) compact, expire, orphans, manifests
+│   │   ├── orchestrator/           (planned) Stateless ProcessTable function
+│   │   ├── janitor/                (planned) Top-level Core entry point
+│   │   ├── state/                  (planned) BlobBackend for _janitor/state/
+│   │   └── config/                 (planned) 12-factor env var loader
+│   ├── cmd/
+│   │   ├── janitor-cli/            ★ discover, analyze, compact (today)
+│   │   ├── janitor-seed/           ★ Pure-Go iceberg fixture generator
+│   │   ├── janitor-server/         (planned) Knative HTTP adapter
+│   │   └── janitor-lambda/         (planned) AWS Lambda adapter
+│   └── test/
+│       └── mvp/                    ★ docker-compose + MVP runbook
+│
+├── helm/                           Helm chart (Python-side, K8s + Knative)
+├── manifests/dev/                  K8s manifests (MinIO, Kafka, REST catalog, Flink, Karpenter)
+├── openapi/                        OpenAPI 3.1 spec for the Python REST API
+├── jmeter/                         DuckDB query benchmark suite
+├── scripts/                        TPC-DS schema, data generators, setup scripts
+├── tests/                          Python: TPC-DS benchmark + feedback loop + policy + analyzer
+└── docs/                           Research: Tableflow comparison, Flink sizing, multi-region
 ```
 
-This prevents CRR from shipping compacted data files cross-region. Each region's data files stay local. Metadata replication ensures both regions see the same logical schema, snapshot history, and table properties — but physical data files are independent.
+★ = ships in the current MVP and reproducible via `make`.
 
-**Why this works with Iceberg:** Iceberg metadata (JSON + Avro manifests) is tiny — typically < 1 MB even for TB-scale tables. Replicating metadata costs fractions of a cent. Data files (Parquet) are the expensive part — and with this approach, they never cross regions.
+---
 
-**Design principles:**
+## Documentation Index
 
-1. **Each region runs its own janitor + Flink cluster** — independent compaction, no cross-region coordination
-2. **Metadata-only CRR** — schema, snapshots, and table properties replicate; data files stay local
-3. **Each region has its own streaming pipeline** — Kafka → Flink → Iceberg writes happen locally
-4. **Shared policy via GitOps** — same thresholds, same triggers, deployed by CI/CD
-5. **Idempotent compaction** — if a table is already healthy (few files, good sizes), the janitor skips it regardless of why it's healthy
-6. **Each region cleans its own orphans** — no cross-region orphan concerns since data files are never replicated
-
-**Conclusion:** Always compact locally. Replicate metadata only. The 20:1 transfer-to-compute cost ratio makes cross-region data shipping uneconomical at any scale. Full analysis: [Multi-Region Strategy](docs/multiregion-strategy.md)
+| Document | Purpose |
+|---|---|
+| [`README.md`](README.md) | This file: project identity, what's stable, what's new, quick start |
+| [`go/README.md`](go/README.md) | Go-specific README with package layout and quick reference |
+| [`go/BENCHMARKS.md`](go/BENCHMARKS.md) | **Live measured numbers from each Go build phase** with reproducible commands |
+| [`go/TABLEFLOW_COMPARISON.md`](go/TABLEFLOW_COMPARISON.md) | Side-by-side architectural comparison vs Confluent Tableflow's compaction |
+| [`go/test/mvp/MVP.md`](go/test/mvp/MVP.md) | Runbook for the Go MVP test loop (local fileblob and MinIO) |
+| [`/Users/jp/.claude/plans/async-plotting-cake.md`](/Users/jp/.claude/plans/async-plotting-cake.md) | The 27-decision design plan with full rationale, alternatives, tradeoffs |
+| [`docs/multiregion-strategy.md`](docs/multiregion-strategy.md) | Cost analysis: local compaction vs cross-region shipping |
+| [`docs/research-tableflow-comparison.md`](docs/research-tableflow-comparison.md) | Earlier research notes on Tableflow (Python era) |
+| [`docs/research-iceberg-maintenance-api.md`](docs/research-iceberg-maintenance-api.md) | Gap analysis of REST Catalog spec, V3 changes |
+| [`docs/flink-sizing.md`](docs/flink-sizing.md) | Flink TaskManager sizing strategy (Python-era; superseded by tier dispatch) |
+| [`openapi/iceberg-janitor-api-v2.yaml`](openapi/iceberg-janitor-api-v2.yaml) | OpenAPI 3.1 spec for the Python REST API |
 
 ---
 
 ## Evolution
 
-This project evolved through several architectural stages:
+The architectural arc from the original Python prototype to the current state:
 
 1. **K8s CronJob** — Simple scheduled maintenance every 15 minutes
 2. **Long-running controller** — Poll-based catalog watching with trigger evaluation
 3. **Knative migration** — Scale-to-zero Serving + event-driven PingSource/KafkaSource
-4. **Catalog-only refactor** — Removed DuckDB/S3 dependencies from core, everything through PyIceberg
+4. **Catalog-only refactor** — Removed DuckDB/S3 dependencies from core; everything through PyIceberg's generic catalog interface
 5. **Adaptive scheduling** — Access frequency tracking, heat classification, feedback loop
-6. **Flink execution** — Smart routing: small tables in-process, large tables on Flink with Karpenter autoscaling
-7. **TPC-DS validation** — 24-table benchmark proving 15-20% query improvement after compaction
-8. **Multi-region strategy** — Simulated 2-region compaction; proved local compaction is 10x cheaper than cross-region shipping
-
----
-
-## Research
-
-- [Tableflow Comparison](docs/research-tableflow-comparison.md) — vs. Confluent Cloud's managed Iceberg maintenance
-- [Iceberg Maintenance API Analysis](docs/research-iceberg-maintenance-api.md) — Gap analysis of the REST Catalog spec, V3 changes, API simplification
-- [Flink Cluster Sizing](docs/flink-sizing.md) — TaskManager memory, parallelism, Karpenter autoscaling strategy
-- [Multi-Region Strategy](docs/multiregion-strategy.md) — Cost analysis: local compaction vs. cross-region shipping (with simulation results)
+6. **Flink execution layer** — Smart routing: small tables in-process, large tables on Flink with Karpenter autoscaling
+7. **TPC-DS validation** — 24-table benchmark proving 15-22% query improvement after compaction
+8. **Multi-region strategy** — Simulated 2-region compaction; proved local compaction is 10× cheaper than cross-region shipping
+9. **Go rewrite design** — 27-decision plan: catalog-less, multi-cloud, no KV store, three serverless tiers, mandatory master check, autopilot circuit breakers, Java Flink retired
+10. **Go MVP** ← currently here. Directory catalog (read+write), atomic CAS, master check (I1+I2+I7), streaming compaction, end-to-end loop verified against fileblob + MinIO with DuckDB round-trip
 
 ---
 

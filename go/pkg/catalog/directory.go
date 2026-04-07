@@ -16,6 +16,7 @@ import (
 	icebergtable "github.com/apache/iceberg-go/table"
 	view "github.com/apache/iceberg-go/view"
 	"gocloud.dev/blob"
+	"gocloud.dev/gcerrors"
 
 	// Register the gocloud-backed io schemes (s3, s3a, gs, azblob, mem)
 	// with iceberg-go's IO registry. The local file:// scheme is built
@@ -187,7 +188,15 @@ func (c *DirectoryCatalog) CommitTable(ctx context.Context, ident icebergtable.I
 // every "atomic file create" library on Unix.
 func (c *DirectoryCatalog) atomicWriteMetadataJSON(ctx context.Context, meta icebergtable.Metadata, absLoc string) error {
 	if strings.HasPrefix(c.warehouseURL, "file://") {
-		return atomicWriteLocalMetadataJSON(absLoc, meta)
+		if err := atomicWriteLocalMetadataJSON(absLoc, meta); err != nil {
+			// Local CAS path returns "CAS conflict" in the message; map it to
+			// the sentinel so retryable callers can detect it.
+			if strings.Contains(err.Error(), "CAS conflict") {
+				return fmt.Errorf("%w: %v", ErrCASConflict, err)
+			}
+			return err
+		}
+		return nil
 	}
 	// Cloud backends: gocloud.dev's IfNotExist maps to a native
 	// conditional-write primitive that the underlying provider
@@ -212,9 +221,14 @@ func (c *DirectoryCatalog) atomicWriteMetadataJSON(ctx context.Context, meta ice
 		return fmt.Errorf("encoding metadata: %w", err)
 	}
 	if err := w.Close(); err != nil {
-		// PreconditionFailed comes back here for losers.
+		// PreconditionFailed comes back here for losers. gocloud.dev maps
+		// the underlying provider's conditional-write failure to
+		// gcerrors.PreconditionFailed.
 		w = nil
-		return fmt.Errorf("CAS conflict committing %s: %w", key, err)
+		if gcerrors.Code(err) == gcerrors.FailedPrecondition {
+			return fmt.Errorf("%w: %v", ErrCASConflict, err)
+		}
+		return fmt.Errorf("closing writer for %s: %w", key, err)
 	}
 	w = nil
 	return nil
@@ -376,6 +390,13 @@ func absoluteURL(warehouseURL, key string) (string, error) {
 // silently doing nothing.
 
 var errNotImplemented = errors.New("DirectoryCatalog: method not implemented in MVP")
+
+// ErrCASConflict is returned by CommitTable when another writer
+// committed v(N+1).metadata.json before us. Callers MUST retry from
+// scratch: reload the current table state, rebuild the new metadata,
+// retry the conditional write. errors.Is(err, ErrCASConflict) is the
+// correct way to detect this case.
+var ErrCASConflict = errors.New("metadata commit CAS conflict: another writer won the v(N+1) race")
 
 func (c *DirectoryCatalog) CreateTable(ctx context.Context, identifier icebergtable.Identifier, schema *icebergpkg.Schema, opts ...icebergcat.CreateTableOpt) (*icebergtable.Table, error) {
 	return nil, errNotImplemented
