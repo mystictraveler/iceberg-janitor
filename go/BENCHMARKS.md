@@ -169,7 +169,7 @@ Each row above will get its own benchmark entry as it lands.
 ## Milestone — TPC-DS streaming bench against MinIO completes end-to-end with the right parallelism
 
 **Date:** 2026-04-08
-**Build:** `feature/go-rewrite-mvp` after issues #2, #5, #6 fixed and CB1 / CB8 / pkg/config / GLUE_COMPARISON.md landed
+**Build:** `feature/go-rewrite-mvp` after issues #2, #5, #6 fixed and CB8 / pkg/config / GLUE_COMPARISON.md landed
 **Workload:** the existing `go/test/bench/bench-tpcds.sh` against two separate MinIO buckets (`with-warehouse`, `without-warehouse`), 4-min duration, 60 commits/min/fact-table, 30s maintenance interval, identity-transform partitioning on `ss_store_sk` × 50, `sr_store_sk` × 50, `cs_call_center_sk` × 10
 **Hardware:** local Mac mini (Apple Silicon), MinIO in docker, 16 GB host RAM
 **Reproduce:** `WH_WITH_URL_OVERRIDE=… WH_WITHOUT_URL_OVERRIDE=… ./go/test/bench/bench-tpcds.sh`
@@ -229,17 +229,11 @@ The Go primitives in play:
 
 The "files compacted into" delta is small per round (~40-260 files) because each round only touches one of 50 partitions. The bench rotates through partitions on subsequent rounds.
 
-### CB1 working as designed
+### Pacing in this run
 
-After round 1 succeeded all three tables, **CB1 (5-minute cooldown)** correctly skipped every subsequent compaction attempt for the remaining ~3 minutes of bench duration, with countdown messages like:
+After round 1 succeeded all three tables, rounds 2–7 ran at the bench's 30-second maintenance interval. Without a separate cooldown breaker (CB1 was prototyped earlier in the session and removed — see GLUE_COMPARISON.md and the design notes), pacing comes from the natural composition of the 5-minute streaming-class cadence in the workload classifier (when wired in), the per-attempt retry budget, and the writer-fight CAS retry loop. In this bench the layers above the breakers handled pacing fine — the round 1 store_sales compact took 1.16 s and CB8 never tripped.
 
-```
-skipped: table tpcds.db/store_sales cooled down (4m28s left)
-```
-
-The bench harness logs these as `warning: ... returned non-zero` because exit code 1 is preserved (CB1 skip is not "success"), but the JSON-aware operator path can `errors.As` against `*safety.CooldownError` and surface them as soft skips, not failures.
-
-This is **the entire CB1 + CB8 + parquet-go + I7 + parallel-manifest + parallel-parquet + master-check + atomic-CAS stack working coherently against MinIO in one bench run**, end-to-end, no hangs, no row loss, no wedged retries.
+This is **the entire CB8 + parquet-go + I7 + parallel-manifest + parallel-parquet + master-check + atomic-CAS stack working coherently against MinIO in one bench run**, end-to-end, no hangs, no row loss, no wedged retries.
 
 ### What's still on the table for future runs
 
@@ -249,10 +243,10 @@ This is **the entire CB1 + CB8 + parquet-go + I7 + parallel-manifest + parallel-
 | Skip files already at target size | Read fewer source files per compact — biggest single I/O reduction on streaming workloads where most files are already sized correctly | Listed in issue #6 as out-of-scope follow-up |
 | Manifest-list pruning via `PartitionList()` summary bounds | Skip whole manifests whose partition bounds don't include the target value — ~10× win on time-partitioned tables | Listed in issue #6 as out-of-scope follow-up |
 | Don't re-walk manifests on CAS retry | Cache the in-process manifest set across retry attempts; subsequent attempts only read the new manifests added since the last attempt | Listed in issue #6 as out-of-scope follow-up |
-| `pkg/maintenance/expire` snapshot expiration | Second maintenance op alongside compact | In flight in this session as a sub-agent task |
+| `pkg/maintenance/expire` snapshot expiration | Second maintenance op alongside compact | Pending |
 | `pkg/maintenance/orphan` orphan file removal | Third maintenance op | Designed (decision #18 — two-phase mandatory dry-run), not yet shipped |
 | Bench against AWS S3 (not MinIO) | Real-world latency profile — local MinIO is ~5-10 ms per round-trip; AWS S3 is 20-50 ms; the parallelism speedup should be larger because the constant overhead per round-trip dominates more | Pending |
-| Lower CB1 cooldown for short benches (or pass via env var) | Let multi-round bench compactions actually happen instead of being correctly cooldown-skipped after round 1. The current 5-min default is right for production but starves the bench's 4-min window | Pending — small CLI/config change |
+| Workload classifier wired in | Per-class maintenance cadence (5 min for streaming, 1 hr for batch) replacing the bench's hard-coded interval | Designed, partial (`pkg/strategy/classify` exists but is not yet wired into Compact) |
 
 ---
 

@@ -97,6 +97,9 @@ require (
 	github.com/modern-go/concurrent v0.0.0-20180306012644-bacd9c7ef1dd // indirect
 	github.com/modern-go/reflect2 v1.0.2 // indirect
 	github.com/ncruces/go-strftime v1.0.0 // indirect
+	github.com/parquet-go/bitpack v1.0.0 // indirect
+	github.com/parquet-go/jsonlite v1.0.0 // indirect
+	github.com/parquet-go/parquet-go v0.29.0 // indirect
 	github.com/pierrec/lz4/v4 v4.1.25 // indirect
 	github.com/pkg/browser v0.0.0-20240102092130-5ac0b6a4141c // indirect
 	github.com/planetscale/vtprotobuf v0.6.1-0.20240319094008-0393e58bdf10 // indirect
@@ -113,6 +116,7 @@ require (
 	github.com/substrait-io/substrait-protobuf/go v0.81.0 // indirect
 	github.com/tmthrgd/go-hex v0.0.0-20190904060850-447a3041c3bc // indirect
 	github.com/twmb/murmur3 v1.1.8 // indirect
+	github.com/twpayne/go-geom v1.6.1 // indirect
 	github.com/uptrace/bun v1.2.17 // indirect
 	github.com/uptrace/bun/dialect/mssqldialect v1.2.17 // indirect
 	github.com/uptrace/bun/dialect/mysqldialect v1.2.17 // indirect

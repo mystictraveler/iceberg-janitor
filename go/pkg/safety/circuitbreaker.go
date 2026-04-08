@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"time"
 
 	"gocloud.dev/blob"
 
@@ -18,35 +17,6 @@ import (
 // successful retry, low enough that a structural problem (writer is faster
 // than compactor, broken table, missing IAM perm) gets noticed quickly.
 const CB8DefaultThreshold = 3
-
-// CB1DefaultCooldown is the default value for CircuitBreaker.CooldownDuration.
-// Five minutes is the universal "back off" primitive: long enough that a
-// freshly-resumed table (or one where a writer is committing faster than the
-// compactor) doesn't immediately re-burn its CB8 retry budget, short enough
-// that a healthy table on a quiet bench still gets touched within a single
-// AutoCompact loop iteration. See design plan CB1.
-const CB1DefaultCooldown = 5 * time.Minute
-
-// CooldownError is returned by CircuitBreaker.Preflight when a table was
-// acted on (success OR failure) less than CooldownDuration ago. Unlike
-// PausedError, this is a SOFT skip that auto-clears when the cooldown
-// elapses — no operator action is required. Callers can errors.As
-// against it to surface the cooldown distinctly from a genuine failure.
-type CooldownError struct {
-	TableUUID         string
-	RemainingDuration time.Duration
-}
-
-func (e *CooldownError) Error() string {
-	return fmt.Sprintf("table %s is cooling down: %s remaining", e.TableUUID, e.RemainingDuration.Round(time.Second))
-}
-
-// IsCooldown reports whether err wraps a CooldownError. Convenience for
-// callers that just want to detect the case without unwrapping.
-func IsCooldown(err error) bool {
-	var ce *CooldownError
-	return errors.As(err, &ce)
-}
 
 // PausedError is returned by CircuitBreaker.Preflight when a table has
 // already been auto- or manually-paused. Callers can errors.As against
@@ -84,11 +54,6 @@ func IsPaused(err error) bool {
 type CircuitBreaker struct {
 	Bucket                 *blob.Bucket
 	MaxConsecutiveFailures int
-	// CooldownDuration is the CB1 per-table cooldown window. If the
-	// table's LastRunAt is less than this old, Preflight returns a
-	// *CooldownError and the caller skips the attempt. Zero means use
-	// CB1DefaultCooldown. See CB1DefaultCooldown for rationale.
-	CooldownDuration time.Duration
 	// TriggeredBy is the identifier the breaker stamps into pause
 	// files it writes (e.g. "janitor-cli", "janitor-server",
 	// "janitor-lambda"). Defaults to os.Args[0] if empty.
@@ -101,7 +66,6 @@ func New(bucket *blob.Bucket) *CircuitBreaker {
 	return &CircuitBreaker{
 		Bucket:                 bucket,
 		MaxConsecutiveFailures: CB8DefaultThreshold,
-		CooldownDuration:       CB1DefaultCooldown,
 	}
 }
 
@@ -110,13 +74,6 @@ func (cb *CircuitBreaker) threshold() int {
 		return cb.MaxConsecutiveFailures
 	}
 	return CB8DefaultThreshold
-}
-
-func (cb *CircuitBreaker) cooldown() time.Duration {
-	if cb.CooldownDuration > 0 {
-		return cb.CooldownDuration
-	}
-	return CB1DefaultCooldown
 }
 
 func (cb *CircuitBreaker) triggeredBy() string {
@@ -129,28 +86,14 @@ func (cb *CircuitBreaker) triggeredBy() string {
 	return "janitor"
 }
 
-// Preflight is the first call a maintenance op makes. It runs every
-// check that can refuse an attempt before any work is done:
+// Preflight is the first call a maintenance op makes. It reads the
+// pause file for the table; if present, it returns a *PausedError.
+// Otherwise it returns nil and the op proceeds.
 //
-//  1. Pause file (CB8, or operator-initiated ManualPause). If present,
-//     returns *PausedError.
-//  2. Per-table cooldown (CB1). If the table's LastRunAt is less than
-//     CooldownDuration ago, returns *CooldownError.
-//
-// Pause wins over cooldown: if a table is paused, the cooldown is
-// irrelevant — the operator has explicitly said "stop touching this"
-// and surfacing a cooldown message would be misleading.
-//
-// Cost: Preflight is the hot path on healthy tables. Before CB1 it did
-// ONE GET (the pause file). With CB1 it now does TWO (pause file +
-// state file). That's acceptable because the state file is small
-// (~200 bytes) and the lookups are parallelizable by the object store,
-// but note it for future breakers — adding a third file-per-Preflight
-// should prompt a batching redesign.
-//
-// A brand-new table (LastRunAt is the zero value, meaning no state
-// file exists or the state file has never been stamped) is NOT
-// subject to the cooldown — first runs must not be blocked.
+// Preflight does NOT load the state file. Reading state is the job of
+// RecordOutcome (which has to write it anyway, so it amortises the
+// round trip). Preflight is the hot path on healthy tables and stays
+// at one HEAD/GET per call.
 func (cb *CircuitBreaker) Preflight(ctx context.Context, tableUUID string) error {
 	if cb == nil || cb.Bucket == nil {
 		return nil
@@ -163,28 +106,10 @@ func (cb *CircuitBreaker) Preflight(ctx context.Context, tableUUID string) error
 		// the whole point of the circuit breaker.
 		return fmt.Errorf("circuit breaker preflight: %w", err)
 	}
-	if pause != nil {
-		return &PausedError{TableUUID: tableUUID, Reason: pause.Reason}
-	}
-	// CB1 cooldown check. Load the state file to find LastRunAt. Same
-	// fail-closed rationale as above: if we cannot read state, we
-	// cannot prove the cooldown has elapsed, so we refuse.
-	s, err := state.Load(ctx, cb.Bucket, tableUUID)
-	if err != nil {
-		return fmt.Errorf("circuit breaker preflight: %w", err)
-	}
-	if s.LastRunAt.IsZero() {
-		// Brand-new table: no prior attempt, no cooldown applies.
+	if pause == nil {
 		return nil
 	}
-	elapsed := timeNow().Sub(s.LastRunAt)
-	if elapsed < cb.cooldown() {
-		return &CooldownError{
-			TableUUID:         tableUUID,
-			RemainingDuration: cb.cooldown() - elapsed,
-		}
-	}
-	return nil
+	return &PausedError{TableUUID: tableUUID, Reason: pause.Reason}
 }
 
 // RecordOutcome updates the per-table state with the result of one
@@ -267,12 +192,6 @@ func (cb *CircuitBreaker) Resume(ctx context.Context, tableUUID string) error {
 	}
 	s.ConsecutiveFailedRuns = 0
 	s.LastErrors = nil
-	// Clear LastRunAt too. Leaving it stamped would cause the next
-	// Preflight to immediately re-skip with CB1 cooldown, which makes
-	// the Resume action useless for the same reason not resetting
-	// ConsecutiveFailedRuns would make it useless for CB8: the
-	// operator's resume signal means "start fresh".
-	s.LastRunAt = time.Time{}
 	s.UpdatedAt = timeNow()
 	return state.Save(ctx, cb.Bucket, s)
 }

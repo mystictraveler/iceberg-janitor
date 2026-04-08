@@ -123,30 +123,6 @@ func TestRecordSuccess_ResetsCounter(t *testing.T) {
 	}
 }
 
-// TestRecordOutcome_StampsLastRunAt: both success and failure must
-// update LastRunAt. CB1 cooldown depends on this field being stamped
-// on EVERY attempt, not just successful ones — a freshly-failed table
-// must also cool down before the next attempt so CB8's retry budget
-// isn't burned in a tight loop.
-func TestRecordOutcome_StampsLastRunAt(t *testing.T) {
-	now := time.Date(2026, 4, 8, 12, 0, 0, 0, time.UTC)
-
-	// Success path.
-	s := &TableState{TableUUID: "x"}
-	s.RecordSuccess(now)
-	if !s.LastRunAt.Equal(now) {
-		t.Errorf("after success: LastRunAt=%v want %v", s.LastRunAt, now)
-	}
-
-	// Failure path.
-	s2 := &TableState{TableUUID: "y"}
-	later := now.Add(time.Minute)
-	s2.RecordFailure(later, "boom")
-	if !s2.LastRunAt.Equal(later) {
-		t.Errorf("after failure: LastRunAt=%v want %v", s2.LastRunAt, later)
-	}
-}
-
 // TestPause_DeleteIdempotent: deleting a pause file that does not
 // exist must NOT error. The operator's `resume` action should be
 // safe to invoke whether or not the table is currently paused.

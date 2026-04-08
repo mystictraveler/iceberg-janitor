@@ -48,7 +48,7 @@ without registering anything.
 | **Atomicity primitive** | Glue catalog handles it server-side via `UpdateTable` with version preconditions. | Per-key conditional write on the object store. Linearized by the cloud provider (or by `link(2)` on POSIX). No external lock service. Verified by `cas_test.go` racing 32 goroutines on the same key — exactly 1 winner, 5/5 runs. |
 | **Concurrent writer safety** | Safe for writers that go through Glue catalog. Writers that bypass Glue (raw `aws s3 cp`, custom Spark with a different catalog) can corrupt the table. | The conditional-write CAS works against ANY writer — janitor, Spark, Flink, Trino, an external dbt job, raw boto3. The janitor doesn't need to be the only writer, and an external writer doesn't need to know the janitor exists. |
 | **Recoverability** | Whatever AWS's SLA covers. Snapshot expiration is destructive — no janitor-side recycle. | Recycle bin (`_janitor/recycle/<run_id>/`) + lifecycle-policy retention. Iceberg time travel still works for any committed snapshot. Two-phase orphan removal (dry run, then operator approval). |
-| **Failure mode visibility** | Glue console + CloudWatch metric `numberOfBytesCompacted`. Failures surface as Glue job failures with stack traces in CloudWatch logs. | Per-table state file in `_janitor/state/<uuid>.json` with `consecutive_failed_runs`, `last_errors[]`, `last_outcome`, `last_run_at`. CB8 auto-pauses tables that fail repeatedly; CB1 cools down freshly-acted-on tables. Operator inspects via `janitor-cli status <table>`. |
+| **Failure mode visibility** | Glue console + CloudWatch metric `numberOfBytesCompacted`. Failures surface as Glue job failures with stack traces in CloudWatch logs. | Per-table state file in `_janitor/state/<uuid>.json` with `consecutive_failed_runs`, `last_errors[]`, `last_outcome`, `last_success_at`. CB8 auto-pauses tables that fail repeatedly. Operator inspects via `janitor-cli status <table>`. |
 
 ## Compaction strategies and target shape
 
@@ -83,9 +83,9 @@ without registering anything.
 
 | Concern | AWS Glue auto-compaction | iceberg-janitor (Go) |
 |---|---|---|
-| **Circuit breakers** | None published. Glue's job framework will retry failed jobs but does not auto-pause tables that consistently fail. Operator monitors CloudWatch and disables compaction manually. | Eleven circuit breakers (CB1–CB11) designed; **CB1 (cooldown) and CB8 (consecutive failure pause) shipped this session**. CB2 loop detection, CB3 metadata-budget axiom, CB4 effectiveness floor, CB5/CB6 ordering, CB7 daily byte budget, CB9 lifetime rewrite ratio, CB10 recursion guard, CB11 ROI estimate are designed and land alongside the maintenance ops they protect. |
+| **Circuit breakers** | None published. Glue's job framework will retry failed jobs but does not auto-pause tables that consistently fail. Operator monitors CloudWatch and disables compaction manually. | Eleven circuit breakers designed; **CB8 (consecutive failure pause) shipped**. CB1 cooldown was prototyped and removed because the per-attempt retry budget plus the workload classifier's per-class cadence cover the same case more cleanly. CB2 loop detection, CB3 metadata-budget axiom, CB4 effectiveness floor, CB5/CB6 ordering, CB7 daily byte budget, CB9 lifetime rewrite ratio, CB10 recursion guard, CB11 ROI estimate are designed and land alongside the maintenance ops they protect. |
 | **Self-pause on repeated failure** | No. | CB8 — after 3 consecutive failed runs the table is auto-paused via `_janitor/control/paused/<uuid>.json`. Operator clears with `janitor-cli resume <table>`. Verified end-to-end against MinIO this session. |
-| **Cooldown between attempts** | No published mechanism. | CB1 — per-table 5-minute (default) minimum interval between maintenance attempts. Protects freshly-resumed tables from immediately re-tripping CB8. Auto-clears when the cooldown elapses; no operator action needed. |
+| **Cooldown between attempts** | No published mechanism. | Not a separate circuit breaker. Pacing comes from three composing layers: (a) the per-attempt retry budget (15 attempts × exponential backoff ≈ 50 s of natural pacing per failed run); (b) CB8's hard pause after 3 consecutive failures; (c) the workload classifier's per-class maintenance cadence (5 min for streaming, 1 hr for batch). A separate cooldown breaker was prototyped and found to fight (c) when set per-table — the layers above already do the work. |
 | **Metadata-to-data ratio enforcement** | _(uncertain)_ Glue likely tracks this internally but doesn't expose it. | **Explicit invariant.** H1 axiom: `metadata_bytes / data_bytes ≤ 5%`. At >5% the janitor warns; at >10% it switches to metadata-shrinking mode and refuses further compaction; at >50% it triggers the warehouse self-pause. The `analyzer.HealthReport` reports the current ratio. |
 | **Three-tier kill switch** | Manual disable via Glue console. | Per-table self-pause (CB8) → warehouse self-pause (`_janitor/control/paused-warehouse`) → operator panic button (`_janitor/control/panic`) — each level wider in scope, all encoded as control files in the warehouse. |
 | **Workload classification** | None. Same policy applies to every table. | Auto-classifier (streaming / batch / slow_changing / dormant) with per-class default thresholds. Streaming class gets 5-min cadence and 60s write-buffer to avoid the writer fight. _(`pkg/strategy/classify` exists but is not yet wired into the compact path.)_ |
@@ -168,10 +168,11 @@ that the janitor doesn't try to do:
   computed against the staged transaction *before* commit. Result
   embedded in the Iceberg snapshot summary forever. Glue's verification
   approach is opaque; there is no published equivalent.
-- **Eleven circuit breakers (CB1–CB11)** with explicit, code-visible,
+- **Eleven circuit breakers** designed with explicit, code-visible,
   operator-readable failure containment. Glue has none beyond
-  job-level retry. CB1 cooldown and CB8 consecutive failure pause
-  shipped; the rest are designed.
+  job-level retry. CB8 consecutive failure pause shipped; the rest are
+  designed (CB1 cooldown was prototyped and removed in favor of the
+  per-attempt retry budget + classifier cadence stack).
 - **Two-phase orphan removal with mandatory dry-run.** Glue's
   vacuum is single-phase and immediate. The janitor refuses to
   delete files without an operator-acknowledged candidate list.
@@ -211,7 +212,7 @@ that the janitor doesn't try to do:
 | Orphan removal | ✅ Shipped (Vacuum) | ❌ Designed (two-phase dry-run), not shipped |
 | Manifest rewrite | ⚠️ _(uncertain)_ | ❌ Designed, not shipped |
 | Pre-commit master check | ❌ None published | ✅ I1, I2, I3, I4, I5, I7 shipped (6/9) |
-| Circuit breakers | ❌ None | ⚠️ CB1, CB8 shipped (2/11) |
+| Circuit breakers | ❌ None | ⚠️ CB8 shipped (1/11) |
 | Recycle bin | ❌ | ✅ Designed, partial |
 | Workload classifier | ❌ | ⚠️ Designed, partial |
 | Adaptive feedback loop | ❌ | ❌ Designed, not shipped |

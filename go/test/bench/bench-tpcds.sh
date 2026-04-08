@@ -422,6 +422,16 @@ EOF
 ## on the store key (50 values) and catalog_sales on the call-center
 ## key (10 values); the column names in --partition match the source
 ## column directly because we use IdentityTransform partition specs.
+## Pattern B target file size for the bench. The streamer's per-commit
+## files are ~5-20 KB each; setting --target-file-size to 1MB means a
+## newly-compacted output (~1-3 MB per partition after round 1) is
+## above the threshold and gets skipped on subsequent rounds, while
+## the freshly-streamed small files at the tail get rewritten. This
+## bounds the per-round read cost to ~the streaming delta, eliminating
+## the writer-fight pathology that surfaced as 222s/12-retries on
+## store_sales round 3 in run 9. Override via TARGET_FILE_SIZE env var.
+TARGET_FILE_SIZE="${TARGET_FILE_SIZE:-1MB}"
+
 COMPACT_ROUND=0
 run_janitor_compact() {
   local warehouse_url="$1"
@@ -429,12 +439,12 @@ run_janitor_compact() {
   local ss_part=$(( (COMPACT_ROUND % 50) + 1 ))
   local sr_part=$(( (COMPACT_ROUND % 50) + 1 ))
   local cs_part=$(( (COMPACT_ROUND % 10) + 1 ))
-  log "running janitor compact (round ${COMPACT_ROUND}: ss_store_sk=${ss_part}, sr_store_sk=${sr_part}, cs_call_center_sk=${cs_part})"
-  JANITOR_WAREHOUSE_URL="$warehouse_url" /tmp/janitor-cli compact "${NAMESPACE}.db/store_sales" --partition "ss_store_sk=${ss_part}" \
+  log "running janitor compact (round ${COMPACT_ROUND}: ss_store_sk=${ss_part}, sr_store_sk=${sr_part}, cs_call_center_sk=${cs_part}; target=${TARGET_FILE_SIZE})"
+  JANITOR_WAREHOUSE_URL="$warehouse_url" /tmp/janitor-cli compact "${NAMESPACE}.db/store_sales" --partition "ss_store_sk=${ss_part}" --target-file-size "${TARGET_FILE_SIZE}" \
     >> "$JANITOR_LOG" 2>&1 || log "  warning: compact store_sales partition returned non-zero"
-  JANITOR_WAREHOUSE_URL="$warehouse_url" /tmp/janitor-cli compact "${NAMESPACE}.db/store_returns" --partition "sr_store_sk=${sr_part}" \
+  JANITOR_WAREHOUSE_URL="$warehouse_url" /tmp/janitor-cli compact "${NAMESPACE}.db/store_returns" --partition "sr_store_sk=${sr_part}" --target-file-size "${TARGET_FILE_SIZE}" \
     >> "$JANITOR_LOG" 2>&1 || log "  warning: compact store_returns partition returned non-zero"
-  JANITOR_WAREHOUSE_URL="$warehouse_url" /tmp/janitor-cli compact "${NAMESPACE}.db/catalog_sales" --partition "cs_call_center_sk=${cs_part}" \
+  JANITOR_WAREHOUSE_URL="$warehouse_url" /tmp/janitor-cli compact "${NAMESPACE}.db/catalog_sales" --partition "cs_call_center_sk=${cs_part}" --target-file-size "${TARGET_FILE_SIZE}" \
     >> "$JANITOR_LOG" 2>&1 || log "  warning: compact catalog_sales partition returned non-zero"
 }
 

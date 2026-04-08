@@ -76,13 +76,23 @@ type CompactOptions struct {
 	// looks up the column's iceberg field id from the table schema,
 	// and matches against DataFile.Partition()[partition_field_id].
 	//
-	// Map key is the schema column name (e.g. "ss_store_sk"); value
-	// is the typed Go value (int64 for the int columns we currently
-	// support).
+	// Map key is the source schema column name (e.g. "ss_store_sk"
+	// or "event_date"); value is the RAW string from the operator
+	// (e.g. "5" or "2026-04-08" or "US"). compactOnce parses each
+	// value as the corresponding iceberg type at runtime, after
+	// loading the table — see buildPartitionLiterals in
+	// compact_partition_types.go for the type-aware parser. The
+	// CLI does NOT need to know the iceberg type to construct this
+	// map; it just forwards the raw user intent.
 	//
-	// nil means "compact the whole table". On an unpartitioned table,
-	// passing a non-nil PartitionTuple is a hard error — see the
-	// guard at the top of compactOnce.
+	// Supported partition column types: bool, int / long, float /
+	// double, string, binary, fixed, uuid, date, time, timestamp,
+	// timestamptz, timestamp_ns, timestamptz_ns. Decimal is
+	// recognized but not yet parsed (see compact_partition_types.go).
+	//
+	// nil means "compact the whole table". On an unpartitioned
+	// table, passing a non-nil PartitionTuple is a hard error — see
+	// the guard at the top of compactOnce.
 	//
 	// This is the smaller-scope-per-compaction primitive for the
 	// writer-fight pathology: instead of compacting the whole table
@@ -91,7 +101,41 @@ type CompactOptions struct {
 	// compact one partition's worth of files in a smaller transaction
 	// that only conflicts with the streamer's commits to that one
 	// partition.
-	PartitionTuple map[string]any
+	PartitionTuple map[string]string
+
+	// TargetFileSizeBytes is the "skip-already-large-files" threshold
+	// per design plan decision #13 (stitching binpack as default
+	// compaction). When non-zero, compactOnce skips every input data
+	// file whose FileSizeBytes is >= this threshold. The skipped
+	// files are not read, not rewritten, and not removed from the
+	// snapshot — they survive the compact unchanged. Only the
+	// small-file tail is read, merged, and rewritten as one new
+	// (target-sized) output file.
+	//
+	// Why: without this threshold, every compaction round reads and
+	// rewrites every file in the partition, which is O(table_size)
+	// I/O per round. On a streaming table that's hot enough that
+	// the total partition size grows faster than one compaction
+	// round can drain it, the compactor permanently loses the
+	// writer-fight CAS race. Run 9 of the TPC-DS streaming bench
+	// surfaced this: store_sales partition compact took 222 s and
+	// 12 retries on round 3 because Pattern A re-read 13499 files
+	// to rewrite 270.
+	//
+	// Pattern B (this option) bounds compaction cost per round to
+	// O(small-file tail), which is bounded by streaming_rate ×
+	// maintenance_interval — independent of table size. The cost
+	// per round becomes constant in steady state.
+	//
+	// 0 (default) disables the filter and preserves Pattern A
+	// behavior — every matching file is read and rewritten. Tests
+	// and the existing CLI default rely on the disabled behavior.
+	// The bench harness and production deployments should set this
+	// to a workload-appropriate value (typically 64-512 MB; the
+	// bench uses 1 MB because the streamer's per-commit files are
+	// only ~5-20 KB and a 1 MB threshold lets each round leave the
+	// previous round's output untouched).
+	TargetFileSizeBytes int64
 
 	// CircuitBreaker, if non-nil, is consulted before and after the
 	// compaction. Pre-compaction it gates entry: if the table has a

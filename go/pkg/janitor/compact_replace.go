@@ -134,12 +134,23 @@ func compactOnce(ctx context.Context, cat *catalog.DirectoryCatalog, ident icebe
 	}
 
 	// Step 1: walk the snapshot's manifest list and collect every
-	// data-file entry. Build the partition-match predicate once.
+	// data-file entry. Build the typed partition predicates once.
+	//
+	// buildPartitionLiterals parses the user's raw `--partition col=value`
+	// strings into typed iceberg.Literal values keyed by partition
+	// field id. The two predicates below — matchPart (per-data-file
+	// equality) and matchManifest (per-manifest bound check, used
+	// to prune the GET storm before reading any manifests) — both
+	// take this same typed binding slice and operate at different
+	// layers. See compact_partition_types.go for the type-aware
+	// parsing and comparison primitives.
 	icebergSchema := tbl.Metadata().CurrentSchema()
-	matchPart, err := buildPartitionMatcher(opts.PartitionTuple, tbl.Spec(), icebergSchema)
+	partitionBindings, err := buildPartitionLiterals(opts.PartitionTuple, icebergSchema, tbl.Spec())
 	if err != nil {
-		return fmt.Errorf("building partition matcher: %w", err)
+		return fmt.Errorf("parsing partition tuple: %w", err)
 	}
+	matchPart := buildPartitionMatcher(partitionBindings)
+	matchManifest := buildManifestPredicate(partitionBindings)
 
 	manifests, err := snap.Manifests(fs)
 	if err != nil {
@@ -164,6 +175,16 @@ func compactOnce(ctx context.Context, cat *catalog.DirectoryCatalog, ident icebe
 	g.SetLimit(manifestReadConcurrency)
 	for i, m := range manifests {
 		i, m := i, m
+		// Manifest pruning: if the manifest's per-partition-column
+		// bound summaries can prove that the target partition value
+		// CANNOT be present in this manifest's data files, skip the
+		// GET entirely. This is the load-bearing optimization for
+		// the writer-fight pathology — see buildManifestPredicate.
+		// On a hot streaming table this typically eliminates 90+%
+		// of manifest reads.
+		if matchManifest != nil && !matchManifest(m) {
+			continue
+		}
 		g.Go(func() error {
 			if gctx.Err() != nil {
 				return gctx.Err()
@@ -184,6 +205,17 @@ func compactOnce(ctx context.Context, cat *catalog.DirectoryCatalog, ident icebe
 					continue
 				}
 				if matchPart != nil && !matchPart(df) {
+					continue
+				}
+				// Pattern B (skip-already-large-files): if a target
+				// file size is configured, files at or above the
+				// threshold are kept in the snapshot unchanged. They
+				// are NOT added to oldPaths (so ReplaceDataFiles will
+				// not remove them) and NOT read or rewritten. Only
+				// the small-file tail is rewritten. See the doc on
+				// CompactOptions.TargetFileSizeBytes for the
+				// architectural rationale and bench numbers.
+				if opts.TargetFileSizeBytes > 0 && df.FileSizeBytes() >= opts.TargetFileSizeBytes {
 					continue
 				}
 				local.paths = append(local.paths, df.FilePath())
@@ -239,72 +271,94 @@ func compactOnce(ctx context.Context, cat *catalog.DirectoryCatalog, ident icebe
 		return fmt.Errorf("creating output file %s: %w", newFilePath, err)
 	}
 
-	pqProps := parquet.NewWriterProperties(parquet.WithStats(true))
-	pqWriter, err := pqarrow.NewFileWriter(writeSchema, out, pqProps, pqarrow.DefaultWriterProps())
-	if err != nil {
-		_ = wfs.Remove(newFilePath)
-		return fmt.Errorf("creating parquet writer: %w", err)
-	}
-	cleanup := func() {
-		_ = pqWriter.Close()
-		_ = wfs.Remove(newFilePath)
-	}
-
-	mem := memory.DefaultAllocator
-
-	// Step 3: read each input file via parquet-go directly and copy
-	// its rows into the output writer. We parallelize the READ side
-	// (workers each open one source parquet, decode it to Arrow batches,
-	// rebatch under the writer schema), but the WRITE side stays
-	// single-threaded behind a mutex because pqarrow.FileWriter is
-	// not safe for concurrent Write calls. Each worker gathers its
-	// file's batches in a local slice, then under the writer mutex
-	// flushes them and releases the references. This bounds working
-	// memory to parquetReadConcurrency × max-batches-per-file rather
-	// than holding all decoded data at once.
+	// Step 3: stitching binpack v1 (fast path) — read each input
+	// parquet file via parquet-go (NOT arrow-go's pqarrow) and use
+	// parquet-go's GenericWriter.WriteRowGroup to copy each input row
+	// group into the output. This skips Arrow decoding entirely and
+	// uses parquet-go's CopyRows fast path through RowWriterTo, which
+	// keeps values in their parquet-native typed-value form across
+	// the read→write boundary. Per design plan decision #13.
 	//
-	// On the TPC-DS streaming bench, this drops store_sales partition
-	// compact from ~33 s/attempt (sequential) to <2 s/attempt — under
-	// the writer's commit interval, so the CAS retry race is winnable
-	// after one attempt instead of thirteen. See issue #6.
-	var rowsWritten int64
-	var pqWriterMu sync.Mutex
-	g2, gctx2 := errgroup.WithContext(ctx)
-	g2.SetLimit(parquetReadConcurrency)
-	for _, fpath := range oldPaths {
-		fpath := fpath
-		g2.Go(func() error {
-			if gctx2.Err() != nil {
-				return gctx2.Err()
-			}
-			batches, n, rerr := readParquetFileBatches(gctx2, fs, fpath, writeSchema, mem)
-			if rerr != nil {
-				return fmt.Errorf("copying %s: %w", fpath, rerr)
-			}
-			pqWriterMu.Lock()
-			defer pqWriterMu.Unlock()
-			for i, b := range batches {
-				if werr := pqWriter.Write(b); werr != nil {
-					// Release the batches we're about to drop on the floor.
-					for j := i; j < len(batches); j++ {
-						batches[j].Release()
-					}
-					return fmt.Errorf("write %s: %w", fpath, werr)
-				}
-				b.Release()
-			}
-			atomic.AddInt64(&rowsWritten, n)
-			return nil
-		})
-	}
-	if err := g2.Wait(); err != nil {
-		cleanup()
-		return err
-	}
-
-	if err := pqWriter.Close(); err != nil {
+	// On the bench's hot tables (store_sales etc), the inputs are all
+	// from the streamer with identical writer config so the fast path
+	// fires reliably. If parquet-go returns a schema-mismatch error
+	// (which shouldn't happen on uniform inputs but could for
+	// real-world workloads with mixed writers), we fall through to
+	// the legacy pqarrow decode/encode read path below.
+	rowsWritten, stitchErr := stitchParquetFiles(ctx, fs, oldPaths, out)
+	usedStitch := stitchErr == nil && rowsWritten == expectedRows
+	if !usedStitch {
+		// Stitching failed or row count mismatched. Close + delete
+		// the partial output and fall through to the pqarrow path
+		// which we know works for any input shape.
+		_ = out.Close()
 		_ = wfs.Remove(newFilePath)
-		return fmt.Errorf("closing parquet writer: %w", err)
+		out, err = wfs.Create(newFilePath)
+		if err != nil {
+			return fmt.Errorf("creating output file %s for fallback: %w", newFilePath, err)
+		}
+		rowsWritten = 0
+
+		pqProps := parquet.NewWriterProperties(parquet.WithStats(true))
+		pqWriter, perr := pqarrow.NewFileWriter(writeSchema, out, pqProps, pqarrow.DefaultWriterProps())
+		if perr != nil {
+			_ = wfs.Remove(newFilePath)
+			return fmt.Errorf("creating parquet writer: %w", perr)
+		}
+		cleanup := func() {
+			_ = pqWriter.Close()
+			_ = wfs.Remove(newFilePath)
+		}
+		mem := memory.DefaultAllocator
+
+		// Fallback: read via pqarrow into Arrow batches, write
+		// serially through pqarrow.FileWriter under a mutex. Same
+		// shape as the path that issue #6 parallelized — workers
+		// read in parallel, writes are serialized.
+		var pqWriterMu sync.Mutex
+		g2, gctx2 := errgroup.WithContext(ctx)
+		g2.SetLimit(parquetReadConcurrency)
+		for _, fpath := range oldPaths {
+			fpath := fpath
+			g2.Go(func() error {
+				if gctx2.Err() != nil {
+					return gctx2.Err()
+				}
+				batches, n, rerr := readParquetFileBatches(gctx2, fs, fpath, writeSchema, mem)
+				if rerr != nil {
+					return fmt.Errorf("copying %s: %w", fpath, rerr)
+				}
+				pqWriterMu.Lock()
+				defer pqWriterMu.Unlock()
+				for i, b := range batches {
+					if werr := pqWriter.Write(b); werr != nil {
+						for j := i; j < len(batches); j++ {
+							batches[j].Release()
+						}
+						return fmt.Errorf("write %s: %w", fpath, werr)
+					}
+					b.Release()
+				}
+				atomic.AddInt64(&rowsWritten, n)
+				return nil
+			})
+		}
+		if err := g2.Wait(); err != nil {
+			cleanup()
+			return err
+		}
+		if err := pqWriter.Close(); err != nil {
+			_ = wfs.Remove(newFilePath)
+			return fmt.Errorf("closing parquet writer: %w", err)
+		}
+	} else {
+		// Stitching path succeeded. Close the output writer (the
+		// stitch helper itself doesn't close it because it doesn't
+		// own the lifecycle).
+		if cerr := out.Close(); cerr != nil {
+			_ = wfs.Remove(newFilePath)
+			return fmt.Errorf("closing stitched output %s: %w", newFilePath, cerr)
+		}
 	}
 
 	// Step 4: pre-flight check. The iceberg-go writer's manifest
@@ -354,96 +408,167 @@ func compactOnce(ctx context.Context, cat *catalog.DirectoryCatalog, ident icebe
 	return nil
 }
 
-// buildPartitionMatcher returns a predicate over DataFile that
-// returns true iff the file's Partition() tuple matches the
-// requested column=value. Returns nil (== "match everything") if
-// PartitionTuple is empty.
+// buildManifestPredicate returns a fast in-memory check that decides
+// whether a given manifest is worth opening for a partition-scoped
+// compaction. The check looks at the manifest's per-partition-column
+// lower/upper bound summaries (which were written into the
+// manifest_list avro file by whoever produced the snapshot, so they
+// are already in memory after `snap.Manifests(fs)` returns) and
+// returns false if those bounds prove the requested partition value
+// CANNOT be present in the manifest's data files.
 //
-// The lookup is structural:
-//   - resolve column name → iceberg schema field id
-//   - resolve schema field id → partition field id (where the
-//     partition field's SourceID == schema field id)
-//   - DataFile.Partition() is keyed by partition field id; compare
-//     values
-func buildPartitionMatcher(partTuple map[string]any, spec icebergpkg.PartitionSpec, sc *icebergpkg.Schema) (func(icebergpkg.DataFile) bool, error) {
-	if len(partTuple) == 0 {
-		return nil, nil
+// Returns nil (== "include every manifest") when:
+//   - bindings is empty (whole-table compaction; nothing to prune)
+//   - the binding's result type isn't comparable via compareLiterals
+//     (currently only DecimalType — see compact_partition_types.go)
+//
+// **Why this matters and how it composes:**
+//
+// On a hot streaming table the manifest list grows by one or two
+// entries per writer commit. Without pruning, every partition-scoped
+// compact attempt walks ALL manifests (even though almost all of
+// them don't contain files from the target partition), paying one S3
+// round-trip per manifest. The bench's worst case (run 9 / run 10)
+// was store_sales partition compact → 13449 data files → ~150 manifests
+// → 222 s wall because the writer kept committing during the walk.
+//
+// Manifest pruning skips manifests whose bounds don't include the
+// target partition value, BEFORE paying the GET round-trip. For a
+// 50-partition table where each commit lands in only 1-3 partitions
+// the win is roughly 10-30×; for time-partitioned tables where each
+// commit lands in one date partition the win is closer to 50-100×.
+//
+// **Composition with other optimizations:**
+//
+//   - Pattern B (skip-already-large-files via opts.TargetFileSizeBytes)
+//     filters which files INSIDE a manifest get rewritten. This
+//     pruning filters which MANIFESTS get opened in the first place.
+//     Both are independent and stack: pruning first to skip the GET,
+//     then Pattern B to skip the per-file rewrite work on the
+//     manifests we did open.
+//
+//   - The future on-commit dispatcher (issue #3, "Pattern C") will
+//     fire compactOnce per writer-commit-event, scoped to the
+//     partition the event touched. The dispatcher passes the same
+//     PartitionTuple to compactOnce, so this predicate works
+//     unchanged from the dispatcher path. Pattern C does NOT need a
+//     special code path here; it's "polling vs event-driven trigger"
+//     wrapping the same compactOnce.
+//
+//   - Manifest rewrite (a future maintenance op, tracked separately)
+//     is the missing additive-better step. Today's compactions write
+//     better-organized DATA files but the historical micro-manifests
+//     from individual streamer commits remain in the snapshot.
+//     Manifest rewrite would consolidate them into fewer larger
+//     manifests, after which this pruning predicate skips even more
+//     manifests per attempt. Pruning is useful right now even
+//     without manifest rewrite, but the two compound: better
+//     manifests → tighter bounds → more skips.
+//
+// SCD type 1 / type 2 tables and pure streaming tables both benefit
+// from this — the predicate doesn't care about the workload pattern,
+// only about the partition spec and the in-memory bounds.
+//
+// **Spec-evolution caveat:** the predicate is built against the
+// current partition spec. If the table's spec was evolved (e.g. a
+// partition column was added), older manifests may have a shorter
+// Partitions() slice than the current spec expects. We detect this
+// case (specPosition >= len(summaries)) and conservatively include
+// the manifest. Manifest pruning becomes less effective on tables
+// whose spec has evolved, but never wrong.
+func buildManifestPredicate(bindings []partitionLiteralBinding) func(icebergpkg.ManifestFile) bool {
+	if len(bindings) == 0 {
+		return nil
 	}
-	type binding struct {
-		partFieldID int
-		want        any
-	}
-	var bindings []binding
-	for col, val := range partTuple {
-		schemaField, ok := sc.FindFieldByName(col)
-		if !ok {
-			return nil, fmt.Errorf("partition column %q not found in schema", col)
-		}
-		var partFieldID = -1
-		for f := range spec.Fields() {
-			if f.SourceID == schemaField.ID {
-				partFieldID = f.FieldID
-				break
-			}
-		}
-		if partFieldID == -1 {
-			return nil, fmt.Errorf("schema column %q (id=%d) is not a partition source", col, schemaField.ID)
-		}
-		bindings = append(bindings, binding{partFieldID: partFieldID, want: val})
-	}
-	return func(df icebergpkg.DataFile) bool {
-		p := df.Partition()
+	return func(m icebergpkg.ManifestFile) bool {
+		summaries := m.Partitions()
 		for _, b := range bindings {
-			got, ok := p[b.partFieldID]
-			if !ok {
-				return false
+			if b.SpecPosition >= len(summaries) {
+				// Manifest's partition summary list is shorter than
+				// the spec — this can happen for manifests written
+				// against an older spec, before a new partition
+				// column was added. Safest is to include the
+				// manifest (we can't prove the value is absent).
+				return true
 			}
-			if !partitionValueEqual(got, b.want) {
+			s := summaries[b.SpecPosition]
+			if s.LowerBound == nil || s.UpperBound == nil {
+				// No bounds recorded — can't decide. Include.
+				return true
+			}
+			lo, err := icebergpkg.LiteralFromBytes(b.ResultType, *s.LowerBound)
+			if err != nil {
+				return true
+			}
+			hi, err := icebergpkg.LiteralFromBytes(b.ResultType, *s.UpperBound)
+			if err != nil {
+				return true
+			}
+			cmpLo, ok := compareLiterals(b.Want, lo, b.ResultType)
+			if !ok {
+				return true
+			}
+			cmpHi, ok := compareLiterals(b.Want, hi, b.ResultType)
+			if !ok {
+				return true
+			}
+			// Include the manifest iff lo <= want <= hi.
+			if cmpLo < 0 || cmpHi > 0 {
 				return false
 			}
 		}
 		return true
-	}, nil
+	}
 }
 
-// partitionValueEqual compares two partition values for equality
-// allowing for the integer-type lattice that comes out of iceberg
-// metadata vs the parsed CLI flag (which lands as int64). The
-// streamer's identity-partitioned columns are int32 in the schema
-// but stored as int32 in the partition tuple, while the CLI parses
-// the value as int64. Normalize both sides to int64 before
-// comparing.
-func partitionValueEqual(a, b any) bool {
-	ai, aok := toInt64(a)
-	bi, bok := toInt64(b)
-	if aok && bok {
-		return ai == bi
+// buildPartitionMatcher returns a predicate over DataFile that
+// returns true iff the file's Partition() tuple matches the
+// requested partition value bindings. Returns nil ("match
+// everything") when bindings is empty.
+//
+// The matcher uses Literal.Equals via valueToLiteral to convert
+// each data file's raw partition value into a typed Literal of the
+// right iceberg type, then compares against the user-supplied
+// Want literal. This routes all type-specific equality through
+// iceberg-go's Literal implementations (one place to add support
+// for new types — see compact_partition_types.go).
+//
+// The matcher is the per-FILE filter that runs INSIDE manifest
+// entries (after a manifest has been opened and read). The
+// manifest predicate (buildManifestPredicate above) is the
+// per-MANIFEST filter that runs BEFORE the manifest GET. They
+// operate on disjoint layers and stack additively.
+func buildPartitionMatcher(bindings []partitionLiteralBinding) func(icebergpkg.DataFile) bool {
+	if len(bindings) == 0 {
+		return nil
 	}
-	return a == b
-}
-
-func toInt64(v any) (int64, bool) {
-	switch x := v.(type) {
-	case int:
-		return int64(x), true
-	case int8:
-		return int64(x), true
-	case int16:
-		return int64(x), true
-	case int32:
-		return int64(x), true
-	case int64:
-		return x, true
-	case uint:
-		return int64(x), true
-	case uint8:
-		return int64(x), true
-	case uint16:
-		return int64(x), true
-	case uint32:
-		return int64(x), true
+	return func(df icebergpkg.DataFile) bool {
+		p := df.Partition()
+		for _, b := range bindings {
+			got, ok := p[b.PartFieldID]
+			if !ok {
+				return false
+			}
+			gotLit, ok := valueToLiteral(got, b.ResultType)
+			if !ok {
+				// Don't know how to wrap the value as a Literal of
+				// this type. Conservative: this file does not match.
+				// (False positives in the matcher mean we read more
+				// than necessary; false negatives in the matcher
+				// mean we drop rows. Returning false here is the
+				// false-positive direction — we drop a file we
+				// might have wanted, which means we under-compact,
+				// which is harmless. Returning true would risk
+				// over-compacting a file from a different partition,
+				// which is correctness — much worse.)
+				return false
+			}
+			if !b.Want.Equals(gotLit) {
+				return false
+			}
+		}
+		return true
 	}
-	return 0, false
 }
 
 // readParquetFileBatches reads `path` via parquet-go directly and

@@ -10,7 +10,6 @@ package main
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -19,7 +18,6 @@ import (
 	"strconv"
 	"strings"
 	"syscall"
-	"time"
 
 	icebergtable "github.com/apache/iceberg-go/table"
 	"gocloud.dev/blob"
@@ -113,7 +111,13 @@ COMMANDS:
   compact <table_path>   Read all data from the table and rewrite it as
                          the minimum number of files needed. The pre-commit
                          master check (I1 row count) is mandatory and
-                         non-bypassable.
+                         non-bypassable. Optional flags:
+                           --partition col=value
+                               Scope to one iceberg partition.
+                           --target-file-size SIZE
+                               Skip-already-large-files threshold (Pattern B).
+                               Files ≥ SIZE are kept unchanged. Bounds the
+                               per-round cost. Suffixes: KB / MB / GB.
   pause <table_path>     Manually pause maintenance on a table. Requires
                          --reason "<text>". Writes a pause file to
                          _janitor/control/paused/<uuid>.json that the next
@@ -322,6 +326,7 @@ func runAnalyze(args []string) error {
 func runCompact(args []string) error {
 	var tablePath string
 	var partitionFilter string
+	var targetFileSize int64
 	for i := 0; i < len(args); i++ {
 		a := args[i]
 		switch {
@@ -330,6 +335,19 @@ func runCompact(args []string) error {
 			i++
 		case strings.HasPrefix(a, "--partition="):
 			partitionFilter = strings.TrimPrefix(a, "--partition=")
+		case a == "--target-file-size" && i+1 < len(args):
+			parsed, err := parseFileSize(args[i+1])
+			if err != nil {
+				return fmt.Errorf("parsing --target-file-size: %w", err)
+			}
+			targetFileSize = parsed
+			i++
+		case strings.HasPrefix(a, "--target-file-size="):
+			parsed, err := parseFileSize(strings.TrimPrefix(a, "--target-file-size="))
+			if err != nil {
+				return fmt.Errorf("parsing --target-file-size: %w", err)
+			}
+			targetFileSize = parsed
 		case strings.HasPrefix(a, "--"):
 			return fmt.Errorf("unknown flag %q", a)
 		default:
@@ -340,7 +358,7 @@ func runCompact(args []string) error {
 		}
 	}
 	if tablePath == "" {
-		return fmt.Errorf("usage: janitor-cli compact <table_path> [--partition col=value]")
+		return fmt.Errorf("usage: janitor-cli compact <table_path> [--partition col=value] [--target-file-size SIZE]")
 	}
 
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -357,9 +375,51 @@ func runCompact(args []string) error {
 		if partitionFilter != "" {
 			fmt.Fprintln(os.Stderr, "warning: --partition is ignored in API mode (not yet supported by janitor-server)")
 		}
+		if targetFileSize > 0 {
+			fmt.Fprintln(os.Stderr, "warning: --target-file-size is ignored in API mode (not yet supported by janitor-server)")
+		}
 		return runCompactViaAPI(ctx, cfg, tablePath)
 	}
-	return runCompactInProcess(ctx, cfg, tablePath, partitionFilter)
+	return runCompactInProcess(ctx, cfg, tablePath, partitionFilter, targetFileSize)
+}
+
+// parseFileSize parses a human-readable file size string like "1MB",
+// "128MB", "512MB", "1024" (bytes), or "1GB" into an int64 byte count.
+// Suffixes: KB / MB / GB (powers of 1024). No suffix means bytes.
+// Case-insensitive on the suffix. Returns an error on unparseable
+// input or non-positive sizes.
+//
+// This is the parser for the --target-file-size flag on
+// `janitor-cli compact`. It exists to make Pattern B's threshold
+// (CompactOptions.TargetFileSizeBytes) human-friendly without
+// pulling in a heavyweight units package.
+func parseFileSize(s string) (int64, error) {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return 0, fmt.Errorf("empty size")
+	}
+	upper := strings.ToUpper(s)
+	var multiplier int64 = 1
+	switch {
+	case strings.HasSuffix(upper, "KB"):
+		multiplier = 1024
+		s = s[:len(s)-2]
+	case strings.HasSuffix(upper, "MB"):
+		multiplier = 1024 * 1024
+		s = s[:len(s)-2]
+	case strings.HasSuffix(upper, "GB"):
+		multiplier = 1024 * 1024 * 1024
+		s = s[:len(s)-2]
+	}
+	s = strings.TrimSpace(s)
+	n, err := strconv.ParseInt(s, 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf("invalid size %q: %w", s, err)
+	}
+	if n <= 0 {
+		return 0, fmt.Errorf("size must be positive, got %d", n)
+	}
+	return n * multiplier, nil
 }
 
 // runCompactInProcess runs the compaction directly against the
@@ -372,7 +432,13 @@ func runCompact(args []string) error {
 // pkg/janitor.Compact, which scopes the compaction to a single
 // partition by walking the snapshot's manifest list and matching
 // against DataFile.Partition().
-func runCompactInProcess(ctx context.Context, cfg *config.Config, tablePath, partitionFilter string) error {
+//
+// If targetFileSize > 0, Pattern B (skip-already-large-files) is
+// enabled: files at or above the threshold are kept in the snapshot
+// unchanged and only the small-file tail is read, merged, and
+// rewritten. See CompactOptions.TargetFileSizeBytes for the
+// architectural rationale.
+func runCompactInProcess(ctx context.Context, cfg *config.Config, tablePath, partitionFilter string, targetFileSize int64) error {
 	tablePath = strings.Trim(tablePath, "/")
 	url := cfg.Warehouse.URL
 
@@ -387,7 +453,9 @@ func runCompactInProcess(ctx context.Context, cfg *config.Config, tablePath, par
 		return err
 	}
 
-	opts := janitor.CompactOptions{}
+	opts := janitor.CompactOptions{
+		TargetFileSizeBytes: targetFileSize,
+	}
 	if partitionFilter != "" {
 		tuple, err := parsePartitionFilter(partitionFilter)
 		if err != nil {
@@ -412,6 +480,9 @@ func runCompactInProcess(ctx context.Context, cfg *config.Config, tablePath, par
 	if partitionFilter != "" {
 		scope = "partition " + partitionFilter
 	}
+	if targetFileSize > 0 {
+		scope = fmt.Sprintf("%s; skip files ≥ %s", scope, humanBytes(targetFileSize))
+	}
 	fmt.Printf("compacting %s (in-process; warehouse=%s; scope=%s)\n", tablePath, url, scope)
 	result, err := janitor.Compact(ctx, cat, ident, opts)
 	if safety.IsPaused(err) {
@@ -422,29 +493,24 @@ func runCompactInProcess(ctx context.Context, cfg *config.Config, tablePath, par
 		fmt.Fprintf(os.Stderr, "         (use 'janitor-cli status %s' to inspect, 'resume' to clear)\n", tablePath)
 		return err
 	}
-	if safety.IsCooldown(err) {
-		// CB1: the table was just acted on. Auto-clears when the
-		// cooldown elapses; no operator action needed. Print a
-		// distinct line so "skipped: cooled down" doesn't look
-		// like "compaction failed" in the bench harness output.
-		var ce *safety.CooldownError
-		if errors.As(err, &ce) {
-			fmt.Fprintf(os.Stderr, "skipped: table %s cooled down (%s left)\n", tablePath, ce.RemainingDuration.Round(time.Second))
-		} else {
-			fmt.Fprintf(os.Stderr, "skipped: %v\n", err)
-		}
-		return err
-	}
 	printCompactResult(tablePath, result, err)
 	return err
 }
 
 // parsePartitionFilter parses a "col=value" string into the
-// PartitionTuple map that pkg/janitor.Compact expects. Only int64
-// values are supported in the MVP. The --partition flag will be
-// removed entirely once AutoCompact reads the partition spec from
-// manifest discovery and chooses partitions on its own.
-func parsePartitionFilter(s string) (map[string]any, error) {
+// PartitionTuple map that pkg/janitor.Compact expects. The CLI
+// stores raw string values; pkg/janitor.compactOnce parses them as
+// the corresponding iceberg types at runtime, after loading the
+// table. This is what makes the CLI flag work for ANY iceberg
+// partition column type — int, string, date, timestamp, uuid, etc.
+// — without the CLI needing to know the iceberg type ahead of
+// time. The supported set is documented on
+// CompactOptions.PartitionTuple.
+//
+// The --partition flag will be removed entirely once AutoCompact
+// reads the partition spec from manifest discovery and chooses
+// partitions on its own.
+func parsePartitionFilter(s string) (map[string]string, error) {
 	eq := strings.Index(s, "=")
 	if eq < 0 {
 		return nil, fmt.Errorf("expected col=value, got %q", s)
@@ -454,11 +520,7 @@ func parsePartitionFilter(s string) (map[string]any, error) {
 	if col == "" || valStr == "" {
 		return nil, fmt.Errorf("expected col=value, got %q", s)
 	}
-	val, err := strconv.ParseInt(valStr, 10, 64)
-	if err != nil {
-		return nil, fmt.Errorf("partition value %q is not an integer: %w", valStr, err)
-	}
-	return map[string]any{col: val}, nil
+	return map[string]string{col: valStr}, nil
 }
 
 // runCompactViaAPI POSTs to a running janitor-server and prints the

@@ -45,10 +45,10 @@ const errorMessageMax = 4096
 // TableState is the per-table janitor bookkeeping persisted at
 // _janitor/state/<table_uuid>.json. Field set is intentionally minimal:
 // only the data CB8 needs today, plus identification fields. Other
-// circuit breakers (CB1 cooldown, CB7 daily byte budget, CB9 lifetime
-// rewrite ratio) will add their own fields here as they ship; the JSON
-// is forwards-compatible because every field is omitempty and unknown
-// keys are ignored on read.
+// circuit breakers (CB7 daily byte budget, CB9 lifetime rewrite ratio)
+// will add their own fields here as they ship; the JSON is forwards-
+// compatible because every field is omitempty and unknown keys are
+// ignored on read.
 type TableState struct {
 	TableUUID string    `json:"table_uuid"`
 	UpdatedAt time.Time `json:"updated_at"`
@@ -62,13 +62,6 @@ type TableState struct {
 	LastErrors            []ErrorRecord `json:"last_errors,omitempty"`
 	LastOutcome           Outcome       `json:"last_outcome,omitempty"`
 	LastSuccessAt         time.Time     `json:"last_success_at,omitempty"`
-
-	// CB1: wall-clock timestamp of the most recent maintenance attempt
-	// on this table, regardless of outcome. Distinct from LastSuccessAt
-	// because cooldown applies to BOTH success and failure runs — we
-	// need to know "when did we last try", not "when did we last
-	// succeed". Updated by RecordSuccess AND RecordFailure.
-	LastRunAt time.Time `json:"last_run_at,omitempty"`
 }
 
 // RecordSuccess clears the failure counter and the recent-errors list
@@ -78,7 +71,6 @@ func (s *TableState) RecordSuccess(now time.Time) {
 	s.LastErrors = nil
 	s.LastOutcome = OutcomeSuccess
 	s.LastSuccessAt = now
-	s.LastRunAt = now
 	s.UpdatedAt = now
 }
 
@@ -95,7 +87,6 @@ func (s *TableState) RecordFailure(now time.Time, errMsg string) {
 	if len(s.LastErrors) > MaxRetainedErrors {
 		s.LastErrors = s.LastErrors[len(s.LastErrors)-MaxRetainedErrors:]
 	}
-	s.LastRunAt = now
 	s.UpdatedAt = now
 }
 
