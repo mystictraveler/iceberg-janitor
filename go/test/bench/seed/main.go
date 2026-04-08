@@ -1,6 +1,19 @@
+//go:build bench
+
 // Command janitor-seed creates an Iceberg table at a configured warehouse
 // URL and writes N small batches into it via Table.AppendTable, simulating
 // the streaming-churn pattern (many small files) that the janitor exists to
+// fix. It is a TEST FIXTURE — gated behind the `bench` build tag so it is
+// not pulled into the production binaries' build graph. The seed depends
+// on iceberg-go's SqlCatalog and the pure-Go sqlite driver, which the
+// production janitor does not use.
+//
+// Build it with:
+//
+//	go build -tags bench ./test/bench/seed
+//
+// The Makefile mvp targets pass `-tags bench` automatically.
+//
 // fix.
 //
 // This is a TEST FIXTURE program. It uses iceberg-go's catalog/sql with a
@@ -41,6 +54,7 @@ import (
 	"os"
 	"os/signal"
 	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
@@ -169,8 +183,24 @@ func run(ctx context.Context, cfg config) error {
 	// 2. Build catalog properties. The warehouse URL is the home for new
 	//    table data, manifests, and metadata files. S3 credentials and
 	//    endpoint are forwarded into iceberg-go's IO layer via props.
+	//
+	//    Strip the query string from the warehouse URL before handing
+	//    it to iceberg-go's SqlCatalog. The query string (?endpoint=...,
+	//    ?s3ForcePathStyle=true, ?region=...) is meaningful only to
+	//    gocloud.dev/blob.OpenBucket; iceberg-go's location provider
+	//    uses the warehouse property as a path PREFIX for newly-created
+	//    metadata files and concatenates it with the table path,
+	//    producing nonsense like
+	//      s3://bucket?endpoint=.../mvp.db/.../00000-...metadata.json
+	//    which gocloud rejects with "invalid argument". The S3 endpoint /
+	//    region / credentials are passed via the s3.* properties below
+	//    so dropping the query string is lossless.
+	warehouseForCatalog := cfg.WarehouseURL
+	if i := strings.IndexByte(warehouseForCatalog, '?'); i >= 0 {
+		warehouseForCatalog = warehouseForCatalog[:i]
+	}
 	props := icebergpkg.Properties{
-		"warehouse": cfg.WarehouseURL,
+		"warehouse": warehouseForCatalog,
 	}
 	if cfg.S3Endpoint != "" {
 		props["s3.endpoint"] = cfg.S3Endpoint

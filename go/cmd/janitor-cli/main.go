@@ -10,6 +10,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -18,8 +19,8 @@ import (
 	"strconv"
 	"strings"
 	"syscall"
+	"time"
 
-	icebergpkg "github.com/apache/iceberg-go"
 	icebergtable "github.com/apache/iceberg-go/table"
 	"gocloud.dev/blob"
 
@@ -30,8 +31,24 @@ import (
 
 	"github.com/mystictraveler/iceberg-janitor/go/pkg/analyzer"
 	"github.com/mystictraveler/iceberg-janitor/go/pkg/catalog"
+	"github.com/mystictraveler/iceberg-janitor/go/pkg/config"
 	"github.com/mystictraveler/iceberg-janitor/go/pkg/janitor"
+	"github.com/mystictraveler/iceberg-janitor/go/pkg/safety"
+	"github.com/mystictraveler/iceberg-janitor/go/pkg/state"
 )
+
+// loadConfig loads the typed Config from the environment and applies the
+// AWS_* env-var side effects that iceberg-go's table-level IO depends on.
+// All run* commands route their env access through this so the binary
+// has a single, validated configuration source per design decision #26.
+func loadConfig() (*config.Config, error) {
+	cfg, err := config.Load()
+	if err != nil {
+		return nil, err
+	}
+	cfg.ApplyAWSEnv()
+	return cfg, nil
+}
 
 func main() {
 	if len(os.Args) < 2 {
@@ -55,6 +72,21 @@ func main() {
 	case "compact":
 		if err := runCompact(args); err != nil {
 			fmt.Fprintln(os.Stderr, "compact:", err)
+			os.Exit(1)
+		}
+	case "pause":
+		if err := runPause(args); err != nil {
+			fmt.Fprintln(os.Stderr, "pause:", err)
+			os.Exit(1)
+		}
+	case "resume":
+		if err := runResume(args); err != nil {
+			fmt.Fprintln(os.Stderr, "resume:", err)
+			os.Exit(1)
+		}
+	case "status":
+		if err := runStatus(args); err != nil {
+			fmt.Fprintln(os.Stderr, "status:", err)
 			os.Exit(1)
 		}
 	case "-h", "--help", "help":
@@ -82,6 +114,15 @@ COMMANDS:
                          the minimum number of files needed. The pre-commit
                          master check (I1 row count) is mandatory and
                          non-bypassable.
+  pause <table_path>     Manually pause maintenance on a table. Requires
+                         --reason "<text>". Writes a pause file to
+                         _janitor/control/paused/<uuid>.json that the next
+                         compact will see and refuse to proceed against.
+  resume <table_path>    Clear the pause file for a table AND reset the
+                         CB8 consecutive-failure counter. Use after
+                         investigating an auto-pause.
+  status <table_path>    Print the per-table janitor state: pause file
+                         (if any), consecutive failures, last errors.
 
 ENVIRONMENT:
   JANITOR_WAREHOUSE_URL   gocloud.dev/blob URL of the warehouse bucket.
@@ -109,10 +150,11 @@ func runDiscover(args []string) error {
 		rootPrefix = args[0]
 	}
 
-	url := os.Getenv("JANITOR_WAREHOUSE_URL")
-	if url == "" {
-		return fmt.Errorf("JANITOR_WAREHOUSE_URL is not set")
+	cfg, err := loadConfig()
+	if err != nil {
+		return err
 	}
+	url := cfg.Warehouse.URL
 
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
@@ -155,12 +197,13 @@ func runDiscover(args []string) error {
 // cleanup function the caller must defer.
 func resolveTable(ctx context.Context, tablePath string) (*icebergtable.Table, string, func(), error) {
 	tablePath = strings.Trim(tablePath, "/")
-	url := os.Getenv("JANITOR_WAREHOUSE_URL")
-	if url == "" {
-		return nil, "", nil, fmt.Errorf("JANITOR_WAREHOUSE_URL is not set")
+	cfg, err := loadConfig()
+	if err != nil {
+		return nil, "", nil, err
 	}
+	url := cfg.Warehouse.URL
 
-	cat, err := catalog.NewDirectoryCatalog(ctx, "janitor", url, propsFromEnv())
+	cat, err := catalog.NewDirectoryCatalog(ctx, "janitor", url, cfg.ToBlobProps())
 	if err != nil {
 		return nil, "", nil, err
 	}
@@ -303,15 +346,20 @@ func runCompact(args []string) error {
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 
-	if apiURL := os.Getenv("JANITOR_API_URL"); apiURL != "" {
+	cfg, err := loadConfig()
+	if err != nil {
+		return err
+	}
+
+	if cfg.Warehouse.APIURL != "" {
 		// API mode doesn't yet support partition filters; warn if the
 		// operator passed one with --partition.
 		if partitionFilter != "" {
 			fmt.Fprintln(os.Stderr, "warning: --partition is ignored in API mode (not yet supported by janitor-server)")
 		}
-		return runCompactViaAPI(ctx, apiURL, tablePath)
+		return runCompactViaAPI(ctx, cfg, tablePath)
 	}
-	return runCompactInProcess(ctx, tablePath, partitionFilter)
+	return runCompactInProcess(ctx, cfg, tablePath, partitionFilter)
 }
 
 // runCompactInProcess runs the compaction directly against the
@@ -319,18 +367,16 @@ func runCompact(args []string) error {
 // fallback path; in production an operator would normally hit the API
 // instead.
 //
-// If partitionFilter is non-empty (e.g. "ss_store_bucket=5") it's
-// parsed into an iceberg.EqualTo predicate and threaded through to
-// pkg/janitor.Compact via CompactOptions.RowFilter, scoping the
-// compaction to a single partition.
-func runCompactInProcess(ctx context.Context, tablePath, partitionFilter string) error {
+// If partitionFilter is non-empty (e.g. "ss_store_sk=5") it's parsed
+// into a CompactOptions.PartitionTuple map and threaded through to
+// pkg/janitor.Compact, which scopes the compaction to a single
+// partition by walking the snapshot's manifest list and matching
+// against DataFile.Partition().
+func runCompactInProcess(ctx context.Context, cfg *config.Config, tablePath, partitionFilter string) error {
 	tablePath = strings.Trim(tablePath, "/")
-	url := os.Getenv("JANITOR_WAREHOUSE_URL")
-	if url == "" {
-		return fmt.Errorf("JANITOR_WAREHOUSE_URL is not set (and JANITOR_API_URL is not set either)")
-	}
+	url := cfg.Warehouse.URL
 
-	cat, err := catalog.NewDirectoryCatalog(ctx, "janitor", url, propsFromEnv())
+	cat, err := catalog.NewDirectoryCatalog(ctx, "janitor", url, cfg.ToBlobProps())
 	if err != nil {
 		return err
 	}
@@ -343,12 +389,23 @@ func runCompactInProcess(ctx context.Context, tablePath, partitionFilter string)
 
 	opts := janitor.CompactOptions{}
 	if partitionFilter != "" {
-		filter, tuple, err := parsePartitionFilter(partitionFilter)
+		tuple, err := parsePartitionFilter(partitionFilter)
 		if err != nil {
 			return fmt.Errorf("parsing --partition: %w", err)
 		}
-		opts.RowFilter = filter
 		opts.PartitionTuple = tuple
+	}
+	// CB8: gate every compact attempt on the per-table circuit
+	// breaker unless the operator explicitly disables it. The
+	// breaker reads/writes _janitor/state/<uuid>.json and the
+	// pause files under _janitor/control/paused/. Disabled via
+	// JANITOR_DISABLE_CB=1 (escape hatch for the bench harness
+	// when we want to observe raw failure modes without the
+	// breaker hiding them; default is on).
+	if !cfg.Safety.DisableCircuitBreaker {
+		cb := safety.New(cat.Bucket())
+		cb.TriggeredBy = "janitor-cli"
+		opts.CircuitBreaker = cb
 	}
 
 	scope := "full table"
@@ -357,37 +414,56 @@ func runCompactInProcess(ctx context.Context, tablePath, partitionFilter string)
 	}
 	fmt.Printf("compacting %s (in-process; warehouse=%s; scope=%s)\n", tablePath, url, scope)
 	result, err := janitor.Compact(ctx, cat, ident, opts)
+	if safety.IsPaused(err) {
+		// Surface CB8 pauses distinctly from genuine failures so
+		// the operator's eye lands on the right line. The breaker
+		// is doing its job here, not breaking.
+		fmt.Fprintf(os.Stderr, "skipped: %v\n", err)
+		fmt.Fprintf(os.Stderr, "         (use 'janitor-cli status %s' to inspect, 'resume' to clear)\n", tablePath)
+		return err
+	}
+	if safety.IsCooldown(err) {
+		// CB1: the table was just acted on. Auto-clears when the
+		// cooldown elapses; no operator action needed. Print a
+		// distinct line so "skipped: cooled down" doesn't look
+		// like "compaction failed" in the bench harness output.
+		var ce *safety.CooldownError
+		if errors.As(err, &ce) {
+			fmt.Fprintf(os.Stderr, "skipped: table %s cooled down (%s left)\n", tablePath, ce.RemainingDuration.Round(time.Second))
+		} else {
+			fmt.Fprintf(os.Stderr, "skipped: %v\n", err)
+		}
+		return err
+	}
 	printCompactResult(tablePath, result, err)
 	return err
 }
 
-// parsePartitionFilter parses a "col=value" string into BOTH the
-// iceberg equality predicate (for the legacy compactOnce path that
-// uses tx.Overwrite + WithRowFilter) and the bare map form (for
-// the compactOnceReplace path that walks manifests directly).
-// Only int64 values are supported in the MVP. The --partition flag
-// will be removed entirely once AutoCompact reads the partition
-// spec from manifest discovery; this dual-output is interim.
-func parsePartitionFilter(s string) (icebergpkg.BooleanExpression, map[string]any, error) {
+// parsePartitionFilter parses a "col=value" string into the
+// PartitionTuple map that pkg/janitor.Compact expects. Only int64
+// values are supported in the MVP. The --partition flag will be
+// removed entirely once AutoCompact reads the partition spec from
+// manifest discovery and chooses partitions on its own.
+func parsePartitionFilter(s string) (map[string]any, error) {
 	eq := strings.Index(s, "=")
 	if eq < 0 {
-		return nil, nil, fmt.Errorf("expected col=value, got %q", s)
+		return nil, fmt.Errorf("expected col=value, got %q", s)
 	}
 	col := strings.TrimSpace(s[:eq])
 	valStr := strings.TrimSpace(s[eq+1:])
 	if col == "" || valStr == "" {
-		return nil, nil, fmt.Errorf("expected col=value, got %q", s)
+		return nil, fmt.Errorf("expected col=value, got %q", s)
 	}
 	val, err := strconv.ParseInt(valStr, 10, 64)
 	if err != nil {
-		return nil, nil, fmt.Errorf("partition value %q is not an integer: %w", valStr, err)
+		return nil, fmt.Errorf("partition value %q is not an integer: %w", valStr, err)
 	}
-	return icebergpkg.EqualTo(icebergpkg.Reference(col), val), map[string]any{col: val}, nil
+	return map[string]any{col: val}, nil
 }
 
 // runCompactViaAPI POSTs to a running janitor-server and prints the
 // returned CompactResult.
-func runCompactViaAPI(ctx context.Context, apiURL, tablePath string) error {
+func runCompactViaAPI(ctx context.Context, cfg *config.Config, tablePath string) error {
 	ident, err := tablePathToIdentifier(strings.Trim(tablePath, "/"))
 	if err != nil {
 		return err
@@ -395,7 +471,7 @@ func runCompactViaAPI(ctx context.Context, apiURL, tablePath string) error {
 	if len(ident) != 2 {
 		return fmt.Errorf("API mode currently supports only two-part identifiers (namespace, table); got %v", ident)
 	}
-	endpoint := strings.TrimRight(apiURL, "/") + fmt.Sprintf("/v1/tables/%s/%s/compact", ident[0], ident[1])
+	endpoint := strings.TrimRight(cfg.Warehouse.APIURL, "/") + fmt.Sprintf("/v1/tables/%s/%s/compact", ident[0], ident[1])
 	fmt.Printf("compacting %s (via API; %s)\n", tablePath, endpoint)
 
 	req, err := http.NewRequestWithContext(ctx, "POST", endpoint, nil)
@@ -546,6 +622,166 @@ func printReport(tablePath string, r *analyzer.HealthReport) {
 	case r.IsHealthy:
 		fmt.Printf("STATUS: healthy\n")
 	}
+}
+
+// resolveTableUUID opens the warehouse, loads the named table, and
+// returns its UUID along with the open catalog (so the caller can
+// reuse the underlying bucket for state/pause file ops). The caller
+// must Close the catalog.
+func resolveTableUUID(ctx context.Context, tablePath string) (*catalog.DirectoryCatalog, string, error) {
+	tablePath = strings.Trim(tablePath, "/")
+	cfg, err := loadConfig()
+	if err != nil {
+		return nil, "", err
+	}
+	url := cfg.Warehouse.URL
+	cat, err := catalog.NewDirectoryCatalog(ctx, "janitor", url, cfg.ToBlobProps())
+	if err != nil {
+		return nil, "", err
+	}
+	ident, err := tablePathToIdentifier(tablePath)
+	if err != nil {
+		cat.Close()
+		return nil, "", err
+	}
+	tbl, err := cat.LoadTable(ctx, ident)
+	if err != nil {
+		cat.Close()
+		return nil, "", fmt.Errorf("loading table %v: %w", ident, err)
+	}
+	return cat, tbl.Metadata().TableUUID().String(), nil
+}
+
+// runPause writes a manual pause file for the given table. The
+// operator must supply a reason string so future operators understand
+// the intent. The reason ends up in _janitor/control/paused/<uuid>.json
+// and is shown by `status`.
+func runPause(args []string) error {
+	var tablePath, reason string
+	for i := 0; i < len(args); i++ {
+		a := args[i]
+		switch {
+		case a == "--reason" && i+1 < len(args):
+			reason = args[i+1]
+			i++
+		case strings.HasPrefix(a, "--reason="):
+			reason = strings.TrimPrefix(a, "--reason=")
+		case strings.HasPrefix(a, "--"):
+			return fmt.Errorf("unknown flag %q", a)
+		default:
+			if tablePath != "" {
+				return fmt.Errorf("multiple table paths provided")
+			}
+			tablePath = a
+		}
+	}
+	if tablePath == "" || reason == "" {
+		return fmt.Errorf("usage: janitor-cli pause <table_path> --reason \"<text>\"")
+	}
+
+	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer cancel()
+
+	cat, uuid, err := resolveTableUUID(ctx, tablePath)
+	if err != nil {
+		return err
+	}
+	defer cat.Close()
+
+	cb := safety.New(cat.Bucket())
+	cb.TriggeredBy = "janitor-cli"
+	if err := cb.ManualPause(ctx, uuid, reason); err != nil {
+		return err
+	}
+	fmt.Printf("paused %s (uuid=%s)\n", tablePath, uuid)
+	fmt.Printf("  reason: %s\n", reason)
+	return nil
+}
+
+// runResume clears the pause file AND resets the failure counter so
+// the next compact starts from a clean slate. Resetting the counter
+// is essential — see safety.CircuitBreaker.Resume for the rationale.
+func runResume(args []string) error {
+	if len(args) != 1 {
+		return fmt.Errorf("usage: janitor-cli resume <table_path>")
+	}
+	tablePath := args[0]
+
+	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer cancel()
+
+	cat, uuid, err := resolveTableUUID(ctx, tablePath)
+	if err != nil {
+		return err
+	}
+	defer cat.Close()
+
+	cb := safety.New(cat.Bucket())
+	cb.TriggeredBy = "janitor-cli"
+	if err := cb.Resume(ctx, uuid); err != nil {
+		return err
+	}
+	fmt.Printf("resumed %s (uuid=%s)\n", tablePath, uuid)
+	fmt.Printf("  pause file cleared, consecutive_failed_runs reset to 0\n")
+	return nil
+}
+
+// runStatus prints the per-table janitor state plus the pause file
+// (if any). The output is operator-facing, not machine-readable; a
+// --json mode can land later.
+func runStatus(args []string) error {
+	if len(args) != 1 {
+		return fmt.Errorf("usage: janitor-cli status <table_path>")
+	}
+	tablePath := args[0]
+
+	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer cancel()
+
+	cat, uuid, err := resolveTableUUID(ctx, tablePath)
+	if err != nil {
+		return err
+	}
+	defer cat.Close()
+
+	bucket := cat.Bucket()
+	s, err := state.Load(ctx, bucket, uuid)
+	if err != nil {
+		return err
+	}
+	pause, err := state.LoadPause(ctx, bucket, uuid)
+	if err != nil {
+		return err
+	}
+
+	fmt.Printf("Table:                   %s\n", tablePath)
+	fmt.Printf("UUID:                    %s\n", uuid)
+	if pause != nil {
+		fmt.Printf("Status:                  PAUSED\n")
+		fmt.Printf("Pause reason:            %s\n", pause.Reason)
+		fmt.Printf("Pause triggered at:      %s\n", pause.TriggeredAt.Format("2006-01-02 15:04:05 MST"))
+		fmt.Printf("Pause triggered by:      %s\n", pause.TriggeredBy)
+	} else {
+		fmt.Printf("Status:                  active\n")
+	}
+	fmt.Printf("Consecutive failed runs: %d (CB8 trips at %d)\n", s.ConsecutiveFailedRuns, safety.CB8DefaultThreshold)
+	if !s.LastSuccessAt.IsZero() {
+		fmt.Printf("Last success:            %s\n", s.LastSuccessAt.Format("2006-01-02 15:04:05 MST"))
+	}
+	if s.LastOutcome != "" {
+		fmt.Printf("Last outcome:            %s\n", s.LastOutcome)
+	}
+	if len(s.LastErrors) > 0 {
+		fmt.Println("Recent errors:")
+		for i, e := range s.LastErrors {
+			msg := e.Message
+			if len(msg) > 200 {
+				msg = msg[:200] + "..."
+			}
+			fmt.Printf("  [%d] %s — %s\n", i+1, e.At.Format("15:04:05"), msg)
+		}
+	}
+	return nil
 }
 
 func humanBytes(n int64) string {

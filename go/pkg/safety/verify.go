@@ -17,6 +17,7 @@ import (
 	icebergpkg "github.com/apache/iceberg-go"
 	icebergio "github.com/apache/iceberg-go/io"
 	icebergtable "github.com/apache/iceberg-go/table"
+	"golang.org/x/sync/errgroup"
 )
 
 // Verification is the structured result of running the master check on a
@@ -195,12 +196,30 @@ func VerifyCompactionConsistency(ctx context.Context, before *icebergtable.Table
 		return v, fmt.Errorf("MASTER CHECK FAILED (I5 bounds): %s", v.I5Bounds.Reason)
 	}
 
-	// I7: manifest reference existence. Every data file referenced by
-	// the staged snapshot's manifests must actually exist in object
-	// storage. This catches the case where a transaction wrote a
-	// manifest entry but the underlying data file write failed (or
-	// was lost). Cheap: N HEAD calls, parallelizable.
-	checked, passed, err := verifyManifestReferences(ctx, staged.Table, props)
+	// I7: manifest reference existence — but only for files this op
+	// just wrote. Every data file referenced by the staged snapshot
+	// that is NOT also referenced by the input snapshot is a "new"
+	// file: it was either created by this transaction or pre-existed
+	// out of band. Either way it's the only set of files whose
+	// existence the master check has any business verifying — every
+	// other file in the staged snapshot was already present in the
+	// input snapshot, which is the known-good base of the operation.
+	//
+	// This is the fix for github.com/mystictraveler/iceberg-janitor#5.
+	// The previous implementation walked every data file in the WHOLE
+	// staged table and HEAD'd each one, which is O(table_size) S3
+	// round-trips per master check call — fine for fileblob, but on
+	// MinIO/S3 it burns 20-60 seconds per compact attempt and the
+	// writer always wins the retry race against a hot table. The
+	// narrowed check is O(files_added_by_this_op), which for the
+	// parquet-go-direct compaction path is exactly 1.
+	newPaths := make([]string, 0)
+	for p := range stagedAgg.filePaths {
+		if _, present := beforeAgg.filePaths[p]; !present {
+			newPaths = append(newPaths, p)
+		}
+	}
+	checked, passed, err := verifyDataFilesExist(ctx, staged.Table, props, newPaths)
 	v.I7ManifestRefs = ManifestRefsCheck{Checked: checked, Passed: passed}
 	if err != nil {
 		v.I7ManifestRefs.Result = "fail"
@@ -214,12 +233,21 @@ func VerifyCompactionConsistency(ctx context.Context, before *icebergtable.Table
 	return v, nil
 }
 
-// verifyManifestReferences walks every manifest in the table's current
-// snapshot and HEAD-checks each referenced data file. Returns
-// (checked, passed, err). On success, checked == passed.
-func verifyManifestReferences(ctx context.Context, tbl *icebergtable.Table, props map[string]string) (int, int, error) {
-	snap := tbl.CurrentSnapshot()
-	if snap == nil {
+// verifyDataFilesExist HEAD-checks each path in `paths` against the
+// table's filesystem. Returns (checked, passed, err). On success,
+// checked == passed == len(paths). Empty input is fine — returns
+// (0, 0, nil).
+//
+// This is I7's actual unit of work: it answers "do the files this
+// transaction wrote actually exist in object storage?" The caller
+// (VerifyCompactionConsistency) is responsible for computing which
+// files those are; this function does not enumerate the table or
+// walk any manifests. That's the fix for issue #5: the previous
+// verifyManifestReferences walked every manifest in the staged
+// snapshot and opened every data file, which on S3 was O(table_size)
+// HEAD round-trips per compact attempt.
+func verifyDataFilesExist(ctx context.Context, tbl *icebergtable.Table, props map[string]string, paths []string) (int, int, error) {
+	if len(paths) == 0 {
 		return 0, 0, nil
 	}
 	fs, err := tbl.FS(ctx)
@@ -229,47 +257,36 @@ func verifyManifestReferences(ctx context.Context, tbl *icebergtable.Table, prop
 			return 0, 0, fmt.Errorf("opening table FS: %w", err)
 		}
 	}
-	manifests, err := snap.Manifests(fs)
-	if err != nil {
-		return 0, 0, fmt.Errorf("listing manifests: %w", err)
-	}
 	checked := 0
 	passed := 0
-	for _, m := range manifests {
-		mf, err := fs.Open(m.FilePath())
+	for _, p := range paths {
+		checked++
+		fh, err := fs.Open(p)
 		if err != nil {
-			return checked, passed, fmt.Errorf("opening manifest %s: %w", m.FilePath(), err)
+			return checked, passed, fmt.Errorf("data file %s does not exist: %w", p, err)
 		}
-		entries, err := icebergpkg.ReadManifest(m, mf, true)
-		mf.Close()
-		if err != nil {
-			return checked, passed, fmt.Errorf("reading manifest %s: %w", m.FilePath(), err)
-		}
-		for _, e := range entries {
-			df := e.DataFile()
-			if df == nil || df.ContentType() != icebergpkg.EntryContentData {
-				continue
-			}
-			checked++
-			fpath := df.FilePath()
-			df_fh, err := fs.Open(fpath)
-			if err != nil {
-				return checked, passed, fmt.Errorf("data file %s does not exist: %w", fpath, err)
-			}
-			df_fh.Close()
-			passed++
-		}
+		fh.Close()
+		passed++
 	}
 	return checked, passed, nil
 }
 
 // dataStats aggregates per-column counts and bounds presence across
 // all data files in a snapshot. The maps are keyed by column id.
+//
+// filePaths is the set of every data file's absolute path in the
+// snapshot. It is collected for free during the existing manifest
+// walk (no extra I/O) and is used by VerifyCompactionConsistency to
+// compute "files added by this op" via the set difference
+// stagedPaths - beforePaths. That set is then the input to I7's
+// HEAD-existence check, which previously walked the WHOLE staged
+// table's manifests on every retry — see issue #5.
 type dataStats struct {
 	totalRows   int64
-	valueCounts map[int]int64 // sum of DataFile.ValueCounts across all files
-	nullCounts  map[int]int64 // sum of DataFile.NullValueCounts
-	boundsCols  map[int]bool  // column ids that have bounds set in at least one file
+	valueCounts map[int]int64       // sum of DataFile.ValueCounts across all files
+	nullCounts  map[int]int64       // sum of DataFile.NullValueCounts
+	boundsCols  map[int]bool        // column ids that have bounds set in at least one file
+	filePaths   map[string]struct{} // set of data file paths
 }
 
 // aggregateDataStats walks the current snapshot's manifests, reads
@@ -282,6 +299,7 @@ func aggregateDataStats(ctx context.Context, tbl *icebergtable.Table, props map[
 		valueCounts: map[int]int64{},
 		nullCounts:  map[int]int64{},
 		boundsCols:  map[int]bool{},
+		filePaths:   map[string]struct{}{},
 	}
 	snap := tbl.CurrentSnapshot()
 	if snap == nil {
@@ -300,38 +318,98 @@ func aggregateDataStats(ctx context.Context, tbl *icebergtable.Table, props map[
 	if err != nil {
 		return nil, fmt.Errorf("listing manifests: %w", err)
 	}
-	for _, m := range manifests {
-		mf, err := fs.Open(m.FilePath())
-		if err != nil {
-			return nil, fmt.Errorf("opening manifest %s: %w", m.FilePath(), err)
+
+	// Bounded-concurrency manifest read. The master check runs twice
+	// per compact attempt (once for `before`, once for `staged`); on
+	// a hot streaming table with hundreds of manifests, sequential
+	// reads dominate the per-attempt latency and the compact loses
+	// the writer-fight CAS race. Each worker reads one manifest into
+	// a per-manifest local accumulator; the merge into `out` runs
+	// single-threaded after all workers complete, so no map locks
+	// are needed during the parallel phase. See issue #6.
+	type manifestAgg struct {
+		totalRows   int64
+		valueCounts map[int]int64
+		nullCounts  map[int]int64
+		boundsCols  map[int]bool
+		filePaths   []string
+	}
+	results := make([]manifestAgg, len(manifests))
+	g, gctx := errgroup.WithContext(ctx)
+	g.SetLimit(manifestReadConcurrency)
+	for i, m := range manifests {
+		i, m := i, m
+		g.Go(func() error {
+			if gctx.Err() != nil {
+				return gctx.Err()
+			}
+			mf, err := fs.Open(m.FilePath())
+			if err != nil {
+				return fmt.Errorf("opening manifest %s: %w", m.FilePath(), err)
+			}
+			entries, err := icebergpkg.ReadManifest(m, mf, true)
+			mf.Close()
+			if err != nil {
+				return fmt.Errorf("reading manifest %s: %w", m.FilePath(), err)
+			}
+			local := manifestAgg{
+				valueCounts: map[int]int64{},
+				nullCounts:  map[int]int64{},
+				boundsCols:  map[int]bool{},
+			}
+			for _, e := range entries {
+				df := e.DataFile()
+				if df == nil || df.ContentType() != icebergpkg.EntryContentData {
+					continue
+				}
+				local.totalRows += df.Count()
+				local.filePaths = append(local.filePaths, df.FilePath())
+				for col, n := range df.ValueCounts() {
+					local.valueCounts[col] += n
+				}
+				for col, n := range df.NullValueCounts() {
+					local.nullCounts[col] += n
+				}
+				for col := range df.LowerBoundValues() {
+					local.boundsCols[col] = true
+				}
+				for col := range df.UpperBoundValues() {
+					local.boundsCols[col] = true
+				}
+			}
+			results[i] = local
+			return nil
+		})
+	}
+	if err := g.Wait(); err != nil {
+		return nil, err
+	}
+
+	for _, r := range results {
+		out.totalRows += r.totalRows
+		for col, n := range r.valueCounts {
+			out.valueCounts[col] += n
 		}
-		entries, err := icebergpkg.ReadManifest(m, mf, true)
-		mf.Close()
-		if err != nil {
-			return nil, fmt.Errorf("reading manifest %s: %w", m.FilePath(), err)
+		for col, n := range r.nullCounts {
+			out.nullCounts[col] += n
 		}
-		for _, e := range entries {
-			df := e.DataFile()
-			if df == nil || df.ContentType() != icebergpkg.EntryContentData {
-				continue
-			}
-			out.totalRows += df.Count()
-			for col, n := range df.ValueCounts() {
-				out.valueCounts[col] += n
-			}
-			for col, n := range df.NullValueCounts() {
-				out.nullCounts[col] += n
-			}
-			for col := range df.LowerBoundValues() {
-				out.boundsCols[col] = true
-			}
-			for col := range df.UpperBoundValues() {
-				out.boundsCols[col] = true
-			}
+		for col := range r.boundsCols {
+			out.boundsCols[col] = true
+		}
+		for _, p := range r.filePaths {
+			out.filePaths[p] = struct{}{}
 		}
 	}
 	return out, nil
 }
+
+// manifestReadConcurrency is the bounded-fan-out limit for parallel
+// manifest avro reads in aggregateDataStats. Same rationale as the
+// constant of the same name in pkg/janitor/compact_replace.go: 32 is
+// a safe HTTP/2-friendly default that gets the per-table walk wall
+// time down from O(N×L) to ~max(L, ⌈N/32⌉×L) without exhausting
+// connection pool or file descriptors. See issue #6.
+const manifestReadConcurrency = 32
 
 // compareColumnCounts is the I3/I4 worker: it compares two per-column
 // sum maps and returns a structured ColumnCountsCheck. The check is

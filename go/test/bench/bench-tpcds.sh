@@ -71,6 +71,21 @@ JANITOR_LOG="$RESULTS_DIR/janitor-runs-$TS.log"
 
 # Warehouse-specific URLs and paths. For S3 we treat WAREHOUSE_BASE as
 # an s3:// URL prefix; we append -with and -without as subprefixes.
+#
+# NOTE: gocloud.dev/blob's s3blob does NOT treat a path component in the
+# URL as a sub-prefix the way you might expect — `s3://bucket/with`
+# opens the bucket as `bucket` and prepends `with/` to every key, but
+# the catalog's discover walks from the root and the table identifiers
+# don't include the `with/` segment, so LoadTable returns "table does
+# not exist". The workaround is two SEPARATE buckets via the explicit
+# WH_WITH_URL / WH_WITHOUT_URL environment overrides; the path-prefix
+# form is left in for backward compatibility with file:// runs and for
+# the day gocloud.dev grows real sub-prefix bucket support.
+if [[ -n "${WH_WITH_URL_OVERRIDE:-}" && -n "${WH_WITHOUT_URL_OVERRIDE:-}" ]]; then
+  WH_WITH_URL="$WH_WITH_URL_OVERRIDE"
+  WH_WITHOUT_URL="$WH_WITHOUT_URL_OVERRIDE"
+  LOCAL_BASE=""
+else
 case "$WAREHOUSE_BASE" in
   s3://*)
     WH_WITH_URL="$WAREHOUSE_BASE/with"
@@ -87,6 +102,7 @@ case "$WAREHOUSE_BASE" in
     exit 2
     ;;
 esac
+fi
 
 CATALOG_DB_WITH="${CATALOG_DB_WITH:-/tmp/janitor-bench-catalog-with.db}"
 CATALOG_DB_WITHOUT="${CATALOG_DB_WITHOUT:-/tmp/janitor-bench-catalog-without.db}"
@@ -135,7 +151,7 @@ fi
 cd "$GO_DIR"
 log "building Go binaries"
 go build -o /tmp/janitor-cli ./cmd/janitor-cli
-go build -o /tmp/janitor-streamer ./cmd/janitor-streamer
+go build -tags bench -o /tmp/janitor-streamer ./test/bench/streamer
 
 # === Phase 1: kick off two streamers in the background ===
 

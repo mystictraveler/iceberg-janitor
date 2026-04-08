@@ -3,6 +3,8 @@ package janitor
 import (
 	"context"
 	"fmt"
+	"sync"
+	"sync/atomic"
 
 	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/apache/arrow-go/v18/arrow/array"
@@ -14,25 +16,59 @@ import (
 	icebergio "github.com/apache/iceberg-go/io"
 	icebergtable "github.com/apache/iceberg-go/table"
 	"github.com/google/uuid"
+	"golang.org/x/sync/errgroup"
 
 	"github.com/mystictraveler/iceberg-janitor/go/pkg/catalog"
 	"github.com/mystictraveler/iceberg-janitor/go/pkg/safety"
 )
 
-// compactOnceReplace is the architectural fix for
-// github.com/mystictraveler/iceberg-janitor#4 / apache/iceberg-go#860.
+// manifestReadConcurrency is the bounded-fan-out limit for parallel
+// manifest avro reads in compactOnce. 32 was chosen as a safe default
+// for HTTP/2 multiplexing: gocloud's S3 backend keeps a connection
+// pool that can serve hundreds of concurrent Range GETs over a small
+// number of TCP connections without exhausting file descriptors.
+// Higher values are worth benchmarking on AWS-S3-with-public-network
+// latency profiles, but on local MinIO 32 already gets the per-attempt
+// manifest-walk wall time down to <100ms for the hottest table in the
+// bench. See issue #6 for the analysis.
+const manifestReadConcurrency = 32
+
+// parquetReadConcurrency is the bounded-fan-out limit for parallel
+// parquet input file reads in compactOnce's data-copy step. Same
+// rationale as manifestReadConcurrency: HTTP/2 multiplexing makes
+// the cost of 32 concurrent Range GETs roughly equal to one, while
+// reducing total wall time from O(N×L) to ~max(L, ⌈N/32⌉×L) for N
+// input files.
 //
-// The original path (compactOnce → tx.Overwrite → iceberg-go's
-// classifier + partitionedFanoutWriter) silently loses rows under
-// concurrent producer load. The bench surfaced a downstream symptom:
-// even iceberg-go's Scan.PlanFiles is non-deterministic on the same
-// *Scan when a foreign writer is committing in parallel — two
-// PlanFiles calls return different file lists despite WithSnapshotID
-// being set, AND scan.ToArrowRecords returns yet a third row count
-// even when the file list is stable. The instrumented bench showed
-// the file count drifting up by exactly one file (= one streamer
-// commit) between the two PlanFiles calls. So iceberg-go's scan
-// path cannot be used safely for compaction against a hot table.
+// The memory bound is parquetReadConcurrency × max-batches-per-file.
+// On the bench's typical 240 KB-per-file workload (each file decoded
+// to ~1 MB Arrow), 32 workers cap working memory at ~32 MB — fine
+// for Lambda's smallest tier. On wider workloads (large parquet
+// files with many row groups) the bound scales linearly; if it ever
+// becomes a problem, drop the concurrency or switch to the
+// stitching-binpack column-chunk byte-copy path that doesn't
+// materialize Arrow at all.
+const parquetReadConcurrency = 32
+
+// compactOnce is the parquet-go-direct compaction path. It is the
+// only compaction implementation; the legacy iceberg-go scan/overwrite
+// path was deleted in the cut-over commit that promoted this function
+// to be the default.
+//
+// Why parquet-go directly: the original path (iceberg-go's
+// tx.Overwrite → classifier + partitionedFanoutWriter) silently loses
+// rows under concurrent producer load. See
+// github.com/mystictraveler/iceberg-janitor#4 and
+// apache/iceberg-go#860 for the upstream report. The bench surfaced
+// a downstream symptom: even iceberg-go's Scan.PlanFiles is
+// non-deterministic on the same *Scan when a foreign writer is
+// committing in parallel — two PlanFiles calls return different file
+// lists despite WithSnapshotID being set, AND scan.ToArrowRecords
+// returns yet a third row count even when the file list is stable.
+// The instrumented bench showed the file count drifting up by exactly
+// one file (= one streamer commit) between the two PlanFiles calls.
+// So iceberg-go's scan path cannot be used safely for compaction
+// against a hot table.
 //
 // This implementation BYPASSES iceberg-go's scan entirely. It:
 //
@@ -73,16 +109,13 @@ import (
 // fail there — but the streamer uses identity transforms specifically
 // for this reason and the unpartitioned-table guard rejects
 // --partition on tables with no partition spec.
-//
-// Gated behind JANITOR_COMPACT_USE_REPLACE=1 in compact.go's Compact
-// dispatch.
-func compactOnceReplace(ctx context.Context, cat *catalog.DirectoryCatalog, ident icebergtable.Identifier, opts CompactOptions, result *CompactResult) error {
+func compactOnce(ctx context.Context, cat *catalog.DirectoryCatalog, ident icebergtable.Identifier, opts CompactOptions, result *CompactResult) error {
 	tbl, err := cat.LoadTable(ctx, ident)
 	if err != nil {
 		return fmt.Errorf("loading table %v: %w", ident, err)
 	}
 
-	if opts.PartitionTuple != nil || opts.RowFilter != nil {
+	if opts.PartitionTuple != nil {
 		if spec := tbl.Spec(); spec.NumFields() == 0 {
 			return fmt.Errorf("partition-scoped compaction requested but table %v is unpartitioned", ident)
 		}
@@ -113,29 +146,67 @@ func compactOnceReplace(ctx context.Context, cat *catalog.DirectoryCatalog, iden
 		return fmt.Errorf("listing manifests: %w", err)
 	}
 
+	// Bounded-concurrency manifest read. Sequential reads of N
+	// manifests cost N round-trips, which on S3 (~20 ms each) becomes
+	// the dominant cost on hot streaming tables and causes the
+	// compactor to lose the writer-fight CAS race against fast
+	// streamers. Parallelizing across 32 workers drops the wall time
+	// to ~max(L, ⌈N/32⌉ × L), which is small enough that the compact
+	// finishes between writer commits even on the hottest table in
+	// the bench (store_sales at 60 cpm). See issue #6 for the full
+	// analysis and bench numbers.
+	type manifestResult struct {
+		paths []string
+		rows  int64
+	}
+	results := make([]manifestResult, len(manifests))
+	g, gctx := errgroup.WithContext(ctx)
+	g.SetLimit(manifestReadConcurrency)
+	for i, m := range manifests {
+		i, m := i, m
+		g.Go(func() error {
+			if gctx.Err() != nil {
+				return gctx.Err()
+			}
+			mf, err := fs.Open(m.FilePath())
+			if err != nil {
+				return fmt.Errorf("opening manifest %s: %w", m.FilePath(), err)
+			}
+			entries, err := icebergpkg.ReadManifest(m, mf, true)
+			mf.Close()
+			if err != nil {
+				return fmt.Errorf("reading manifest %s: %w", m.FilePath(), err)
+			}
+			var local manifestResult
+			for _, e := range entries {
+				df := e.DataFile()
+				if df == nil || df.ContentType() != icebergpkg.EntryContentData {
+					continue
+				}
+				if matchPart != nil && !matchPart(df) {
+					continue
+				}
+				local.paths = append(local.paths, df.FilePath())
+				local.rows += df.Count()
+			}
+			results[i] = local
+			return nil
+		})
+	}
+	if err := g.Wait(); err != nil {
+		return err
+	}
+
+	// Flatten results in manifest-list order. Order matters because
+	// downstream filesToDataFiles inference (and any future debugging
+	// of which-file-came-from-where) is much easier to reason about
+	// when the input order is deterministic and matches the snapshot's
+	// own manifest ordering.
 	var oldPaths []string
 	var expectedRows int64
-	for _, m := range manifests {
-		mf, err := fs.Open(m.FilePath())
-		if err != nil {
-			return fmt.Errorf("opening manifest %s: %w", m.FilePath(), err)
-		}
-		entries, err := icebergpkg.ReadManifest(m, mf, true)
-		mf.Close()
-		if err != nil {
-			return fmt.Errorf("reading manifest %s: %w", m.FilePath(), err)
-		}
-		for _, e := range entries {
-			df := e.DataFile()
-			if df == nil || df.ContentType() != icebergpkg.EntryContentData {
-				continue
-			}
-			if matchPart != nil && !matchPart(df) {
-				continue
-			}
-			oldPaths = append(oldPaths, df.FilePath())
-			expectedRows += df.Count()
-		}
+	for _, r := range results {
+		oldPaths = append(oldPaths, r.paths...)
+		expectedRows += r.rows
 	}
 	if len(oldPaths) == 0 {
 		return nil // nothing to compact
@@ -182,15 +253,53 @@ func compactOnceReplace(ctx context.Context, cat *catalog.DirectoryCatalog, iden
 	mem := memory.DefaultAllocator
 
 	// Step 3: read each input file via parquet-go directly and copy
-	// its rows into the output writer.
+	// its rows into the output writer. We parallelize the READ side
+	// (workers each open one source parquet, decode it to Arrow batches,
+	// rebatch under the writer schema), but the WRITE side stays
+	// single-threaded behind a mutex because pqarrow.FileWriter is
+	// not safe for concurrent Write calls. Each worker gathers its
+	// file's batches in a local slice, then under the writer mutex
+	// flushes them and releases the references. This bounds working
+	// memory to parquetReadConcurrency × max-batches-per-file rather
+	// than holding all decoded data at once.
+	//
+	// On the TPC-DS streaming bench, this drops store_sales partition
+	// compact from ~33 s/attempt (sequential) to <2 s/attempt — under
+	// the writer's commit interval, so the CAS retry race is winnable
+	// after one attempt instead of thirteen. See issue #6.
 	var rowsWritten int64
+	var pqWriterMu sync.Mutex
+	g2, gctx2 := errgroup.WithContext(ctx)
+	g2.SetLimit(parquetReadConcurrency)
 	for _, fpath := range oldPaths {
-		n, rerr := copyParquetFile(ctx, fs, fpath, pqWriter, writeSchema, mem)
-		if rerr != nil {
-			cleanup()
-			return fmt.Errorf("copying %s: %w", fpath, rerr)
-		}
-		rowsWritten += n
+		fpath := fpath
+		g2.Go(func() error {
+			if gctx2.Err() != nil {
+				return gctx2.Err()
+			}
+			batches, n, rerr := readParquetFileBatches(gctx2, fs, fpath, writeSchema, mem)
+			if rerr != nil {
+				return fmt.Errorf("copying %s: %w", fpath, rerr)
+			}
+			pqWriterMu.Lock()
+			defer pqWriterMu.Unlock()
+			for i, b := range batches {
+				if werr := pqWriter.Write(b); werr != nil {
+					// Release the batches we're about to drop on the floor.
+					for j := i; j < len(batches); j++ {
+						batches[j].Release()
+					}
+					return fmt.Errorf("write %s: %w", fpath, werr)
+				}
+				b.Release()
+			}
+			atomic.AddInt64(&rowsWritten, n)
+			return nil
+		})
+	}
+	if err := g2.Wait(); err != nil {
+		cleanup()
+		return err
 	}
 
 	if err := pqWriter.Close(); err != nil {
@@ -337,10 +446,20 @@ func toInt64(v any) (int64, bool) {
 	return 0, false
 }
 
-// copyParquetFile reads `path` via parquet-go directly and writes
-// every row group's records into `dst`, rewrapped under
-// `writeSchema` (the fieldless target schema). Returns the number
-// of rows written.
+// readParquetFileBatches reads `path` via parquet-go directly and
+// returns every row group's records as a slice of arrow.RecordBatch
+// rewrapped under `writeSchema` (the fieldless target schema), plus
+// the total row count. The caller is responsible for Release()'ing
+// each returned batch after use (the bench's compact path does this
+// under the writer mutex right after pqWriter.Write).
+//
+// This is the READ-ONLY half of what was once `copyParquetFile`. The
+// split is what lets us parallelize: many workers can call this
+// function concurrently against different files (each one's network
+// I/O multiplexes over gocloud's HTTP/2 connection pool), and a
+// single mutex-guarded writer goroutine drains the batches into the
+// shared pqarrow.FileWriter. The writer is the only serialization
+// point.
 //
 // We use parquet-go's pqarrow reader rather than iceberg-go's scan
 // because the bug we're working around (apache/iceberg-go#860) is
@@ -348,50 +467,56 @@ func toInt64(v any) (int64, bool) {
 // — it has no knowledge of snapshots, manifests, or row filters,
 // and so cannot exhibit the snapshot-pinning races that the scan
 // path does.
-func copyParquetFile(ctx context.Context, fs icebergio.IO, path string, dst *pqarrow.FileWriter, writeSchema *arrow.Schema, mem memory.Allocator) (int64, error) {
+func readParquetFileBatches(ctx context.Context, fs icebergio.IO, path string, writeSchema *arrow.Schema, mem memory.Allocator) ([]arrow.RecordBatch, int64, error) {
 	f, err := fs.Open(path)
 	if err != nil {
-		return 0, fmt.Errorf("open: %w", err)
+		return nil, 0, fmt.Errorf("open: %w", err)
 	}
 	defer f.Close()
 
 	pqf, err := file.NewParquetReader(f)
 	if err != nil {
-		return 0, fmt.Errorf("parquet open: %w", err)
+		return nil, 0, fmt.Errorf("parquet open: %w", err)
 	}
 	defer pqf.Close()
 
 	arrReader, err := pqarrow.NewFileReader(pqf, pqarrow.ArrowReadProperties{}, mem)
 	if err != nil {
-		return 0, fmt.Errorf("pqarrow open: %w", err)
+		return nil, 0, fmt.Errorf("pqarrow open: %w", err)
 	}
 
 	// nil columns + nil row groups → read all columns and all row
 	// groups.
 	rec, err := arrReader.GetRecordReader(ctx, nil, nil)
 	if err != nil {
-		return 0, fmt.Errorf("get record reader: %w", err)
+		return nil, 0, fmt.Errorf("get record reader: %w", err)
 	}
 	defer rec.Release()
 
-	var rows int64
+	var (
+		batches []arrow.RecordBatch
+		rows    int64
+	)
 	for rec.Next() {
 		batch := rec.RecordBatch()
 		converted, cerr := rebatchWithSchema(batch, writeSchema)
 		if cerr != nil {
-			return rows, fmt.Errorf("rebatch: %w", cerr)
+			// Release any batches we already accumulated.
+			for _, b := range batches {
+				b.Release()
+			}
+			return nil, 0, fmt.Errorf("rebatch: %w", cerr)
 		}
-		if werr := dst.Write(converted); werr != nil {
-			converted.Release()
-			return rows, fmt.Errorf("write: %w", werr)
-		}
+		batches = append(batches, converted)
 		rows += converted.NumRows()
-		converted.Release()
 	}
 	if err := rec.Err(); err != nil {
-		return rows, fmt.Errorf("read: %w", err)
+		for _, b := range batches {
+			b.Release()
+		}
+		return nil, 0, fmt.Errorf("read: %w", err)
 	}
-	return rows, nil
+	return batches, rows, nil
 }
 
 // rebatchWithSchema returns a copy of `batch` whose schema is

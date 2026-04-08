@@ -1,4 +1,19 @@
+//go:build bench
+
 // Command janitor-streamer is the TPC-DS streaming benchmark writer.
+// It is a TEST FIXTURE — gated behind the `bench` build tag so it is
+// not pulled into the production binaries' build graph. The streamer
+// depends on iceberg-go's SqlCatalog and the pure-Go sqlite driver,
+// which the production janitor does not use; gating keeps those
+// dependencies out of `go build ./cmd/...`.
+//
+// Build it with:
+//
+//	go build -tags bench ./test/bench/streamer
+//
+// The bench harness (test/bench/bench-tpcds.sh) and the Makefile mvp
+// targets pass `-tags bench` for this purpose.
+//
 // It seeds the 9 dimension tables once at startup and then streams
 // micro-batches into the 3 fact tables (store_sales, store_returns,
 // catalog_sales) at a configurable cadence to simulate the kind of
@@ -72,6 +87,7 @@ import (
 	"os"
 	"os/signal"
 	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
@@ -265,7 +281,24 @@ func run(ctx context.Context, cfg config) error {
 	}
 	defer db.Close()
 
-	props := icebergpkg.Properties{"warehouse": cfg.WarehouseURL}
+	// Strip the query string from the warehouse URL before handing
+	// it to iceberg-go's SqlCatalog. The query string (?endpoint=...,
+	// ?s3ForcePathStyle=true, ?region=...) is meaningful to
+	// gocloud.dev/blob.OpenBucket but iceberg-go's location provider
+	// uses the warehouse property as a path PREFIX for newly-created
+	// metadata files — it concatenates the warehouse string with the
+	// table path and feeds the result to gocloud as a key, which
+	// produces nonsense like
+	//   s3://bucket?endpoint=.../tpcds.db/.../00000-...metadata.json
+	// and gocloud rejects with "invalid argument". The S3 endpoint /
+	// region / credentials are already passed via the s3.* properties
+	// below, so the query string contributes nothing useful to
+	// iceberg-go and can be safely dropped.
+	warehouseForCatalog := cfg.WarehouseURL
+	if i := strings.IndexByte(warehouseForCatalog, '?'); i >= 0 {
+		warehouseForCatalog = warehouseForCatalog[:i]
+	}
+	props := icebergpkg.Properties{"warehouse": warehouseForCatalog}
 	if cfg.S3Endpoint != "" {
 		props["s3.endpoint"] = cfg.S3Endpoint
 	}

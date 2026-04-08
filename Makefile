@@ -118,7 +118,7 @@ mvp-seed:
 		NAMESPACE=$(MVP_NAMESPACE) TABLE=$(MVP_TABLE) \
 		NUM_BATCHES=$(MVP_NUM_BATCHES) ROWS_PER_BATCH=$(MVP_ROWS_PER_BATCH) \
 		CATALOG_DB=/tmp/janitor-mvp-catalog.db \
-		go run ./cmd/janitor-seed
+		go run -tags bench ./test/bench/seed
 
 # Seed against the local filesystem (no Docker).
 mvp-seed-local:
@@ -127,7 +127,7 @@ mvp-seed-local:
 		NAMESPACE=$(MVP_NAMESPACE) TABLE=$(MVP_TABLE) \
 		NUM_BATCHES=$(MVP_NUM_BATCHES) ROWS_PER_BATCH=$(MVP_ROWS_PER_BATCH) \
 		CATALOG_DB=/tmp/janitor-mvp-catalog.db \
-		go run ./cmd/janitor-seed
+		go run -tags bench ./test/bench/seed
 
 mvp-discover:
 	cd go && JANITOR_WAREHOUSE_URL='$(MVP_WAREHOUSE_S3)' \

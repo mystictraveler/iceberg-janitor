@@ -166,6 +166,96 @@ Each row above will get its own benchmark entry as it lands.
 
 ---
 
+## Milestone — TPC-DS streaming bench against MinIO completes end-to-end with the right parallelism
+
+**Date:** 2026-04-08
+**Build:** `feature/go-rewrite-mvp` after issues #2, #5, #6 fixed and CB1 / CB8 / pkg/config / GLUE_COMPARISON.md landed
+**Workload:** the existing `go/test/bench/bench-tpcds.sh` against two separate MinIO buckets (`with-warehouse`, `without-warehouse`), 4-min duration, 60 commits/min/fact-table, 30s maintenance interval, identity-transform partitioning on `ss_store_sk` × 50, `sr_store_sk` × 50, `cs_call_center_sk` × 10
+**Hardware:** local Mac mini (Apple Silicon), MinIO in docker, 16 GB host RAM
+**Reproduce:** `WH_WITH_URL_OVERRIDE=… WH_WITHOUT_URL_OVERRIDE=… ./go/test/bench/bench-tpcds.sh`
+
+### The headline number
+
+The store_sales partition compact — the bench's worst case because store_sales is the largest fact table and the streamer commits at 60 cpm — is the canary for the writer-fight pathology. Tracking it across four bench runs as we landed the parallelism layers:
+
+| Run | Manifest walk | Parquet copy loop | store_sales attempts | store_sales wall | bench completes? |
+|---|---|---|---:|---:|---|
+| **Run 4** (baseline, post-#5 master check fix only) | sequential | sequential | 13 | **438 s** | yes, but store_sales hogged 7+ minutes of one round |
+| **Run 5** (parallelize manifest walk only — issue #6 first half) | parallel(32) | sequential | 13 | 438 s | identical wall — manifest walk wasn't the dominant cost on a hot table |
+| **Run 6** (parallelize parquet read loop too — issue #6 second half) | parallel(32) | parallel(32) | **2** | **1,388 ms** | yes — round 1 finished in <2 s per table |
+
+**~315× wall-time speedup on the bench's worst-case table compact.** The first attempt now races the writer cleanly enough that the second attempt almost always wins — vs. the prior 13-attempt exhaustion of the retry budget.
+
+### What changed in code (Go primitives only)
+
+The right parallelism here is **fan-out within one process / one transaction**, not "spin up another serverless invocation." The unit of work is one compaction commit; if any sub-step fails the whole commit has to fail; everything that produces input feeds one writer that owns the commit. Per the architecture decision in this session ("threads vs serverless: failure-isolation-driven"), this is squarely the threads case.
+
+Two hot loops were parallelized using **only standard library + `golang.org/x/sync/errgroup`**:
+
+1. **`pkg/janitor/compact_replace.go` — manifest walk** (in `compactOnce`, around line 120):
+   - Bounded fan-out via `errgroup.Group{}.SetLimit(32)`
+   - Each worker reads one manifest avro file via `fs.Open` + `iceberg-go.ReadManifest` into a per-manifest local accumulator
+   - After `g.Wait()`, results are merged in manifest-list order (deterministic) into `oldPaths` + `expectedRows`
+   - **No mutex needed** because each worker writes to a unique slot in a pre-sized `[]manifestResult`
+
+2. **`pkg/janitor/compact_replace.go` — parquet copy loop** (in `compactOnce`, around line 240):
+   - Bounded fan-out via a second `errgroup.Group{}.SetLimit(32)` over the same `oldPaths`
+   - Each worker calls `readParquetFileBatches(...)` which streams the source file into a local `[]arrow.RecordBatch`
+   - **`pqarrow.FileWriter` is NOT goroutine-safe** for concurrent `Write` calls. Solution: each worker holds a `sync.Mutex` (`pqWriterMu`) for the duration of its batch flush, and `dst.Write` is only ever called under the lock. Workers read in parallel; writes are serialized.
+   - Per-worker memory bound: at most one source file's worth of decoded Arrow batches. Total bound: `parquetReadConcurrency × max_batches_per_file ≈ 32 MB` on the bench's 240 KB-per-file workload.
+   - `atomic.AddInt64(&rowsWritten, n)` for the running row counter.
+
+3. **`pkg/safety/verify.go` — `aggregateDataStats`** (the master check's manifest walk):
+   - Same `errgroup(32)` shape as `compact_replace.go`'s manifest walk.
+   - Each worker computes a per-manifest local `dataStats` accumulator.
+   - The merge into the shared `out *dataStats` runs single-threaded after `g.Wait()`, so no map locking is needed during the parallel phase.
+   - This walks twice per master check (once for `before`, once for `staged`), so the speedup multiplies.
+
+The Go primitives in play:
+- `errgroup.Group` with `SetLimit(N)` — bounded fan-out with first-error propagation
+- `sync.Mutex` — serializes writes to a non-thread-safe library type (`pqarrow.FileWriter`)
+- `sync/atomic.AddInt64` — running counter without a second mutex
+- `context.Context` cancellation propagation via `errgroup.WithContext` — first error cancels all in-flight workers
+
+**Notably absent:** no channels, no `sync.Once`, no `sync.WaitGroup` directly, no goroutine pools. `errgroup` already encapsulates "bounded worker pool with shared error" so reaching for anything more complex would have been over-engineering.
+
+### Per-table results from Run 6, round 1
+
+| Table | Source files | Files compacted into | Attempts | Wall | Master check |
+|---|---:|---:|---:|---:|---|
+| store_sales (partition `ss_store_sk=2`) | 2249 | 2205 | 2 | **1,388 ms** | PASS (I1/I2/I3/I4/I5/I7 — I7 reports `1/1 files` thanks to #5) |
+| store_returns (partition `sr_store_sk=2`) | 2012 | 1971 | 2 | **1,211 ms** | PASS |
+| catalog_sales (partition `cs_call_center_sk=2`) | 470 | 424 | 2 | **1,252 ms** | PASS |
+
+The "files compacted into" delta is small per round (~40-260 files) because each round only touches one of 50 partitions. The bench rotates through partitions on subsequent rounds.
+
+### CB1 working as designed
+
+After round 1 succeeded all three tables, **CB1 (5-minute cooldown)** correctly skipped every subsequent compaction attempt for the remaining ~3 minutes of bench duration, with countdown messages like:
+
+```
+skipped: table tpcds.db/store_sales cooled down (4m28s left)
+```
+
+The bench harness logs these as `warning: ... returned non-zero` because exit code 1 is preserved (CB1 skip is not "success"), but the JSON-aware operator path can `errors.As` against `*safety.CooldownError` and surface them as soft skips, not failures.
+
+This is **the entire CB1 + CB8 + parquet-go + I7 + parallel-manifest + parallel-parquet + master-check + atomic-CAS stack working coherently against MinIO in one bench run**, end-to-end, no hangs, no row loss, no wedged retries.
+
+### What's still on the table for future runs
+
+| Optimization | Expected effect | Status |
+|---|---|---|
+| Stitching binpack (column-chunk byte copy via parquet-go's lower-level API; no decode/encode) | Another ~3-10× compaction speedup; eliminates the per-batch Arrow allocation pressure entirely; works for stitching-eligible files (uniform schema/codec/encoding/writer version) | Designed (decision #13), not yet shipped |
+| Skip files already at target size | Read fewer source files per compact — biggest single I/O reduction on streaming workloads where most files are already sized correctly | Listed in issue #6 as out-of-scope follow-up |
+| Manifest-list pruning via `PartitionList()` summary bounds | Skip whole manifests whose partition bounds don't include the target value — ~10× win on time-partitioned tables | Listed in issue #6 as out-of-scope follow-up |
+| Don't re-walk manifests on CAS retry | Cache the in-process manifest set across retry attempts; subsequent attempts only read the new manifests added since the last attempt | Listed in issue #6 as out-of-scope follow-up |
+| `pkg/maintenance/expire` snapshot expiration | Second maintenance op alongside compact | In flight in this session as a sub-agent task |
+| `pkg/maintenance/orphan` orphan file removal | Third maintenance op | Designed (decision #18 — two-phase mandatory dry-run), not yet shipped |
+| Bench against AWS S3 (not MinIO) | Real-world latency profile — local MinIO is ~5-10 ms per round-trip; AWS S3 is 20-50 ms; the parallelism speedup should be larger because the constant overhead per round-trip dominates more | Pending |
+| Lower CB1 cooldown for short benches (or pass via env var) | Let multi-round bench compactions actually happen instead of being correctly cooldown-skipped after round 1. The current 5-min default is right for production but starves the bench's 4-min window | Pending — small CLI/config change |
+
+---
+
 ## Format conventions for future entries
 
 When adding new rows to this file as new build phases land:
