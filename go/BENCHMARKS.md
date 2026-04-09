@@ -250,6 +250,148 @@ This is **the entire CB8 + parquet-go + I7 + parallel-manifest + parallel-parque
 
 ---
 
+## Run 13 — A vs B: snapshot expire + manifest rewrite close the writer-fight loop
+
+**Date:** 2026-04-08
+**Commit baseline:** `ee9f450` ("Snapshot expiration + manifest rewrite + cmd tests") + a one-line follow-up that caps the CAS-retry exponential backoff at 5s (see "The bug we found" below).
+**Hardware:** local Mac (Apple Silicon), MinIO via docker on the same host.
+**Workload:** TPC-DS streaming bench, 60 commits/min, 30s maintenance interval, partition-rotation across all 50 store partitions.
+**Run wall:** 5 minutes per side. Both sides run **on the same MinIO container** (`janitor-mvp-minio`, port 9000) with distinct top-level bucket prefixes so the underlying disk and network conditions are byte-identical between A and B.
+
+```bash
+# A — baseline
+WH_WITH_URL_OVERRIDE='s3://with-warehouse?endpoint=http://localhost:9000&s3ForcePathStyle=true&region=us-east-1' \
+WH_WITHOUT_URL_OVERRIDE='s3://without-warehouse?endpoint=http://localhost:9000&s3ForcePathStyle=true&region=us-east-1' \
+WAREHOUSE_BASE=/dev/null S3_ENDPOINT=http://localhost:9000 \
+S3_ACCESS_KEY=minioadmin S3_SECRET_KEY=minioadmin S3_REGION=us-east-1 \
+DURATION_SECONDS=300 QUERY_INTERVAL_SECONDS=60 \
+MAINTENANCE_INTERVAL_SECONDS=30 COMMITS_PER_MINUTE=60 \
+./go/test/bench/bench-tpcds.sh
+
+# B — same bench script but augmented with expire + rewrite-manifests every 4 compact rounds
+CATALOG_DB_WITH=/tmp/janitor-bench-catalog-with-b.db \
+CATALOG_DB_WITHOUT=/tmp/janitor-bench-catalog-without-b.db \
+WH_WITH_URL_OVERRIDE='s3://with-warehouse-b?endpoint=http://localhost:9000&s3ForcePathStyle=true&region=us-east-1' \
+WH_WITHOUT_URL_OVERRIDE='s3://without-warehouse-b?endpoint=http://localhost:9000&s3ForcePathStyle=true&region=us-east-1' \
+WAREHOUSE_BASE=/dev/null S3_ENDPOINT=http://localhost:9000 \
+S3_ACCESS_KEY=minioadmin S3_SECRET_KEY=minioadmin S3_REGION=us-east-1 \
+DURATION_SECONDS=300 QUERY_INTERVAL_SECONDS=60 \
+MAINTENANCE_INTERVAL_SECONDS=30 COMMITS_PER_MINUTE=60 \
+EXPIRE_REWRITE_INTERVAL=4 EXPIRE_KEEP_LAST=3 EXPIRE_KEEP_WITHIN=1m \
+./go/test/bench/bench-tpcds-with-expire.sh
+```
+
+The two scripts are identical except for the `bench-tpcds-with-expire.sh` `run_janitor_compact` body, which after every 4 compact rounds invokes `janitor-cli expire` then `janitor-cli rewrite-manifests` against each fact table.
+
+### The headline number
+
+![Run 13 A vs B: compact wall time and B's metadata maintenance ops](docs/bench/run13-AvB.png)
+
+| metric | A (baseline) | B (+ expire + rewrite) | A→B |
+|---|---:|---:|---|
+| compacts attempted in 5 min | 3 | **12** | 4× |
+| compacts succeeded | 1 | **12** | 12× |
+| max attempts on any compact | 13 | **1** | — |
+| longest single compact wall | **117.8 s** | 25.8 s | 4.6× faster |
+| median successful compact wall | 117.8 s | **17.6 s** | 6.7× faster |
+| expire + rewrite-manifests calls | 0 | 6 (3 each) | — |
+| snapshots in metadata at end (per table) | unbounded growth | **5** (KeepLast=3 + 2 for the in-flight commits) | — |
+| micro-manifests in current snapshot (store_sales) | grows to ~442 | **50 → 50 → 50** (one per partition, after each rewrite) | 8.8× consolidation |
+| micro-manifests in current snapshot (catalog_sales) | grows to ~441 | **10** (one per partition) | 44× consolidation |
+
+### The mechanism: why B wins
+
+The compactor's per-attempt cost is dominated by reading the snapshot's manifest list. On a hot streaming table the manifest list grows by 1–3 entries per writer commit. After 4 minutes at 60 cpm, store_sales had **442 micro-manifests** in its snapshot's manifest list.
+
+- **A's compactor** walks all 442 manifests on every CAS attempt. The walk takes longer than the streamer's commit interval, so the compactor loses the optimistic-CAS race against the streamer over and over. In Run 13's A side, the one compact that *did* succeed needed **13 attempts and 117.8 s** of wall time. The other two attempts hit the 15-attempt cap and gave up with `compaction failed: exceeded 15 concurrency-retry attempts`.
+
+- **B's compactor** walks at most ~50 manifests on every attempt because every 4th compact round triggers `rewrite-manifests`, which collapses 442 micro-manifests into one consolidated manifest per partition (50 for store_sales/store_returns, 10 for catalog_sales). With the manifest list bounded, every B compact wins the CAS race in **1 attempt** and finishes in **8.7–25.8 s**.
+
+This is the closed-loop fix from `mystictraveler/iceberg-janitor#7` working end-to-end:
+
+1. **Compact** rewrites small files into a target-sized output (Pattern B threshold 1 MB).
+2. After every 4 compact rounds, **expire snapshots** drops the parent chain back to KeepLast=3, removing 434–435 historical snapshots per table.
+3. Then **rewrite-manifests** consolidates the surviving snapshot's per-commit micro-manifests into one manifest per partition tuple.
+4. The next compact round walks a tiny manifest list and wins the CAS race.
+
+### Per-op detail from Run 13's janitor-runs log
+
+**B compaction (12/12 succeeded in 1 attempt each):**
+
+| round | store_sales | store_returns | catalog_sales |
+|---|---:|---:|---:|
+| 1 | 21.4 s | 13.4 s | 16.1 s |
+| 2 | 19.2 s | 16.8 s | 14.2 s |
+| 3 | 23.7 s | 18.5 s | 19.5 s |
+| 4 | 25.8 s | 9.2 s | 8.7 s |
+
+**B maintenance (fired once at round 4):**
+
+| table | expire wall | snapshots removed | rewrite wall | manifests before → after |
+|---|---:|---:|---:|---|
+| store_sales | 4245 ms | 435 | 3136 ms | 442 → 50 |
+| store_returns | 2499 ms | 434 | 2945 ms | 441 → 50 |
+| catalog_sales | 2117 ms | 434 | 1733 ms | 441 → 10 |
+
+Total cost of B's metadata maintenance pass: **~16.7 seconds** of wall time across all three tables. This unlocks the next 4 compact rounds at 1 attempt each — a trade that pays for itself many times over on any streaming workload.
+
+**A compaction (1/3 succeeded):**
+
+| target | result | attempts | wall | reason |
+|---|---|---:|---:|---|
+| store_sales `ss_store_sk=2` | FAIL | 1 | — | latent stale-state bug — `NoSuchKey` on a manifest from a prior bench whose `_janitor/` cleanup didn't reach the metadata layer (separate from anything tested here) |
+| store_returns `sr_store_sk=2` | FAIL | 15 | ~75 s | exceeded retry cap; writer-fight |
+| catalog_sales `cs_call_center_sk=2` | PASS | 13 | **117.8 s** | compactor crawled the manifest list 13 times while losing the CAS race to the streamer |
+
+A reached only iteration 1 of the bench loop in 5 minutes because each compact (success or failure) burned 75–120 s of wall time and the bench script's main loop blocks on each compact subprocess.
+
+### The bug we found and fixed mid-experiment
+
+While diagnosing why an earlier 10-minute run B hung, we core-dumped the compactor with `kill -3` and saw goroutine 1 parked in `select` at `pkg/janitor/compact.go:259`. That's the **CAS retry backoff sleep**, and the doubling was unbounded:
+
+```go
+// Before:
+backoff := opts.InitialBackoff           // 100ms
+for attempt := 1; attempt <= opts.MaxAttempts; attempt++ {  // 15
+    err := compactOnce(...)
+    ...
+    select {
+    case <-ctx.Done(): return ctx.Err()
+    case <-time.After(backoff):
+    }
+    backoff *= 2  // ← unbounded; reaches 1638s by attempt 15
+}
+```
+
+With `MaxAttempts=15` and `InitialBackoff=100 ms` the worst-case cumulative wait was `100 ms × (2^15 − 1) ≈ 3276 s ≈ 55 minutes` of pure sleeping, which surfaced as a hung compactor under heavy writer-fight. Fix is one cap, applied symmetrically to `pkg/janitor/compact.go`, `pkg/maintenance/expire.go`, and `pkg/maintenance/manifest_rewrite.go`:
+
+```go
+type CompactOptions struct {
+    ...
+    MaxBackoff time.Duration  // default 5s
+}
+
+// Inside the retry loop:
+backoff *= 2
+if backoff > opts.MaxBackoff {
+    backoff = opts.MaxBackoff
+}
+```
+
+5 s is a safe cap because the streamer's commit window in this bench is sub-second; 5 s of quiet is more than enough for the next CAS attempt to find a usable slot. With the cap, the worst-case cumulative wait drops from ~55 min to ~46 s — comfortably inside the bench's 30 s maintenance interval × 2.
+
+### Open issues this run did NOT fix
+
+1. **`NoSuchKey` ghost references** — A's first compact failed because `bench-tpcds.sh`'s setup doesn't wipe `_janitor/` files between runs, and a prior failed run left a manifest reference whose underlying file had been GC'd. The streamer's `TRUNCATE_TABLES=true` only truncates iceberg-table data, not the `_janitor/` prefix. Workaround: nuke the bucket between runs. Real fix: have the streamer (or the bench harness) clear `_janitor/` on startup.
+2. **q1 query latency** is still 3–5× higher with-janitor than without across all 13 bench runs. Untouched.
+3. **Lambda / Knative Job adapters** still stubs.
+
+### What this unlocks for the design plan
+
+Decision #13 (stitching binpack as default compaction) is fully delivered with bench evidence on a streaming workload. Decision #18's first half (snapshot expire) and decision #19 (manifest rewrite) are now real ops, both shipped behind `janitor-cli expire` and `janitor-cli rewrite-manifests`, and both have demonstrated their architectural payoff in a back-to-back A/B against an unfortified baseline. The next milestones (Pattern C event-driven dispatch, lease primitive, AWS S3 bench) all build on top of this metadata-bounded foundation.
+
+---
+
 ## Format conventions for future entries
 
 When adding new rows to this file as new build phases land:

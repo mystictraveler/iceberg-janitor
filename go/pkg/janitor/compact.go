@@ -67,8 +67,19 @@ type CompactOptions struct {
 	// MaxAttempts caps the CAS-conflict retry loop. Default 15.
 	MaxAttempts int
 	// InitialBackoff is the wait between the first failed attempt and
-	// the second. Doubles each time. Default 100ms.
+	// the second. Doubles each time, capped at MaxBackoff. Default 100ms.
 	InitialBackoff time.Duration
+	// MaxBackoff caps the per-attempt sleep so the exponential
+	// doubling can't run away to multi-minute waits. Default 5s. The
+	// streamer's commit window is sub-second on the bench, so 5s of
+	// quiet is more than enough for the next attempt to find a
+	// usable CAS slot. Without this cap, MaxAttempts=15 with 100ms
+	// base produces a worst-case cumulative wait of ~3276s (~55 min)
+	// — which under load shows up as a hung compactor that's just
+	// patiently sleeping. The fix is one line; the bug surfaced in
+	// the run-B 10-min bench when one CAS-loser hit attempt 12 and
+	// sat in a 200-second select with no progress.
+	MaxBackoff time.Duration
 
 	// PartitionTuple, if non-nil, scopes the compaction to one
 	// partition's worth of data files. The compactOnce implementation
@@ -162,6 +173,9 @@ func (o *CompactOptions) defaults() {
 	}
 	if o.InitialBackoff <= 0 {
 		o.InitialBackoff = 100 * time.Millisecond
+	}
+	if o.MaxBackoff <= 0 {
+		o.MaxBackoff = 5 * time.Second
 	}
 }
 
@@ -262,6 +276,9 @@ func Compact(ctx context.Context, cat *catalog.DirectoryCatalog, ident icebergta
 			case <-time.After(backoff):
 			}
 			backoff *= 2
+			if backoff > opts.MaxBackoff {
+				backoff = opts.MaxBackoff
+			}
 		}
 		return fmt.Errorf("compaction failed: exceeded %d concurrency-retry attempts", opts.MaxAttempts)
 	}()

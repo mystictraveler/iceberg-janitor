@@ -71,8 +71,13 @@ type RewriteManifestsOptions struct {
 	MaxAttempts int
 
 	// InitialBackoff is the wait between the first failed attempt and
-	// the second. Doubles each time. Default 100ms.
+	// the second. Doubles each time, capped at MaxBackoff. Default 100ms.
 	InitialBackoff time.Duration
+
+	// MaxBackoff caps the per-attempt sleep so the doubling can't run
+	// away. Default 5s. Same rationale as
+	// CompactOptions.MaxBackoff — see the doc comment there.
+	MaxBackoff time.Duration
 
 	// CircuitBreaker, if non-nil, is consulted before the rewrite runs
 	// and is updated with the outcome afterward. Same shape as
@@ -89,6 +94,9 @@ func (o *RewriteManifestsOptions) defaults() {
 	}
 	if o.InitialBackoff <= 0 {
 		o.InitialBackoff = 100 * time.Millisecond
+	}
+	if o.MaxBackoff <= 0 {
+		o.MaxBackoff = 5 * time.Second
 	}
 }
 
@@ -152,6 +160,9 @@ func RewriteManifests(ctx context.Context, cat *catalog.DirectoryCatalog, ident 
 			case <-time.After(backoff):
 			}
 			backoff *= 2
+			if backoff > opts.MaxBackoff {
+				backoff = opts.MaxBackoff
+			}
 		}
 		return fmt.Errorf("manifest rewrite failed: exceeded %d concurrency-retry attempts", opts.MaxAttempts)
 	}()
