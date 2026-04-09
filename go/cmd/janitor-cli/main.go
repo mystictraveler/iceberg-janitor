@@ -18,6 +18,7 @@ import (
 	"strconv"
 	"strings"
 	"syscall"
+	"time"
 
 	icebergtable "github.com/apache/iceberg-go/table"
 	"gocloud.dev/blob"
@@ -31,6 +32,7 @@ import (
 	"github.com/mystictraveler/iceberg-janitor/go/pkg/catalog"
 	"github.com/mystictraveler/iceberg-janitor/go/pkg/config"
 	"github.com/mystictraveler/iceberg-janitor/go/pkg/janitor"
+	"github.com/mystictraveler/iceberg-janitor/go/pkg/maintenance"
 	"github.com/mystictraveler/iceberg-janitor/go/pkg/safety"
 	"github.com/mystictraveler/iceberg-janitor/go/pkg/state"
 )
@@ -70,6 +72,16 @@ func main() {
 	case "compact":
 		if err := runCompact(args); err != nil {
 			fmt.Fprintln(os.Stderr, "compact:", err)
+			os.Exit(1)
+		}
+	case "expire":
+		if err := runExpire(args); err != nil {
+			fmt.Fprintln(os.Stderr, "expire:", err)
+			os.Exit(1)
+		}
+	case "rewrite-manifests":
+		if err := runRewriteManifests(args); err != nil {
+			fmt.Fprintln(os.Stderr, "rewrite-manifests:", err)
 			os.Exit(1)
 		}
 	case "pause":
@@ -118,6 +130,32 @@ COMMANDS:
                                Skip-already-large-files threshold (Pattern B).
                                Files ≥ SIZE are kept unchanged. Bounds the
                                per-round cost. Suffixes: KB / MB / GB.
+  expire <table_path>    Drop old snapshots from the table's metadata,
+                         then GC the orphaned manifest_lists / manifests
+                         / data files. The current snapshot (main branch
+                         tip) is always retained. Optional flags:
+                           --keep-last N
+                               Minimum snapshots to retain on the parent
+                               chain (default 5).
+                           --keep-within DURATION
+                               Minimum age before a snapshot is eligible
+                               (default 168h = 7 days). Go duration syntax.
+                           --no-delete
+                               Stage and commit the metadata change but
+                               skip the post-commit orphan file delete.
+                               Use when consumers may still be reading
+                               the expired snapshots' files.
+  rewrite-manifests <table_path>
+                         Consolidate per-commit micro-manifests in the
+                         current snapshot into fewer larger manifests
+                         organized by partition tuple. Pairs with expire:
+                         expire drops snapshots, rewrite-manifests
+                         shrinks the surviving snapshot's metadata
+                         layer so manifest pruning is more effective on
+                         the next compact / scan. Optional flags:
+                           --min-manifests N
+                               Skip rewrite if the snapshot has fewer
+                               than N manifests (default 4).
   pause <table_path>     Manually pause maintenance on a table. Requires
                          --reason "<text>". Writes a pause file to
                          _janitor/control/paused/<uuid>.json that the next
@@ -381,6 +419,239 @@ func runCompact(args []string) error {
 		return runCompactViaAPI(ctx, cfg, tablePath)
 	}
 	return runCompactInProcess(ctx, cfg, tablePath, partitionFilter, targetFileSize)
+}
+
+// runExpire is the entry point for `janitor-cli expire <table_path>`.
+// It mirrors runCompact's shape: parse flags, load config, route
+// in-process to pkg/maintenance.Expire, print the result.
+//
+// API mode is intentionally NOT plumbed yet — the janitor-server side
+// of expire (handler + result type wiring) hasn't been written. The
+// flag parser will refuse to fall through to the server in that
+// configuration so the operator gets a clear error rather than silent
+// "did nothing".
+func runExpire(args []string) error {
+	var tablePath string
+	keepLast := 5
+	keepWithin := 7 * 24 * time.Hour
+	postDelete := true
+	for i := 0; i < len(args); i++ {
+		a := args[i]
+		switch {
+		case a == "--keep-last" && i+1 < len(args):
+			n, err := strconv.Atoi(args[i+1])
+			if err != nil || n <= 0 {
+				return fmt.Errorf("invalid --keep-last %q: must be positive integer", args[i+1])
+			}
+			keepLast = n
+			i++
+		case strings.HasPrefix(a, "--keep-last="):
+			n, err := strconv.Atoi(strings.TrimPrefix(a, "--keep-last="))
+			if err != nil || n <= 0 {
+				return fmt.Errorf("invalid --keep-last %q: must be positive integer", a)
+			}
+			keepLast = n
+		case a == "--keep-within" && i+1 < len(args):
+			d, err := time.ParseDuration(args[i+1])
+			if err != nil || d <= 0 {
+				return fmt.Errorf("invalid --keep-within %q: %v", args[i+1], err)
+			}
+			keepWithin = d
+			i++
+		case strings.HasPrefix(a, "--keep-within="):
+			d, err := time.ParseDuration(strings.TrimPrefix(a, "--keep-within="))
+			if err != nil || d <= 0 {
+				return fmt.Errorf("invalid --keep-within %q: %v", a, err)
+			}
+			keepWithin = d
+		case a == "--no-delete":
+			postDelete = false
+		case strings.HasPrefix(a, "--"):
+			return fmt.Errorf("unknown flag %q", a)
+		default:
+			if tablePath != "" {
+				return fmt.Errorf("multiple table paths provided")
+			}
+			tablePath = a
+		}
+	}
+	if tablePath == "" {
+		return fmt.Errorf("usage: janitor-cli expire <table_path> [--keep-last N] [--keep-within DURATION] [--no-delete]")
+	}
+
+	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer cancel()
+
+	cfg, err := loadConfig()
+	if err != nil {
+		return err
+	}
+	if cfg.Warehouse.APIURL != "" {
+		return fmt.Errorf("expire is not yet wired through janitor-server; unset JANITOR_API_URL to run in-process")
+	}
+
+	tablePath = strings.Trim(tablePath, "/")
+	cat, err := catalog.NewDirectoryCatalog(ctx, "janitor", cfg.Warehouse.URL, cfg.ToBlobProps())
+	if err != nil {
+		return err
+	}
+	defer cat.Close()
+
+	ident, err := tablePathToIdentifier(tablePath)
+	if err != nil {
+		return err
+	}
+
+	opts := maintenance.ExpireOptions{
+		KeepLast:         keepLast,
+		KeepWithin:       keepWithin,
+		PostCommitDelete: postDelete,
+	}
+	if !cfg.Safety.DisableCircuitBreaker {
+		cb := safety.New(cat.Bucket())
+		cb.TriggeredBy = "janitor-cli"
+		opts.CircuitBreaker = cb
+	}
+
+	fmt.Printf("expiring %s (in-process; warehouse=%s; keep-last=%d; keep-within=%s; post-delete=%t)\n",
+		tablePath, cfg.Warehouse.URL, keepLast, keepWithin, postDelete)
+	result, err := maintenance.Expire(ctx, cat, ident, opts)
+	if safety.IsPaused(err) {
+		fmt.Fprintf(os.Stderr, "skipped: %v\n", err)
+		fmt.Fprintf(os.Stderr, "         (use 'janitor-cli status %s' to inspect, 'resume' to clear)\n", tablePath)
+		return err
+	}
+	printExpireResult(tablePath, result, err)
+	return err
+}
+
+func printExpireResult(tablePath string, r *maintenance.ExpireResult, runErr error) {
+	if r == nil {
+		return
+	}
+	fmt.Printf("  before: %d snapshots, %d data files, %d rows (snapshot %d)\n",
+		r.BeforeSnapshots, r.BeforeFiles, r.BeforeRows, r.BeforeSnapshotID)
+	if r.Verification != nil {
+		v := r.Verification
+		fmt.Printf("  master check: %s\n", strings.ToUpper(v.Overall))
+		fmt.Printf("    I1 row count:   in=%d out=%d (%s)\n",
+			v.I1RowCount.In, v.I1RowCount.Out, v.I1RowCount.Result)
+		fmt.Printf("    I2 schema:      id=%d (%s)\n",
+			v.I2Schema.OutID, v.I2Schema.Result)
+		fmt.Printf("    snap retain:    before=%d after=%d removed=%d (%s)\n",
+			v.SnapshotRetain.BeforeSnapshots, v.SnapshotRetain.AfterSnapshots,
+			v.SnapshotRetain.Removed, v.SnapshotRetain.Result)
+	}
+	if runErr != nil {
+		fmt.Fprintf(os.Stderr, "expire failed after %d attempt(s): %v\n", r.Attempts, runErr)
+		return
+	}
+	fmt.Printf("  after:  %d snapshots, %d data files, %d rows (snapshot %d)\n",
+		r.AfterSnapshots, r.AfterFiles, r.AfterRows, r.AfterSnapshotID)
+	fmt.Printf("expire complete: removed %d snapshot(s) in %d attempt(s), %dms\n",
+		len(r.RemovedSnapshotIDs), r.Attempts, r.DurationMs)
+}
+
+// runRewriteManifests is the entry point for `janitor-cli rewrite-manifests`.
+// Same shape as runExpire: parse one optional flag, route in-process to
+// pkg/maintenance.RewriteManifests, print the result.
+func runRewriteManifests(args []string) error {
+	var tablePath string
+	minManifests := 4
+	for i := 0; i < len(args); i++ {
+		a := args[i]
+		switch {
+		case a == "--min-manifests" && i+1 < len(args):
+			n, err := strconv.Atoi(args[i+1])
+			if err != nil || n <= 0 {
+				return fmt.Errorf("invalid --min-manifests %q: must be positive integer", args[i+1])
+			}
+			minManifests = n
+			i++
+		case strings.HasPrefix(a, "--min-manifests="):
+			n, err := strconv.Atoi(strings.TrimPrefix(a, "--min-manifests="))
+			if err != nil || n <= 0 {
+				return fmt.Errorf("invalid --min-manifests %q: must be positive integer", a)
+			}
+			minManifests = n
+		case strings.HasPrefix(a, "--"):
+			return fmt.Errorf("unknown flag %q", a)
+		default:
+			if tablePath != "" {
+				return fmt.Errorf("multiple table paths provided")
+			}
+			tablePath = a
+		}
+	}
+	if tablePath == "" {
+		return fmt.Errorf("usage: janitor-cli rewrite-manifests <table_path> [--min-manifests N]")
+	}
+
+	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer cancel()
+
+	cfg, err := loadConfig()
+	if err != nil {
+		return err
+	}
+	if cfg.Warehouse.APIURL != "" {
+		return fmt.Errorf("rewrite-manifests is not yet wired through janitor-server; unset JANITOR_API_URL to run in-process")
+	}
+
+	tablePath = strings.Trim(tablePath, "/")
+	cat, err := catalog.NewDirectoryCatalog(ctx, "janitor", cfg.Warehouse.URL, cfg.ToBlobProps())
+	if err != nil {
+		return err
+	}
+	defer cat.Close()
+
+	ident, err := tablePathToIdentifier(tablePath)
+	if err != nil {
+		return err
+	}
+
+	opts := maintenance.RewriteManifestsOptions{MinManifestsToTrigger: minManifests}
+	if !cfg.Safety.DisableCircuitBreaker {
+		cb := safety.New(cat.Bucket())
+		cb.TriggeredBy = "janitor-cli"
+		opts.CircuitBreaker = cb
+	}
+
+	fmt.Printf("rewriting manifests for %s (in-process; warehouse=%s; min-manifests=%d)\n",
+		tablePath, cfg.Warehouse.URL, minManifests)
+	result, err := maintenance.RewriteManifests(ctx, cat, ident, opts)
+	if safety.IsPaused(err) {
+		fmt.Fprintf(os.Stderr, "skipped: %v\n", err)
+		fmt.Fprintf(os.Stderr, "         (use 'janitor-cli status %s' to inspect, 'resume' to clear)\n", tablePath)
+		return err
+	}
+	printRewriteResult(tablePath, result, err)
+	return err
+}
+
+func printRewriteResult(tablePath string, r *maintenance.RewriteManifestsResult, runErr error) {
+	if r == nil {
+		return
+	}
+	fmt.Printf("  before: %d manifests, %d data files, %d rows (snapshot %d)\n",
+		r.BeforeManifests, r.BeforeDataFiles, r.BeforeRows, r.BeforeSnapshotID)
+	if r.Verification != nil {
+		v := r.Verification
+		fmt.Printf("  master check: %s\n", strings.ToUpper(v.Overall))
+		fmt.Printf("    I1 row count:   in=%d out=%d (%s)\n",
+			v.I1RowCount.In, v.I1RowCount.Out, v.I1RowCount.Result)
+		fmt.Printf("    I2 schema:      id=%d (%s)\n",
+			v.I2Schema.OutID, v.I2Schema.Result)
+	}
+	if runErr != nil {
+		fmt.Fprintf(os.Stderr, "rewrite-manifests failed after %d attempt(s): %v\n", r.Attempts, runErr)
+		return
+	}
+	fmt.Printf("  after:  %d manifests, %d data files, %d rows (snapshot %d)\n",
+		r.AfterManifests, r.AfterDataFiles, r.AfterRows, r.AfterSnapshotID)
+	reduction := float64(r.BeforeManifests) / maxF(float64(r.AfterManifests), 1)
+	fmt.Printf("rewrite-manifests complete: %d → %d manifests (%.1fx reduction) in %d attempt(s), %dms\n",
+		r.BeforeManifests, r.AfterManifests, reduction, r.Attempts, r.DurationMs)
 }
 
 // parseFileSize parses a human-readable file size string like "1MB",

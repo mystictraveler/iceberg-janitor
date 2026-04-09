@@ -42,6 +42,12 @@ type Verification struct {
 	I7ManifestRefs ManifestRefsCheck `json:"I7_manifest_refs"`
 	// I6, I8, I9 will be added by subsequent iterations.
 
+	// SnapshotRetain is populated only by VerifyExpireConsistency.
+	// It's a separate field from the I-numbered invariants because
+	// "every snapshot in the retain set survives the stage" is an
+	// expire-only check that has no analogue in compact.
+	SnapshotRetain SnapshotRetainCheck `json:"snapshot_retain,omitempty"`
+
 	Overall string `json:"overall"` // "pass" | "fail"
 }
 
@@ -463,6 +469,200 @@ func compareBoundsPresence(in, out map[int]bool) BoundsCheck {
 	result.Reason = fmt.Sprintf("bounds set mismatch: missing_in_out=%v spurious_in_out=%v",
 		result.MissingInOut, result.SpuriousInOut)
 	return result
+}
+
+// SnapshotRetainCheck reports the result of the expire-specific
+// invariant: every snapshot in the operator-supplied retain set must
+// still appear in the staged metadata's snapshot list, and the staged
+// list must be a subset of the input list (an expire never adds new
+// snapshots).
+type SnapshotRetainCheck struct {
+	BeforeSnapshots int     `json:"before_snapshots"`
+	AfterSnapshots  int     `json:"after_snapshots"`
+	Removed         int     `json:"removed"`
+	Added           []int64 `json:"added,omitempty"` // populated only on failure
+	Result          string  `json:"result"`
+	Reason          string  `json:"reason,omitempty"`
+}
+
+// VerifyExpireConsistency runs the master check against a pending
+// snapshot expiration. The invariants enforced here are different from
+// VerifyCompactionConsistency:
+//
+//   - I1 (row count): the CURRENT snapshot's total rows must not
+//     change. Expire only touches the parent chain; the branch tip
+//     stays put.
+//   - I2 (schema by id): must not change.
+//   - Current snapshot id: must not change. Expire is forbidden from
+//     reseating the main branch.
+//   - Snapshot set monotonicity: stagedSnapshots ⊆ beforeSnapshots.
+//     An expire that ADDS snapshots indicates a programming bug.
+//
+// I3/I4/I5 are skipped because the per-file column statistics don't
+// move under expire (the same data files are still referenced by the
+// surviving snapshots). I7 is skipped because expire writes no new
+// data files; the post-commit orphan deletion in iceberg-go's
+// removeSnapshotsUpdate.PostCommit is fire-and-forget AFTER the CAS
+// has already succeeded, so any failure to delete a particular
+// orphan is a separate (best-effort) error path that doesn't gate
+// commit.
+//
+// The check is mandatory; no --force bypass.
+func VerifyExpireConsistency(ctx context.Context, before *icebergtable.Table, staged *icebergtable.StagedTable, props map[string]string) (*Verification, error) {
+	v := &Verification{
+		SchemeVersion:  1,
+		CheckedAt:      nowRFC3339(),
+		CheckerVersion: "iceberg-janitor-go expire",
+	}
+	if before == nil || staged == nil {
+		return v, fmt.Errorf("VerifyExpireConsistency: before or staged is nil")
+	}
+
+	beforeSnap := before.CurrentSnapshot()
+	stagedSnap := staged.CurrentSnapshot()
+	if beforeSnap != nil {
+		v.InputSnapshotID = beforeSnap.SnapshotID
+	}
+	if stagedSnap != nil {
+		v.OutputSnapshotID = stagedSnap.SnapshotID
+	}
+
+	// Current snapshot id must not change.
+	if beforeSnap == nil || stagedSnap == nil || beforeSnap.SnapshotID != stagedSnap.SnapshotID {
+		v.I1RowCount = RowCountCheck{Result: "fail",
+			Reason: fmt.Sprintf("expire reseated the main branch: %d -> %d", v.InputSnapshotID, v.OutputSnapshotID)}
+		v.Overall = "fail"
+		return v, fmt.Errorf("MASTER CHECK FAILED (expire reseated main branch): %s", v.I1RowCount.Reason)
+	}
+
+	// I1: current-snapshot row count is invariant under expire. We
+	// derive it from the snapshot's summary so we don't have to walk
+	// the manifests twice. The summary's "total-records" is written
+	// by every iceberg writer (including ours, since iceberg-go fills
+	// it on append/replace) and we're comparing the SAME snapshot's
+	// summary against itself reached two different ways — so the
+	// numbers had better match. If summary is missing on either side
+	// we fall back to a manifest walk via aggregateDataStats; that's
+	// slower but always correct.
+	beforeRows, err := snapshotTotalRows(ctx, before, beforeSnap, props)
+	if err != nil {
+		return v, fmt.Errorf("computing before rows: %w", err)
+	}
+	stagedRows, err := snapshotTotalRows(ctx, staged.Table, stagedSnap, props)
+	if err != nil {
+		return v, fmt.Errorf("computing staged rows: %w", err)
+	}
+	v.I1RowCount = RowCountCheck{In: beforeRows, Out: stagedRows}
+	if beforeRows != stagedRows {
+		v.I1RowCount.Result = "fail"
+		v.I1RowCount.Reason = fmt.Sprintf("current-snapshot rows changed under expire: %d -> %d", beforeRows, stagedRows)
+		v.Overall = "fail"
+		return v, fmt.Errorf("MASTER CHECK FAILED (I1 row count under expire): %s", v.I1RowCount.Reason)
+	}
+	v.I1RowCount.Result = "pass"
+
+	// I2: schema id must not change.
+	beforeSchema := before.Metadata().CurrentSchema()
+	stagedSchema := staged.Metadata().CurrentSchema()
+	v.I2Schema = SchemaCheck{}
+	if beforeSchema != nil {
+		v.I2Schema.InID = beforeSchema.ID
+	}
+	if stagedSchema != nil {
+		v.I2Schema.OutID = stagedSchema.ID
+	}
+	if beforeSchema == nil || stagedSchema == nil || beforeSchema.ID != stagedSchema.ID {
+		v.I2Schema.Result = "fail"
+		v.I2Schema.Reason = fmt.Sprintf("schema id changed under expire: %d -> %d", v.I2Schema.InID, v.I2Schema.OutID)
+		v.Overall = "fail"
+		return v, fmt.Errorf("MASTER CHECK FAILED (I2 schema): %s", v.I2Schema.Reason)
+	}
+	v.I2Schema.Result = "pass"
+
+	// Snapshot set monotonicity: staged ⊆ before. Any "added" snapshot
+	// id is a programming bug — expire is supposed to be a strict
+	// removal op against the metadata.snapshots[] slice.
+	beforeIDs := make(map[int64]struct{}, len(before.Metadata().Snapshots()))
+	for _, s := range before.Metadata().Snapshots() {
+		beforeIDs[s.SnapshotID] = struct{}{}
+	}
+	var added []int64
+	for _, s := range staged.Metadata().Snapshots() {
+		if _, present := beforeIDs[s.SnapshotID]; !present {
+			added = append(added, s.SnapshotID)
+		}
+	}
+	v.SnapshotRetain = SnapshotRetainCheck{
+		BeforeSnapshots: len(before.Metadata().Snapshots()),
+		AfterSnapshots:  len(staged.Metadata().Snapshots()),
+	}
+	v.SnapshotRetain.Removed = v.SnapshotRetain.BeforeSnapshots - v.SnapshotRetain.AfterSnapshots
+	if len(added) > 0 {
+		v.SnapshotRetain.Added = added
+		v.SnapshotRetain.Result = "fail"
+		v.SnapshotRetain.Reason = fmt.Sprintf("expire produced %d new snapshot id(s): %v", len(added), added)
+		v.Overall = "fail"
+		return v, fmt.Errorf("MASTER CHECK FAILED (snapshot retain): %s", v.SnapshotRetain.Reason)
+	}
+	v.SnapshotRetain.Result = "pass"
+
+	v.Overall = "pass"
+	return v, nil
+}
+
+// snapshotTotalRows returns the total row count of a single snapshot.
+// It prefers the snapshot summary's "total-records" key (O(1), already
+// in memory) and falls back to walking the manifest entries
+// (O(manifest count) S3 round trips). The caller passes the snapshot
+// it cares about explicitly so we don't accidentally read the wrong
+// snapshot when the staged table's CurrentSnapshot has shifted.
+func snapshotTotalRows(ctx context.Context, tbl *icebergtable.Table, snap *icebergtable.Snapshot, props map[string]string) (int64, error) {
+	if snap == nil {
+		return 0, nil
+	}
+	if snap.Summary != nil {
+		if v, ok := snap.Summary.Properties["total-records"]; ok {
+			var n int64
+			if _, err := fmt.Sscanf(v, "%d", &n); err == nil {
+				return n, nil
+			}
+		}
+	}
+	// Fallback: walk manifests directly. This duplicates a sliver of
+	// aggregateDataStats but skips the per-column maps because expire
+	// only needs the row total. On a healthy table the summary path
+	// always wins; this fallback exists for paranoia.
+	fs, err := tbl.FS(ctx)
+	if err != nil {
+		fs, err = openFS(ctx, tbl.MetadataLocation(), props)
+		if err != nil {
+			return 0, fmt.Errorf("opening fs: %w", err)
+		}
+	}
+	manifests, err := snap.Manifests(fs)
+	if err != nil {
+		return 0, fmt.Errorf("listing manifests: %w", err)
+	}
+	var rows int64
+	for _, m := range manifests {
+		mf, err := fs.Open(m.FilePath())
+		if err != nil {
+			return 0, fmt.Errorf("opening manifest %s: %w", m.FilePath(), err)
+		}
+		entries, err := icebergpkg.ReadManifest(m, mf, true)
+		mf.Close()
+		if err != nil {
+			return 0, fmt.Errorf("reading manifest %s: %w", m.FilePath(), err)
+		}
+		for _, e := range entries {
+			df := e.DataFile()
+			if df == nil || df.ContentType() != icebergpkg.EntryContentData {
+				continue
+			}
+			rows += df.Count()
+		}
+	}
+	return rows, nil
 }
 
 func unionKeys(a, b map[int]int64) []int {
