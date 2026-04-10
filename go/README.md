@@ -35,9 +35,11 @@ test/
 
 ## Status
 
-Phase 1 shipped + naive Phase 3: blob layer, directory catalog read AND write, analyzer with H1 metadata-data ratio check, CLI `discover` / `analyze` / `compact`, Go-only seed binary, master check (I1 row count), end-to-end loop verified against both local fileblob and MinIO.
+**19/30 design decisions fully shipped, 5 partially shipped, 6 pending.** The core maintenance pipeline (compact + expire + rewrite-manifests + all 11 circuit breakers) is proven end-to-end with bench evidence on bursty streaming workloads. AWS deployment on ECS Fargate is operational.
 
-**Measured benchmark results live at [BENCHMARKS.md](BENCHMARKS.md)** and are updated every time a new build phase lands. That file is the single source of truth for "how well does it actually work right now?"
+**[Full project scorecard](https://gist.github.com/mystictraveler/1c075afc793e3507ada484f3153cdf27)** — status of every design decision, bench results, architecture overview.
+
+**Measured benchmark results live at [BENCHMARKS.md](BENCHMARKS.md)** and are updated every time a new build phase lands.
 
 **For an architectural comparison against [Confluent Tableflow](https://www.confluent.io/product/tableflow/)'s compaction subsystem**, see [TABLEFLOW_COMPARISON.md](TABLEFLOW_COMPARISON.md). TL;DR: same correctness story with stronger guarantees (mandatory master check, snapshot-internal audit), no managed control plane, multi-cloud by construction, zero idle cost, and an open-source compaction algorithm you can audit in an afternoon.
 
