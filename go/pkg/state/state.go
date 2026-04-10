@@ -53,15 +53,26 @@ type TableState struct {
 	TableUUID string    `json:"table_uuid"`
 	UpdatedAt time.Time `json:"updated_at"`
 
-	// CB8: consecutive maintenance failures with no successful run
-	// in between. Reset to zero on every success. When this reaches
-	// the CB8 threshold (default 3), the circuit breaker writes a
-	// pause file at _janitor/control/paused/<uuid>.json and refuses
-	// further work on this table until an operator clears it.
+	// CB8: consecutive maintenance failures.
 	ConsecutiveFailedRuns int           `json:"consecutive_failed_runs"`
 	LastErrors            []ErrorRecord `json:"last_errors,omitempty"`
 	LastOutcome           Outcome       `json:"last_outcome,omitempty"`
 	LastSuccessAt         time.Time     `json:"last_success_at,omitempty"`
+
+	// CB2: loop detection — tracks file paths removed+re-added across
+	// consecutive runs. If the same set appears N times, the table is
+	// in a feedback loop with an external writer.
+	LastCompactedFiles []string `json:"last_compacted_files,omitempty"`
+	LoopCount          int      `json:"loop_count,omitempty"`
+
+	// CB7: daily byte budget.
+	DailyBytesRead    int64     `json:"daily_bytes_read,omitempty"`
+	DailyBytesWritten int64     `json:"daily_bytes_written,omitempty"`
+	DailyResetAt      time.Time `json:"daily_reset_at,omitempty"`
+
+	// CB9: lifetime rewrite ratio.
+	LifetimeBytesRewritten int64 `json:"lifetime_bytes_rewritten,omitempty"`
+	LifetimeDataBytes      int64 `json:"lifetime_data_bytes,omitempty"`
 }
 
 // RecordSuccess clears the failure counter and the recent-errors list
