@@ -15,7 +15,10 @@ import (
 	icebergtable "github.com/apache/iceberg-go/table"
 	"github.com/google/uuid"
 
+	"go.opentelemetry.io/otel/attribute"
+
 	"github.com/mystictraveler/iceberg-janitor/go/pkg/catalog"
+	"github.com/mystictraveler/iceberg-janitor/go/pkg/observe"
 	"github.com/mystictraveler/iceberg-janitor/go/pkg/safety"
 )
 
@@ -77,7 +80,14 @@ import (
 // Gated behind JANITOR_COMPACT_USE_REPLACE=1 in compact.go's Compact
 // dispatch.
 func compactOnceReplace(ctx context.Context, cat *catalog.DirectoryCatalog, ident icebergtable.Identifier, opts CompactOptions, result *CompactResult) error {
+	tr := observe.Tracer("janitor.compact")
+	ctx, span := tr.Start(ctx, "compactOnceReplace")
+	span.SetAttributes(observe.Table(ident[0], ident[1]), observe.Attempt(result.Attempts))
+	defer span.End()
+
+	ctx, loadSpan := tr.Start(ctx, "load_table")
 	tbl, err := cat.LoadTable(ctx, ident)
+	loadSpan.End()
 	if err != nil {
 		return fmt.Errorf("loading table %v: %w", ident, err)
 	}
@@ -108,21 +118,26 @@ func compactOnceReplace(ctx context.Context, cat *catalog.DirectoryCatalog, iden
 		return fmt.Errorf("building partition matcher: %w", err)
 	}
 
+	ctx, walkSpan := tr.Start(ctx, "manifest_walk")
 	manifests, err := snap.Manifests(fs)
 	if err != nil {
+		walkSpan.End()
 		return fmt.Errorf("listing manifests: %w", err)
 	}
+	walkSpan.SetAttributes(observe.Manifests(len(manifests)))
 
 	var oldPaths []string
 	var expectedRows int64
 	for _, m := range manifests {
 		mf, err := fs.Open(m.FilePath())
 		if err != nil {
+			walkSpan.End()
 			return fmt.Errorf("opening manifest %s: %w", m.FilePath(), err)
 		}
 		entries, err := icebergpkg.ReadManifest(m, mf, true)
 		mf.Close()
 		if err != nil {
+			walkSpan.End()
 			return fmt.Errorf("reading manifest %s: %w", m.FilePath(), err)
 		}
 		for _, e := range entries {
@@ -137,6 +152,9 @@ func compactOnceReplace(ctx context.Context, cat *catalog.DirectoryCatalog, iden
 			expectedRows += df.Count()
 		}
 	}
+	walkSpan.SetAttributes(observe.Files(len(oldPaths)), observe.Rows(expectedRows))
+	walkSpan.End()
+
 	if len(oldPaths) == 0 {
 		return nil // nothing to compact
 	}
@@ -183,10 +201,13 @@ func compactOnceReplace(ctx context.Context, cat *catalog.DirectoryCatalog, iden
 
 	// Step 3: read each input file via parquet-go directly and copy
 	// its rows into the output writer.
+	ctx, stitchSpan := tr.Start(ctx, "stitch_write")
+	stitchSpan.SetAttributes(observe.Files(len(oldPaths)))
 	var rowsWritten int64
 	for _, fpath := range oldPaths {
 		n, rerr := copyParquetFile(ctx, fs, fpath, pqWriter, writeSchema, mem)
 		if rerr != nil {
+			stitchSpan.End()
 			cleanup()
 			return fmt.Errorf("copying %s: %w", fpath, rerr)
 		}
@@ -194,9 +215,12 @@ func compactOnceReplace(ctx context.Context, cat *catalog.DirectoryCatalog, iden
 	}
 
 	if err := pqWriter.Close(); err != nil {
+		stitchSpan.End()
 		_ = wfs.Remove(newFilePath)
 		return fmt.Errorf("closing parquet writer: %w", err)
 	}
+	stitchSpan.SetAttributes(observe.Rows(rowsWritten))
+	stitchSpan.End()
 
 	// Step 4: pre-flight check. The iceberg-go writer's manifest
 	// entries record the exact row count of each data file. If
@@ -223,17 +247,26 @@ func compactOnceReplace(ctx context.Context, cat *catalog.DirectoryCatalog, iden
 	}
 
 	// Step 6: master check (mandatory, unchanged).
+	ctx, verifySpan := tr.Start(ctx, "master_check")
 	verification, err := safety.VerifyCompactionConsistency(ctx, tbl, staged, cat.Props())
 	result.Verification = verification
 	if err != nil {
+		verifySpan.RecordError(err)
+		verifySpan.End()
 		return err
 	}
+	verifySpan.SetAttributes(attribute.String("result", verification.Overall))
+	verifySpan.End()
 
 	// Step 7: commit.
+	_, commitSpan := tr.Start(ctx, "cas_commit")
 	newTbl, err := tx.Commit(ctx)
 	if err != nil {
+		commitSpan.RecordError(err)
+		commitSpan.End()
 		return err
 	}
+	commitSpan.End()
 
 	if newSnap := newTbl.CurrentSnapshot(); newSnap != nil {
 		result.AfterSnapshotID = newSnap.SnapshotID

@@ -17,6 +17,7 @@ import (
 	icebergtable "github.com/apache/iceberg-go/table"
 
 	"github.com/mystictraveler/iceberg-janitor/go/pkg/catalog"
+	"github.com/mystictraveler/iceberg-janitor/go/pkg/observe"
 	"github.com/mystictraveler/iceberg-janitor/go/pkg/safety"
 )
 
@@ -201,6 +202,11 @@ type CompactResult struct {
 // No partition scoping, no incremental work, no stitching binpack.
 // True stitching (column-chunk byte copy) lands later.
 func Compact(ctx context.Context, cat *catalog.DirectoryCatalog, ident icebergtable.Identifier, opts CompactOptions) (*CompactResult, error) {
+	tr := observe.Tracer("janitor.compact")
+	ctx, span := tr.Start(ctx, "Compact")
+	span.SetAttributes(observe.Table(ident[0], ident[1]))
+	defer span.End()
+
 	opts.defaults()
 	applyIcebergMaxWorkersOverride()
 	started := time.Now()

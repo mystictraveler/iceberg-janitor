@@ -8,11 +8,10 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
-	"io"
-	"net/http"
 	"os"
 	"os/signal"
 	"strconv"
@@ -23,15 +22,25 @@ import (
 	icebergtable "github.com/apache/iceberg-go/table"
 	"gocloud.dev/blob"
 
-	// Blank imports register URL openers with gocloud.dev/blob so that
-	// blob.OpenBucket can dispatch on the URL scheme.
 	_ "gocloud.dev/blob/fileblob"
 	_ "gocloud.dev/blob/s3blob"
 
 	"github.com/mystictraveler/iceberg-janitor/go/pkg/analyzer"
+	janitoraws "github.com/mystictraveler/iceberg-janitor/go/pkg/aws"
 	"github.com/mystictraveler/iceberg-janitor/go/pkg/catalog"
 	"github.com/mystictraveler/iceberg-janitor/go/pkg/janitor"
 )
+
+func newAPIClient(ctx context.Context, apiURL string) (*janitoraws.APIClient, error) {
+	region := os.Getenv("AWS_REGION")
+	if region == "" {
+		region = os.Getenv("AWS_DEFAULT_REGION")
+	}
+	if region == "" {
+		region = "us-east-1"
+	}
+	return janitoraws.NewAPIClient(ctx, apiURL, region)
+}
 
 func main() {
 	if len(os.Args) < 2 {
@@ -55,6 +64,11 @@ func main() {
 	case "compact":
 		if err := runCompact(args); err != nil {
 			fmt.Fprintln(os.Stderr, "compact:", err)
+			os.Exit(1)
+		}
+	case "glue-register":
+		if err := runGlueRegister(args); err != nil {
+			fmt.Fprintln(os.Stderr, "glue-register:", err)
 			os.Exit(1)
 		}
 	case "-h", "--help", "help":
@@ -82,15 +96,23 @@ COMMANDS:
                          the minimum number of files needed. The pre-commit
                          master check (I1 row count) is mandatory and
                          non-bypassable.
+  glue-register          Register all discovered Iceberg tables in a Glue
+    --database <db>      database with column definitions extracted from
+    [prefix]             the Iceberg metadata. Enables Athena queries.
 
 ENVIRONMENT:
+  JANITOR_API_URL         URL of a running janitor-server (e.g. the private
+                          API Gateway endpoint). When set, ALL commands are
+                          dispatched to the server via SigV4-signed HTTP
+                          requests. The operator needs execute-api:Invoke
+                          permission, NOT direct S3 access.
+
   JANITOR_WAREHOUSE_URL   gocloud.dev/blob URL of the warehouse bucket.
-                          Examples:
+                          Used only when JANITOR_API_URL is NOT set (local /
+                          standalone mode). Examples:
                             file:///tmp/warehouse
                             s3://my-warehouse?region=us-east-1
                             s3://warehouse?endpoint=http://localhost:9000&s3ForcePathStyle=true&region=us-east-1
-                            (for MinIO; AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY
-                             must be set in the environment)
 
 EXAMPLES:
   # local fileblob fixture
@@ -109,13 +131,17 @@ func runDiscover(args []string) error {
 		rootPrefix = args[0]
 	}
 
-	url := os.Getenv("JANITOR_WAREHOUSE_URL")
-	if url == "" {
-		return fmt.Errorf("JANITOR_WAREHOUSE_URL is not set")
-	}
-
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
+
+	if apiURL := os.Getenv("JANITOR_API_URL"); apiURL != "" {
+		return runDiscoverViaAPI(ctx, apiURL, rootPrefix)
+	}
+
+	url := os.Getenv("JANITOR_WAREHOUSE_URL")
+	if url == "" {
+		return fmt.Errorf("JANITOR_WAREHOUSE_URL is not set (and JANITOR_API_URL is not set either)")
+	}
 
 	bucket, err := blob.OpenBucket(ctx, url)
 	if err != nil {
@@ -133,6 +159,33 @@ func runDiscover(args []string) error {
 		return nil
 	}
 
+	maxPrefix := 0
+	for _, t := range tables {
+		if len(t.Prefix) > maxPrefix {
+			maxPrefix = len(t.Prefix)
+		}
+	}
+	fmt.Printf("%-*s  %-7s  %s\n", maxPrefix, "TABLE", "VERSION", "CURRENT METADATA")
+	fmt.Printf("%s  %s  %s\n", strings.Repeat("-", maxPrefix), "-------", strings.Repeat("-", 16))
+	for _, t := range tables {
+		fmt.Printf("%-*s  v%-6d  %s\n", maxPrefix, t.Prefix, t.CurrentVersion, t.CurrentMetadata)
+	}
+	return nil
+}
+
+func runDiscoverViaAPI(ctx context.Context, apiURL, prefix string) error {
+	client, err := newAPIClient(ctx, apiURL)
+	if err != nil {
+		return err
+	}
+	tables, err := client.ListTables(ctx, prefix)
+	if err != nil {
+		return err
+	}
+	if len(tables) == 0 {
+		fmt.Fprintln(os.Stderr, "no Iceberg tables found")
+		return nil
+	}
 	maxPrefix := 0
 	for _, t := range tables {
 		if len(t.Prefix) > maxPrefix {
@@ -239,6 +292,10 @@ func runAnalyze(args []string) error {
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 
+	if apiURL := os.Getenv("JANITOR_API_URL"); apiURL != "" {
+		return runAnalyzeViaAPI(ctx, apiURL, tablePath, jsonOut)
+	}
+
 	tbl, prefix, cleanup, err := resolveTable(ctx, tablePath)
 	if err != nil {
 		return err
@@ -256,6 +313,40 @@ func runAnalyze(args []string) error {
 		return enc.Encode(report)
 	}
 	printReport(prefix, report)
+	return nil
+}
+
+func runAnalyzeViaAPI(ctx context.Context, apiURL, tablePath string, jsonOut bool) error {
+	ident, err := tablePathToIdentifier(strings.Trim(tablePath, "/"))
+	if err != nil {
+		return err
+	}
+	if len(ident) != 2 {
+		return fmt.Errorf("API mode supports two-part identifiers (namespace, table); got %v", ident)
+	}
+	client, err := newAPIClient(ctx, apiURL)
+	if err != nil {
+		return err
+	}
+	data, err := client.Analyze(ctx, ident[0]+".db", ident[1])
+	if err != nil {
+		return err
+	}
+	if jsonOut {
+		var buf bytes.Buffer
+		json.Indent(&buf, data, "", "  ")
+		buf.WriteTo(os.Stdout)
+		fmt.Println()
+		return nil
+	}
+	// For non-JSON output, decode into HealthReport and use the standard printer.
+	var report analyzer.HealthReport
+	if err := json.Unmarshal(data, &report); err != nil {
+		// Fallback: just print the raw JSON.
+		fmt.Println(string(data))
+		return nil
+	}
+	printReport(tablePath, &report)
 	return nil
 }
 
@@ -385,8 +476,8 @@ func parsePartitionFilter(s string) (icebergpkg.BooleanExpression, map[string]an
 	return icebergpkg.EqualTo(icebergpkg.Reference(col), val), map[string]any{col: val}, nil
 }
 
-// runCompactViaAPI POSTs to a running janitor-server and prints the
-// returned CompactResult.
+// runCompactViaAPI POSTs to a running janitor-server with SigV4 auth
+// and prints the returned CompactResult.
 func runCompactViaAPI(ctx context.Context, apiURL, tablePath string) error {
 	ident, err := tablePathToIdentifier(strings.Trim(tablePath, "/"))
 	if err != nil {
@@ -395,25 +486,18 @@ func runCompactViaAPI(ctx context.Context, apiURL, tablePath string) error {
 	if len(ident) != 2 {
 		return fmt.Errorf("API mode currently supports only two-part identifiers (namespace, table); got %v", ident)
 	}
-	endpoint := strings.TrimRight(apiURL, "/") + fmt.Sprintf("/v1/tables/%s/%s/compact", ident[0], ident[1])
-	fmt.Printf("compacting %s (via API; %s)\n", tablePath, endpoint)
+	fmt.Printf("compacting %s (via API; %s)\n", tablePath, apiURL)
 
-	req, err := http.NewRequestWithContext(ctx, "POST", endpoint, nil)
+	client, err := newAPIClient(ctx, apiURL)
 	if err != nil {
 		return err
 	}
-	req.Header.Set("Accept", "application/json")
-	resp, err := http.DefaultClient.Do(req)
+	data, err := client.Compact(ctx, ident[0]+".db", ident[1])
 	if err != nil {
-		return fmt.Errorf("calling janitor-server: %w", err)
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode >= 400 {
-		body, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("janitor-server returned HTTP %d: %s", resp.StatusCode, string(body))
+		return err
 	}
 	var result janitor.CompactResult
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+	if err := json.Unmarshal(data, &result); err != nil {
 		return fmt.Errorf("decoding response: %w", err)
 	}
 	printCompactResult(tablePath, &result, nil)

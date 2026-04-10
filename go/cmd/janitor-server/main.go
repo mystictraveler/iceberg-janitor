@@ -48,11 +48,15 @@ import (
 	"github.com/mystictraveler/iceberg-janitor/go/pkg/analyzer"
 	"github.com/mystictraveler/iceberg-janitor/go/pkg/catalog"
 	"github.com/mystictraveler/iceberg-janitor/go/pkg/janitor"
+	"github.com/mystictraveler/iceberg-janitor/go/pkg/observe"
 )
 
 func main() {
 	logger := slog.New(slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
 	slog.SetDefault(logger)
+
+	shutdownTracer := observe.Init("janitor-server")
+	defer shutdownTracer()
 
 	listen := getenv("JANITOR_LISTEN", ":8080")
 	warehouseURL := os.Getenv("JANITOR_WAREHOUSE_URL")
@@ -77,6 +81,7 @@ func main() {
 		cat:     cat,
 		logger:  logger,
 		started: time.Now(),
+		jobs:    newJobStore(),
 	}
 
 	mux := http.NewServeMux()
@@ -84,7 +89,8 @@ func main() {
 	mux.HandleFunc("GET /v1/readyz", srv.handleReadyz)
 	mux.HandleFunc("GET /v1/tables", srv.handleListTables)
 	mux.HandleFunc("GET /v1/tables/{ns}/{name}/health", srv.handleAnalyze)
-	mux.HandleFunc("POST /v1/tables/{ns}/{name}/compact", srv.handleCompact)
+	mux.HandleFunc("POST /v1/tables/{ns}/{name}/compact", srv.handleCompactAsync)
+	mux.HandleFunc("GET /v1/jobs/{id}", srv.handleJobStatus)
 
 	httpServer := &http.Server{
 		Addr:              listen,
@@ -114,6 +120,7 @@ type server struct {
 	cat     *catalog.DirectoryCatalog
 	logger  *slog.Logger
 	started time.Time
+	jobs    *jobStore
 }
 
 // === handlers ===
