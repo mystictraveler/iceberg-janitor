@@ -93,6 +93,11 @@ func main() {
 			fmt.Fprintln(os.Stderr, "rewrite-manifests:", err)
 			os.Exit(1)
 		}
+	case "import":
+		if err := runImport(args); err != nil {
+			fmt.Fprintln(os.Stderr, "import:", err)
+			os.Exit(1)
+		}
 	case "pause":
 		if err := runPause(args); err != nil {
 			fmt.Fprintln(os.Stderr, "pause:", err)

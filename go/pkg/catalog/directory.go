@@ -14,6 +14,7 @@ import (
 	icebergcat "github.com/apache/iceberg-go/catalog"
 	icebergio "github.com/apache/iceberg-go/io"
 	icebergtable "github.com/apache/iceberg-go/table"
+	"github.com/google/uuid"
 	view "github.com/apache/iceberg-go/view"
 	"gocloud.dev/blob"
 	"gocloud.dev/gcerrors"
@@ -377,6 +378,12 @@ func identToPrefix(ident icebergtable.Identifier) string {
 // absoluteURL converts a warehouse URL plus a bucket-relative key into
 // the absolute URL iceberg-go's IO registry expects. file:// preserves
 // the path; s3:// keeps just the bucket name and appends the key.
+// AbsoluteURL resolves a relative blob key against the warehouse URL.
+// Exported for use by the import command.
+func AbsoluteURL(warehouseURL, key string) (string, error) {
+	return absoluteURL(warehouseURL, key)
+}
+
 func absoluteURL(warehouseURL, key string) (string, error) {
 	switch {
 	case strings.HasPrefix(warehouseURL, "file://"):
@@ -415,8 +422,82 @@ var errNotImplemented = errors.New("DirectoryCatalog: method not implemented in 
 // correct way to detect this case.
 var ErrCASConflict = errors.New("metadata commit CAS conflict: another writer won the v(N+1) race")
 
+// CreateTable builds an empty v2 Iceberg table at the standard
+// directory layout under the warehouse root. The initial metadata has
+// the provided schema and partition spec (from opts) but no data files
+// and no snapshot. The caller adds files via Transaction.AddFiles and
+// commits normally.
+//
+// Path layout:
+//
+//	<warehouse>/<ns>.db/<name>/metadata/v1.metadata.json
 func (c *DirectoryCatalog) CreateTable(ctx context.Context, identifier icebergtable.Identifier, schema *icebergpkg.Schema, opts ...icebergcat.CreateTableOpt) (*icebergtable.Table, error) {
-	return nil, errNotImplemented
+	cfg := icebergcat.CreateTableCfg{}
+	for _, o := range opts {
+		o(&cfg)
+	}
+
+	// Build the table location from the identifier.
+	// Convention: <warehouse>/<namespace>.db/<tablename>
+	if len(identifier) != 2 {
+		return nil, fmt.Errorf("CreateTable requires [namespace, table] identifier, got %v", identifier)
+	}
+	tablePrefix := fmt.Sprintf("%s.db/%s", identifier[0], identifier[1])
+	tableLoc, err := absoluteURL(c.warehouseURL, tablePrefix)
+	if err != nil {
+		return nil, fmt.Errorf("computing table location: %w", err)
+	}
+
+	builder, err := icebergtable.NewMetadataBuilder(2)
+	if err != nil {
+		return nil, fmt.Errorf("creating metadata builder: %w", err)
+	}
+	if err := builder.SetUUID(uuid.New()); err != nil {
+		return nil, err
+	}
+	if err := builder.SetLoc(tableLoc); err != nil {
+		return nil, err
+	}
+	if err := builder.AddSchema(schema); err != nil {
+		return nil, err
+	}
+	if err := builder.SetCurrentSchemaID(schema.ID); err != nil {
+		return nil, err
+	}
+	if cfg.PartitionSpec != nil {
+		if err := builder.AddPartitionSpec(cfg.PartitionSpec, true); err != nil {
+			return nil, err
+		}
+	} else {
+		if err := builder.AddPartitionSpec(icebergpkg.UnpartitionedSpec, true); err != nil {
+			return nil, err
+		}
+	}
+	builder.SetLastUpdatedMS()
+
+	meta, err := builder.Build()
+	if err != nil {
+		return nil, fmt.Errorf("building initial metadata: %w", err)
+	}
+
+	// Write v1.metadata.json. Use atomicWriteMetadataJSON so the
+	// same CAS contract holds even for the initial create.
+	provider, err := icebergtable.LoadLocationProvider(tableLoc, meta.Properties())
+	if err != nil {
+		return nil, fmt.Errorf("loading location provider: %w", err)
+	}
+	metaLoc, err := provider.NewTableMetadataFileLocation(1)
+	if err != nil {
+		return nil, fmt.Errorf("computing metadata location: %w", err)
+	}
+	if err := c.atomicWriteMetadataJSON(ctx, meta, metaLoc); err != nil {
+		return nil, fmt.Errorf("writing initial metadata: %w", err)
+	}
+
+	// Load and return the table through the normal path so the
+	// caller gets a fully-wired *Table with FS, catalog reference,
+	// etc.
+	return c.LoadTable(ctx, identifier)
 }
 
 func (c *DirectoryCatalog) ListTables(ctx context.Context, namespace icebergtable.Identifier) iter.Seq2[icebergtable.Identifier, error] {
