@@ -84,6 +84,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"math/rand"
 	"os"
 	"os/signal"
 	"strconv"
@@ -160,6 +161,8 @@ type config struct {
 	NumStreamBatches     int
 	TruncateTables       bool
 	SkipDimensions       bool
+	Bursty               bool
+	BurstMax             int
 	Seed                 uint64
 
 	S3Endpoint  string
@@ -232,6 +235,8 @@ func loadConfig() config {
 		NumStreamBatches:     getint("NUM_STREAM_BATCHES", 0),
 		TruncateTables:       getbool("TRUNCATE_TABLES", true),
 		SkipDimensions:       getbool("SKIP_DIMENSIONS", false),
+		Bursty:               getbool("BURSTY", false),
+		BurstMax:             getint("BURST_MAX", 10),
 		Seed:                 getuint64("SEED", 42),
 		S3Endpoint:           getenv("S3_ENDPOINT", ""),
 		S3AccessKey:          getenv("S3_ACCESS_KEY", ""),
@@ -384,6 +389,16 @@ func run(ctx context.Context, cfg config) error {
 		sleepBetween = time.Minute / time.Duration(cfg.CommitsPerMinute*len(factOrder))
 	}
 
+	// Bursty mode: instead of uniform spacing, fire bursts of 1-N
+	// commits with no delay, then sleep for a random quiet period
+	// drawn from an exponential distribution so the average rate
+	// stays at COMMITS_PER_MINUTE. This simulates real-world
+	// streaming where micro-batches arrive in clumps (e.g. a Kafka
+	// consumer draining a partition, or a cron job landing 5 files
+	// at once then going quiet).
+	burstRng := rand.New(rand.NewSource(int64(cfg.Seed + 999)))
+	burstRemaining := 0 // commits left in the current burst
+
 	started := time.Now()
 	deadline := time.Time{}
 	if cfg.DurationSeconds > 0 {
@@ -430,7 +445,31 @@ func run(ctx context.Context, cfg config) error {
 			nextProgress = time.Now().Add(progressEvery)
 		}
 
-		if sleepBetween > 0 {
+		if cfg.Bursty && sleepBetween > 0 {
+			burstRemaining--
+			if burstRemaining <= 0 {
+				// End of burst. Pick the next burst size and compute
+				// a quiet period. The quiet period is drawn from an
+				// exponential distribution with mean = burstSize ×
+				// sleepBetween, so the average throughput stays at
+				// COMMITS_PER_MINUTE. The exponential distribution
+				// naturally produces mostly-short and occasionally-
+				// long pauses — realistic for streaming workloads.
+				nextBurst := burstRng.Intn(cfg.BurstMax) + 1
+				meanQuiet := float64(nextBurst) * float64(sleepBetween)
+				quiet := time.Duration(burstRng.ExpFloat64() * meanQuiet)
+				if quiet > 30*time.Second {
+					quiet = 30 * time.Second // cap so the bench doesn't stall
+				}
+				burstRemaining = nextBurst
+				select {
+				case <-ctx.Done():
+					goto done
+				case <-time.After(quiet):
+				}
+			}
+			// Within a burst: no sleep, fire immediately.
+		} else if sleepBetween > 0 {
 			elapsed := time.Since(commitStart)
 			if remaining := sleepBetween - elapsed; remaining > 0 {
 				select {

@@ -4,11 +4,15 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	icebergpkg "github.com/apache/iceberg-go"
+	icebergio "github.com/apache/iceberg-go/io"
 	icebergtable "github.com/apache/iceberg-go/table"
+	"golang.org/x/sync/errgroup"
 
 	"github.com/mystictraveler/iceberg-janitor/go/pkg/catalog"
 	"github.com/mystictraveler/iceberg-janitor/go/pkg/observe"
@@ -310,6 +314,267 @@ func Compact(ctx context.Context, cat *catalog.DirectoryCatalog, ident icebergta
 		return result, runErr
 	}
 	return result, nil
+}
+
+// defaultTargetFileSizeBytes is used when neither the caller nor the
+// table property specifies a target. 128 MB matches the iceberg spec's
+// conventional floor and is what most query engines (DuckDB, Trino,
+// Spark) assume for "well-sized" parquet files.
+const defaultTargetFileSizeBytes int64 = 128 * 1024 * 1024
+
+// defaultTargetFileSize reads the iceberg standard table property
+// write.target-file-size-bytes and returns it as int64. If the
+// property is absent or unparseable, returns defaultTargetFileSizeBytes
+// (128 MB). This makes Pattern B opt-out rather than opt-in: any
+// iceberg-spec-compliant table is auto-compacted to its own target
+// without operator action.
+func defaultTargetFileSize(tbl *icebergtable.Table) int64 {
+	props := tbl.Metadata().Properties()
+	if v, ok := props["write.target-file-size-bytes"]; ok {
+		var n int64
+		if _, err := fmt.Sscanf(v, "%d", &n); err == nil && n > 0 {
+			return n
+		}
+	}
+	return defaultTargetFileSizeBytes
+}
+
+// compactTableConcurrency is the maximum number of partitions
+// compacted in parallel by CompactTable. Each partition compact is
+// a full CAS-retry loop with manifest walk + parquet read/write,
+// so this bounds the peak I/O and memory pressure.
+const compactTableConcurrency = 8
+
+// CompactTableResult aggregates the outcomes of compacting every
+// partition in a table. Each partition gets its own CompactResult.
+type CompactTableResult struct {
+	Identifier       icebergtable.Identifier `json:"identifier"`
+	PartitionsFound  int                     `json:"partitions_found"`
+	PartitionsToCompact int                  `json:"partitions_to_compact"`
+	PartitionsSucceeded int                  `json:"partitions_succeeded"`
+	PartitionsFailed int                     `json:"partitions_failed"`
+	PartitionResults []*CompactResult        `json:"partition_results,omitempty"`
+	TotalDurationMs  int64                   `json:"total_duration_ms"`
+}
+
+// CompactTable discovers all partitions with small files in the table
+// and compacts each in parallel via a bounded worker pool. This is the
+// "one call compacts the whole table" entry point used by the maintain
+// endpoint.
+//
+// The discovery walk reads the current snapshot's manifest entries,
+// groups them by partition tuple, and selects partitions that have at
+// least one file below TargetFileSizeBytes. Partitions where every
+// file is already at or above the threshold are skipped (nothing to
+// do — Pattern B would skip them anyway).
+//
+// Each selected partition is compacted via Compact() with the
+// partition tuple set, running up to compactTableConcurrency partitions
+// in parallel. A single partition failure does NOT abort the others;
+// all results are collected and returned.
+//
+// For unpartitioned tables or when TargetFileSizeBytes is 0 (whole-
+// table rewrite mode), CompactTable falls through to a single Compact()
+// call with no partition filter.
+func CompactTable(ctx context.Context, cat *catalog.DirectoryCatalog, ident icebergtable.Identifier, opts CompactOptions) (*CompactTableResult, error) {
+	opts.defaults()
+	started := time.Now()
+	result := &CompactTableResult{Identifier: ident}
+
+	// Load the table to discover its partition spec.
+	tbl, err := cat.LoadTable(ctx, ident)
+	if err != nil {
+		result.TotalDurationMs = time.Since(started).Milliseconds()
+		return result, fmt.Errorf("loading table %v: %w", ident, err)
+	}
+
+	// If no target file size was set by the caller, read the iceberg
+	// standard table property write.target-file-size-bytes. This is
+	// what Spark, Glue, and other compaction tools use. If the
+	// property isn't set either, default to 128MB — the iceberg spec's
+	// conventional floor for well-organized data files.
+	if opts.TargetFileSizeBytes == 0 {
+		opts.TargetFileSizeBytes = defaultTargetFileSize(tbl)
+	}
+
+	spec := tbl.Spec()
+	// Unpartitioned table or whole-table rewrite: single Compact call.
+	if spec.NumFields() == 0 || opts.TargetFileSizeBytes == 0 {
+		r, err := Compact(ctx, cat, ident, opts)
+		result.PartitionsFound = 1
+		result.PartitionsToCompact = 1
+		result.PartitionResults = []*CompactResult{r}
+		if err != nil {
+			result.PartitionsFailed = 1
+		} else {
+			result.PartitionsSucceeded = 1
+		}
+		result.TotalDurationMs = time.Since(started).Milliseconds()
+		return result, err
+	}
+
+	// Discover partitions with small files.
+	partitions, err := discoverSmallFilePartitions(ctx, tbl, spec, opts.TargetFileSizeBytes)
+	if err != nil {
+		result.TotalDurationMs = time.Since(started).Milliseconds()
+		return result, fmt.Errorf("discovering partitions: %w", err)
+	}
+	result.PartitionsFound = len(partitions)
+	if len(partitions) == 0 {
+		result.TotalDurationMs = time.Since(started).Milliseconds()
+		return result, nil
+	}
+	result.PartitionsToCompact = len(partitions)
+
+	// Compact each partition in parallel.
+	var mu sync.Mutex
+	g, gctx := errgroup.WithContext(ctx)
+	g.SetLimit(compactTableConcurrency)
+	for _, pt := range partitions {
+		pt := pt
+		g.Go(func() error {
+			if gctx.Err() != nil {
+				return nil // context canceled, skip
+			}
+			partOpts := opts
+			partOpts.PartitionTuple = pt
+			r, err := Compact(gctx, cat, ident, partOpts)
+			mu.Lock()
+			result.PartitionResults = append(result.PartitionResults, r)
+			if err != nil {
+				result.PartitionsFailed++
+			} else {
+				result.PartitionsSucceeded++
+			}
+			mu.Unlock()
+			return nil // don't propagate — we want all partitions to run
+		})
+	}
+	_ = g.Wait()
+	result.TotalDurationMs = time.Since(started).Milliseconds()
+	return result, nil
+}
+
+// discoverSmallFilePartitions walks the current snapshot's data files
+// and returns the set of distinct partition tuples that have at least
+// one file smaller than targetSize bytes. Each returned map is a
+// PartitionTuple suitable for passing to CompactOptions.
+func discoverSmallFilePartitions(ctx context.Context, tbl *icebergtable.Table, spec icebergpkg.PartitionSpec, targetSize int64) ([]map[string]string, error) {
+	snap := tbl.CurrentSnapshot()
+	if snap == nil {
+		return nil, nil
+	}
+	fs, err := tbl.FS(ctx)
+	if err != nil {
+		return nil, err
+	}
+	manifests, err := snap.Manifests(fs)
+	if err != nil {
+		return nil, err
+	}
+
+	// Build a reverse map: partition field id → source column name.
+	schema := tbl.Metadata().CurrentSchema()
+	fieldIDToName := buildFieldIDToName(spec, schema)
+
+	// Collect partition tuples that have at least one small file.
+	seen := map[partKey]map[string]string{}
+	hasSmall := map[partKey]bool{}
+
+	for _, m := range manifests {
+		if m.ManifestContent() != icebergpkg.ManifestContentData {
+			continue
+		}
+		entries, err := readManifestEntries(ctx, fs, m)
+		if err != nil {
+			continue // skip unreadable manifests
+		}
+		for _, e := range entries {
+			df := e.DataFile()
+			if df == nil || df.ContentType() != icebergpkg.EntryContentData {
+				continue
+			}
+			key := canonicalKey(df.Partition())
+			if _, ok := seen[key]; !ok {
+				seen[key] = partitionToTuple(df.Partition(), fieldIDToName)
+			}
+			if df.FileSizeBytes() < targetSize {
+				hasSmall[key] = true
+			}
+		}
+	}
+
+	// Collect only partitions that have small files.
+	result := make([]map[string]string, 0, len(hasSmall))
+	for key := range hasSmall {
+		if tuple, ok := seen[key]; ok && len(tuple) > 0 {
+			result = append(result, tuple)
+		}
+	}
+	// Sort for determinism.
+	sort.Slice(result, func(i, j int) bool {
+		return fmt.Sprint(result[i]) < fmt.Sprint(result[j])
+	})
+	return result, nil
+}
+
+// buildFieldIDToName returns a map from partition field ID to the
+// source column name in the schema, used to construct PartitionTuple
+// maps keyed by column name.
+func buildFieldIDToName(spec icebergpkg.PartitionSpec, schema *icebergpkg.Schema) map[int]string {
+	out := map[int]string{}
+	for f := range spec.Fields() {
+		srcField, ok := schema.FindFieldByID(f.SourceID)
+		if ok {
+			out[f.FieldID] = srcField.Name
+		}
+	}
+	return out
+}
+
+// partitionToTuple converts a DataFile.Partition() map[int]any into
+// a PartitionTuple map[string]string keyed by column name with
+// string-encoded values.
+func partitionToTuple(p map[int]any, fieldIDToName map[int]string) map[string]string {
+	out := map[string]string{}
+	for fid, val := range p {
+		if name, ok := fieldIDToName[fid]; ok {
+			out[name] = fmt.Sprint(val)
+		}
+	}
+	return out
+}
+
+// canonicalKey produces a stable string key for a partition map,
+// used for deduplication during discovery.
+func canonicalKey(p map[int]any) partKey {
+	keys := make([]int, 0, len(p))
+	for k := range p {
+		keys = append(keys, k)
+	}
+	sort.Ints(keys)
+	var b strings.Builder
+	for i, k := range keys {
+		if i > 0 {
+			b.WriteByte('|')
+		}
+		fmt.Fprintf(&b, "%d=%v", k, p[k])
+	}
+	return partKey(b.String())
+}
+
+// partKey is a canonical string encoding of a partition tuple, used
+// only for dedup during partition discovery.
+type partKey string
+
+func readManifestEntries(ctx context.Context, fs icebergio.IO, m icebergpkg.ManifestFile) ([]icebergpkg.ManifestEntry, error) {
+	mf, err := fs.Open(m.FilePath())
+	if err != nil {
+		return nil, err
+	}
+	entries, err := icebergpkg.ReadManifest(m, mf, true)
+	mf.Close()
+	return entries, err
 }
 
 // SnapshotFileStats walks the current snapshot's manifests and returns

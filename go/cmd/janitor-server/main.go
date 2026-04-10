@@ -90,6 +90,9 @@ func main() {
 	mux.HandleFunc("GET /v1/tables", srv.handleListTables)
 	mux.HandleFunc("GET /v1/tables/{ns}/{name}/health", srv.handleAnalyze)
 	mux.HandleFunc("POST /v1/tables/{ns}/{name}/compact", srv.handleCompactAsync)
+	mux.HandleFunc("POST /v1/tables/{ns}/{name}/expire", srv.handleExpireAsync)
+	mux.HandleFunc("POST /v1/tables/{ns}/{name}/rewrite-manifests", srv.handleRewriteManifestsAsync)
+	mux.HandleFunc("POST /v1/tables/{ns}/{name}/maintain", srv.handleMaintainAsync)
 	mux.HandleFunc("GET /v1/jobs/{id}", srv.handleJobStatus)
 
 	httpServer := &http.Server{

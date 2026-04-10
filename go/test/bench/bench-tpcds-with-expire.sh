@@ -129,8 +129,9 @@ cleanup() {
   log "shutting down streamers..."
   [[ -n "${PID_WITH:-}" ]] && kill "$PID_WITH" 2>/dev/null || true
   [[ -n "${PID_WITHOUT:-}" ]] && kill "$PID_WITHOUT" 2>/dev/null || true
+  [[ -n "${JANITOR_SERVER_PID:-}" ]] && kill "$JANITOR_SERVER_PID" 2>/dev/null || true
   wait 2>/dev/null || true
-  log "streamers stopped"
+  log "streamers + server stopped"
 }
 trap cleanup EXIT INT TERM
 
@@ -151,6 +152,7 @@ fi
 cd "$GO_DIR"
 log "building Go binaries"
 go build -o /tmp/janitor-cli-b ./cmd/janitor-cli
+go build -o /tmp/janitor-server-b ./cmd/janitor-server
 go build -tags bench -o /tmp/janitor-streamer-b ./test/bench/streamer
 
 # === Phase 1: kick off two streamers in the background ===
@@ -429,50 +431,113 @@ EOF
 ## the freshly-streamed small files at the tail get rewritten. This
 ## bounds the per-round read cost to ~the streaming delta, eliminating
 ## the writer-fight pathology that surfaced as 222s/12-retries on
-## store_sales round 3 in run 9. Override via TARGET_FILE_SIZE env var.
-TARGET_FILE_SIZE="${TARGET_FILE_SIZE:-1MB}"
+## store_sales round 3 in run 9.
+##
+## Default: empty (let CompactTable read write.target-file-size-bytes
+## from the table's iceberg properties, falling back to 128MB).
+## Override via TARGET_FILE_SIZE env var (e.g. TARGET_FILE_SIZE=1MB
+## for micro-bench workloads).
+TARGET_FILE_SIZE="${TARGET_FILE_SIZE:-}"
 
-COMPACT_ROUND=0
-# Every Nth maintenance round, also run expire + rewrite-manifests
-# on each fact table. The default of 5 means at 30s maintenance
-# interval expire/rewrite fires every 2.5 minutes — frequent enough
-# to bound metadata accumulation in a 30-min bench, infrequent
-# enough that the per-call cost (~1-2s per table) doesn't dominate.
-EXPIRE_REWRITE_INTERVAL="${EXPIRE_REWRITE_INTERVAL:-5}"
-EXPIRE_KEEP_LAST="${EXPIRE_KEEP_LAST:-3}"
+## janitor-server setup
+##
+## Instead of invoking janitor-cli per-op, this bench starts a local
+## janitor-server and calls the /v1/tables/{ns}/{name}/maintain endpoint
+## which runs the full cycle: expire → rewrite-manifests → compact →
+## rewrite-manifests (post-compact). Each cycle starts from the clean
+## metadata the previous cycle left so the cost is O(delta), not O(table).
+
+JANITOR_LISTEN="${JANITOR_LISTEN:-127.0.0.1:8099}"
+EXPIRE_KEEP_LAST="${EXPIRE_KEEP_LAST:-1}"
 EXPIRE_KEEP_WITHIN="${EXPIRE_KEEP_WITHIN:-1m}"
 
+log "starting janitor-server on ${JANITOR_LISTEN}"
+JANITOR_WAREHOUSE_URL="$WH_WITH_URL" \
+JANITOR_LISTEN="${JANITOR_LISTEN}" \
+S3_ENDPOINT="${S3_ENDPOINT:-}" \
+S3_REGION="${S3_REGION:-${AWS_REGION:-us-east-1}}" \
+/tmp/janitor-server-b >> "$JANITOR_LOG" 2>&1 &
+JANITOR_SERVER_PID=$!
+log "janitor-server PID=$JANITOR_SERVER_PID"
+
+# Wait for server readiness
+for i in $(seq 1 30); do
+  if curl -sf "http://${JANITOR_LISTEN}/v1/healthz" >/dev/null 2>&1; then
+    log "janitor-server ready"
+    break
+  fi
+  sleep 1
+done
+
+## call_maintain posts to the maintain endpoint for one table and polls
+## until the async job completes. Returns 0 on success, 1 on failure.
+call_maintain() {
+  local ns_name="$1"     # e.g. "tpcds.db/store_sales"
+  local partition="$2"   # e.g. "ss_store_sk=5"
+
+  local ns table
+  ns="${ns_name%%/*}"    # tpcds.db
+  table="${ns_name#*/}"  # store_sales
+
+  local url="http://${JANITOR_LISTEN}/v1/tables/${ns}/${table}/maintain"
+  url="${url}?keep_last=${EXPIRE_KEEP_LAST}&keep_within=${EXPIRE_KEEP_WITHIN}"
+  if [[ -n "$partition" ]]; then
+    url="${url}&partition=${partition}"
+  fi
+  if [[ -n "$TARGET_FILE_SIZE" ]]; then
+    url="${url}&target_file_size=${TARGET_FILE_SIZE}"
+  fi
+
+  # POST → 202 Accepted with {"job_id": "..."}
+  local resp
+  resp=$(curl -sf -X POST "$url" 2>>"$JANITOR_LOG")
+  if [[ -z "$resp" ]]; then
+    echo "maintain POST failed for $ns_name" >> "$JANITOR_LOG"
+    return 1
+  fi
+  local job_id
+  job_id=$(echo "$resp" | python3 -c "import sys,json; print(json.load(sys.stdin).get('job_id',''))" 2>/dev/null)
+  if [[ -z "$job_id" ]]; then
+    echo "no job_id in response: $resp" >> "$JANITOR_LOG"
+    return 1
+  fi
+
+  # Poll until done (max 5 min)
+  local poll_url="http://${JANITOR_LISTEN}/v1/jobs/${job_id}"
+  for i in $(seq 1 300); do
+    local status_resp
+    status_resp=$(curl -sf "$poll_url" 2>/dev/null)
+    local status
+    status=$(echo "$status_resp" | python3 -c "import sys,json; print(json.load(sys.stdin).get('status',''))" 2>/dev/null)
+    case "$status" in
+      completed) return 0 ;;
+      failed)
+        echo "maintain job $job_id failed: $status_resp" >> "$JANITOR_LOG"
+        return 1 ;;
+      pending|running) sleep 1 ;;
+      *)
+        echo "unexpected job status: $status_resp" >> "$JANITOR_LOG"
+        return 1 ;;
+    esac
+  done
+  echo "maintain job $job_id timed out" >> "$JANITOR_LOG"
+  return 1
+}
+
+COMPACT_ROUND=0
 run_janitor_compact() {
-  local warehouse_url="$1"
+  local warehouse_url="$1"  # unused — server is pre-configured with warehouse
   COMPACT_ROUND=$((COMPACT_ROUND + 1))
   local ss_part=$(( (COMPACT_ROUND % 50) + 1 ))
   local sr_part=$(( (COMPACT_ROUND % 50) + 1 ))
   local cs_part=$(( (COMPACT_ROUND % 10) + 1 ))
-  log "running janitor compact (round ${COMPACT_ROUND}: ss_store_sk=${ss_part}, sr_store_sk=${sr_part}, cs_call_center_sk=${cs_part}; target=${TARGET_FILE_SIZE})"
-  JANITOR_WAREHOUSE_URL="$warehouse_url" /tmp/janitor-cli-b compact "${NAMESPACE}.db/store_sales" --partition "ss_store_sk=${ss_part}" --target-file-size "${TARGET_FILE_SIZE}" \
-    >> "$JANITOR_LOG" 2>&1 || log "  warning: compact store_sales partition returned non-zero"
-  JANITOR_WAREHOUSE_URL="$warehouse_url" /tmp/janitor-cli-b compact "${NAMESPACE}.db/store_returns" --partition "sr_store_sk=${sr_part}" --target-file-size "${TARGET_FILE_SIZE}" \
-    >> "$JANITOR_LOG" 2>&1 || log "  warning: compact store_returns partition returned non-zero"
-  JANITOR_WAREHOUSE_URL="$warehouse_url" /tmp/janitor-cli-b compact "${NAMESPACE}.db/catalog_sales" --partition "cs_call_center_sk=${cs_part}" --target-file-size "${TARGET_FILE_SIZE}" \
-    >> "$JANITOR_LOG" 2>&1 || log "  warning: compact catalog_sales partition returned non-zero"
-
-  # Periodic metadata maintenance: bound the snapshot list and the
-  # per-snapshot manifest count by running expire + rewrite-manifests
-  # every Nth round. This is the closed loop of issue #7: compact
-  # creates a snapshot every round, and the surviving snapshot's
-  # manifest list grows because each compact rewrites only one
-  # partition's manifests while leaving the others alone. expire
-  # drops the old snapshots; rewrite-manifests consolidates the
-  # surviving snapshot's micro-manifests into one per partition.
-  if (( COMPACT_ROUND % EXPIRE_REWRITE_INTERVAL == 0 )); then
-    log "running janitor expire+rewrite-manifests (round ${COMPACT_ROUND}: every ${EXPIRE_REWRITE_INTERVAL} compact rounds)"
-    for tbl in store_sales store_returns catalog_sales; do
-      JANITOR_WAREHOUSE_URL="$warehouse_url" /tmp/janitor-cli-b expire "${NAMESPACE}.db/${tbl}" --keep-last "${EXPIRE_KEEP_LAST}" --keep-within "${EXPIRE_KEEP_WITHIN}" \
-        >> "$JANITOR_LOG" 2>&1 || log "  warning: expire ${tbl} returned non-zero"
-      JANITOR_WAREHOUSE_URL="$warehouse_url" /tmp/janitor-cli-b rewrite-manifests "${NAMESPACE}.db/${tbl}" \
-        >> "$JANITOR_LOG" 2>&1 || log "  warning: rewrite-manifests ${tbl} returned non-zero"
-    done
-  fi
+  log "running janitor maintain (round ${COMPACT_ROUND}: ss_store_sk=${ss_part}, sr_store_sk=${sr_part}, cs_call_center_sk=${cs_part}; target=${TARGET_FILE_SIZE})"
+  call_maintain "${NAMESPACE}.db/store_sales" "ss_store_sk=${ss_part}" \
+    || log "  warning: maintain store_sales returned non-zero"
+  call_maintain "${NAMESPACE}.db/store_returns" "sr_store_sk=${sr_part}" \
+    || log "  warning: maintain store_returns returned non-zero"
+  call_maintain "${NAMESPACE}.db/catalog_sales" "cs_call_center_sk=${cs_part}" \
+    || log "  warning: maintain catalog_sales returned non-zero"
 }
 
 # === Phase 3: main loop ===

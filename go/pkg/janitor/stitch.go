@@ -183,11 +183,11 @@ func stitchParquetFiles(ctx context.Context, fs icebergio.IO, srcPaths []string,
 					outMD.DictionaryPageOffset = srcMD.DictionaryPageOffset + delta
 				}
 				if srcMD.IndexPageOffset > 0 {
-					// We don't copy index pages in v2, so this would be
-					// dangling. Zero it out.
-					outMD.IndexPageOffset = 0
+					outMD.IndexPageOffset = 0 // not yet copied; zeroed to avoid dangling
 				}
-				// Drop bloom filter offset/length too (we don't copy bloom filter bytes).
+				// Bloom filter and indexes are copied in a second pass
+				// below; zero the offsets here so they don't dangle if
+				// the second pass skips them.
 				outMD.BloomFilterOffset = 0
 				outMD.BloomFilterLength = 0
 
@@ -199,6 +199,49 @@ func stitchParquetFiles(ctx context.Context, fs icebergio.IO, srcPaths []string,
 				outRG.Columns[colIdx] = outCC
 
 				rgTotalCompressed += length
+			}
+
+			// Second pass: copy bloom filters, column indexes, and
+			// offset indexes for each column in this row group. These
+			// are stored at separate file offsets from the column chunk
+			// data and need their own offset translation. Readers
+			// locate them by the offsets in the footer metadata, so
+			// the exact position in the output file doesn't matter as
+			// long as the offsets are correct.
+			for colIdx := range srcRG.Columns {
+				srcCC := &srcRG.Columns[colIdx]
+				srcMD := srcCC.MetaData
+
+				// Bloom filter.
+				if srcMD.BloomFilterOffset > 0 && srcMD.BloomFilterLength > 0 {
+					bf := make([]byte, srcMD.BloomFilterLength)
+					n, rerr := src.readerAt.ReadAt(bf, srcMD.BloomFilterOffset)
+					if rerr == nil && int32(n) == srcMD.BloomFilterLength {
+						newOff := wc.offset
+						if _, werr := wc.Write(bf); werr == nil {
+							outRG.Columns[colIdx].MetaData.BloomFilterOffset = newOff
+							outRG.Columns[colIdx].MetaData.BloomFilterLength = srcMD.BloomFilterLength
+						}
+					}
+				}
+
+				// Column indexes and offset indexes are stripped for now.
+				// parquet-go's OpenFile auto-validates page indexes on
+				// read, and the offset translation interacts poorly
+				// with the internal validation. The per-row-group
+				// column statistics (min/max/null_count in
+				// ColumnChunk.MetaData.Statistics) ARE preserved by
+				// the byte copy, and iceberg reads stats from manifest
+				// entries — so stripping page indexes doesn't affect
+				// correctness or iceberg-level query planning. It
+				// loses intra-file predicate pushdown for readers
+				// that use page indexes (DuckDB, Spark). Follow-up:
+				// recompute page indexes from the copied per-page
+				// stats rather than byte-copying them.
+				outRG.Columns[colIdx].ColumnIndexOffset = 0
+				outRG.Columns[colIdx].ColumnIndexLength = 0
+				outRG.Columns[colIdx].OffsetIndexOffset = 0
+				outRG.Columns[colIdx].OffsetIndexLength = 0
 			}
 
 			outRG.TotalCompressedSize = rgTotalCompressed
