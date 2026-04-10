@@ -127,7 +127,10 @@ func runImport(args []string) error {
 	}
 
 	// Convert arrow schema to iceberg schema.
-	icebergSchema, err := icebergtable.ArrowSchemaToIceberg(schema, false, nil)
+	// Use WithFreshIDs because parquet files from non-iceberg writers
+	// typically don't carry arrow field IDs. Fresh IDs are safe
+	// because this is a new table with no prior schema history.
+	icebergSchema, err := icebergtable.ArrowSchemaToIcebergWithFreshIDs(schema, false)
 	if err != nil {
 		return fmt.Errorf("converting schema: %w", err)
 	}

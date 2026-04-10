@@ -468,10 +468,23 @@ func (c *DirectoryCatalog) CreateTable(ctx context.Context, identifier icebergta
 		if err := builder.AddPartitionSpec(cfg.PartitionSpec, true); err != nil {
 			return nil, err
 		}
+		if err := builder.SetDefaultSpecID(cfg.PartitionSpec.ID()); err != nil {
+			return nil, err
+		}
 	} else {
 		if err := builder.AddPartitionSpec(icebergpkg.UnpartitionedSpec, true); err != nil {
 			return nil, err
 		}
+		if err := builder.SetDefaultSpecID(icebergpkg.UnpartitionedSpec.ID()); err != nil {
+			return nil, err
+		}
+	}
+	// v2 requires a default sort order. Add the unsorted order.
+	if err := builder.AddSortOrder(&icebergtable.UnsortedSortOrder); err != nil {
+		return nil, err
+	}
+	if err := builder.SetDefaultSortOrderID(icebergtable.UnsortedSortOrder.OrderID()); err != nil {
+		return nil, err
 	}
 	builder.SetLastUpdatedMS()
 
