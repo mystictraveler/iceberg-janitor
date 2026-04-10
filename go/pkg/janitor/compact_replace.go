@@ -18,7 +18,10 @@ import (
 	"github.com/google/uuid"
 	"golang.org/x/sync/errgroup"
 
+	"go.opentelemetry.io/otel/attribute"
+
 	"github.com/mystictraveler/iceberg-janitor/go/pkg/catalog"
+	"github.com/mystictraveler/iceberg-janitor/go/pkg/observe"
 	"github.com/mystictraveler/iceberg-janitor/go/pkg/safety"
 )
 
@@ -110,7 +113,14 @@ const parquetReadConcurrency = 32
 // for this reason and the unpartitioned-table guard rejects
 // --partition on tables with no partition spec.
 func compactOnce(ctx context.Context, cat *catalog.DirectoryCatalog, ident icebergtable.Identifier, opts CompactOptions, result *CompactResult) error {
+	tr := observe.Tracer("janitor.compact")
+	ctx, span := tr.Start(ctx, "compactOnce")
+	span.SetAttributes(observe.Table(ident[0], ident[1]), observe.Attempt(result.Attempts))
+	defer span.End()
+
+	ctx, loadSpan := tr.Start(ctx, "load_table")
 	tbl, err := cat.LoadTable(ctx, ident)
+	loadSpan.End()
 	if err != nil {
 		return fmt.Errorf("loading table %v: %w", ident, err)
 	}
@@ -152,10 +162,13 @@ func compactOnce(ctx context.Context, cat *catalog.DirectoryCatalog, ident icebe
 	matchPart := buildPartitionMatcher(partitionBindings)
 	matchManifest := buildManifestPredicate(partitionBindings)
 
+	ctx, walkSpan := tr.Start(ctx, "manifest_walk")
 	manifests, err := snap.Manifests(fs)
 	if err != nil {
+		walkSpan.End()
 		return fmt.Errorf("listing manifests: %w", err)
 	}
+	walkSpan.SetAttributes(observe.Manifests(len(manifests)))
 
 	// Bounded-concurrency manifest read. Sequential reads of N
 	// manifests cost N round-trips, which on S3 (~20 ms each) becomes
@@ -240,6 +253,9 @@ func compactOnce(ctx context.Context, cat *catalog.DirectoryCatalog, ident icebe
 		oldPaths = append(oldPaths, r.paths...)
 		expectedRows += r.rows
 	}
+	walkSpan.SetAttributes(observe.Files(len(oldPaths)), observe.Rows(expectedRows))
+	walkSpan.End()
+
 	if len(oldPaths) == 0 {
 		return nil // nothing to compact
 	}
@@ -299,9 +315,13 @@ func compactOnce(ctx context.Context, cat *catalog.DirectoryCatalog, ident icebe
 		}
 		rowsWritten = 0
 
+		ctx, stitchSpan := tr.Start(ctx, "stitch_write_fallback")
+		stitchSpan.SetAttributes(observe.Files(len(oldPaths)))
+
 		pqProps := parquet.NewWriterProperties(parquet.WithStats(true))
 		pqWriter, perr := pqarrow.NewFileWriter(writeSchema, out, pqProps, pqarrow.DefaultWriterProps())
 		if perr != nil {
+			stitchSpan.End()
 			_ = wfs.Remove(newFilePath)
 			return fmt.Errorf("creating parquet writer: %w", perr)
 		}
@@ -344,13 +364,17 @@ func compactOnce(ctx context.Context, cat *catalog.DirectoryCatalog, ident icebe
 			})
 		}
 		if err := g2.Wait(); err != nil {
+			stitchSpan.End()
 			cleanup()
 			return err
 		}
 		if err := pqWriter.Close(); err != nil {
+			stitchSpan.End()
 			_ = wfs.Remove(newFilePath)
 			return fmt.Errorf("closing parquet writer: %w", err)
 		}
+		stitchSpan.SetAttributes(observe.Rows(rowsWritten))
+		stitchSpan.End()
 	} else {
 		// Stitching path succeeded. Close the output writer (the
 		// stitch helper itself doesn't close it because it doesn't
@@ -386,17 +410,26 @@ func compactOnce(ctx context.Context, cat *catalog.DirectoryCatalog, ident icebe
 	}
 
 	// Step 6: master check (mandatory, unchanged).
+	ctx, verifySpan := tr.Start(ctx, "master_check")
 	verification, err := safety.VerifyCompactionConsistency(ctx, tbl, staged, cat.Props())
 	result.Verification = verification
 	if err != nil {
+		verifySpan.RecordError(err)
+		verifySpan.End()
 		return err
 	}
+	verifySpan.SetAttributes(attribute.String("result", verification.Overall))
+	verifySpan.End()
 
 	// Step 7: commit.
+	_, commitSpan := tr.Start(ctx, "cas_commit")
 	newTbl, err := tx.Commit(ctx)
 	if err != nil {
+		commitSpan.RecordError(err)
+		commitSpan.End()
 		return err
 	}
+	commitSpan.End()
 
 	if newSnap := newTbl.CurrentSnapshot(); newSnap != nil {
 		result.AfterSnapshotID = newSnap.SnapshotID

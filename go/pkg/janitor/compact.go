@@ -11,6 +11,7 @@ import (
 	icebergtable "github.com/apache/iceberg-go/table"
 
 	"github.com/mystictraveler/iceberg-janitor/go/pkg/catalog"
+	"github.com/mystictraveler/iceberg-janitor/go/pkg/observe"
 	"github.com/mystictraveler/iceberg-janitor/go/pkg/safety"
 )
 
@@ -225,6 +226,11 @@ type CompactResult struct {
 // concurrent producer load — see the doc comment on compactOnce in
 // compact_replace.go for the full story.
 func Compact(ctx context.Context, cat *catalog.DirectoryCatalog, ident icebergtable.Identifier, opts CompactOptions) (*CompactResult, error) {
+	tr := observe.Tracer("janitor.compact")
+	ctx, span := tr.Start(ctx, "Compact")
+	span.SetAttributes(observe.Table(ident[0], ident[1]))
+	defer span.End()
+
 	opts.defaults()
 	started := time.Now()
 	result := &CompactResult{Identifier: ident}
