@@ -41,6 +41,26 @@ func IsPaused(err error) bool {
 	return errors.As(err, &pe)
 }
 
+// SkippedError is returned when a soft circuit breaker fires. Unlike
+// PausedError, the table is NOT paused — the janitor simply skips
+// this particular compaction because a future run is likely to do
+// meaningful work (e.g. after more files accumulate or after the
+// daily budget resets). The caller should log it and move on.
+type SkippedError struct {
+	TableUUID string
+	Reason    string
+}
+
+func (e *SkippedError) Error() string {
+	return fmt.Sprintf("table %s skipped: %s", e.TableUUID, e.Reason)
+}
+
+// IsSkipped reports whether err wraps a SkippedError.
+func IsSkipped(err error) bool {
+	var se *SkippedError
+	return errors.As(err, &se)
+}
+
 // CircuitBreaker enforces the eleven safety rules from the design plan.
 // All eleven are now implemented:
 //
@@ -424,65 +444,74 @@ func (cb *CircuitBreaker) RecordCompactOutcome(ctx context.Context, tableUUID st
 		s.RecordFailure(now, outcome.Err.Error())
 	}
 
-	// Evaluate all CBs.
+	// Evaluate all CBs. Split into:
+	//   fatal  → writes pause file, requires operator intervention
+	//   soft   → returns SkippedError, next run can retry
+	//   info   → logged only, no action
 	evalStart := time.Now()
-	var pauseReasons []string
+	var fatalReasons []string
+	var softReasons []string
 
-	// CB8: consecutive failures.
+	// CB8 (fatal): consecutive failures — structural problem.
 	if outcome.Err != nil && s.ConsecutiveFailedRuns >= cb.threshold() {
-		pauseReasons = append(pauseReasons, fmt.Sprintf("cb8_consecutive_failure: %d consecutive failed runs", s.ConsecutiveFailedRuns))
+		fatalReasons = append(fatalReasons, fmt.Sprintf("cb8_consecutive_failure: %d consecutive failed runs", s.ConsecutiveFailedRuns))
 		cost.ChecksFired++
 	}
 
-	// CB2: loop detection.
+	// CB2 (fatal): loop detection — feedback loop with external writer.
 	if reason := cb.checkCB2(s, outcome); reason != "" {
-		pauseReasons = append(pauseReasons, reason)
+		fatalReasons = append(fatalReasons, reason)
 		cost.ChecksFired++
 	}
 
-	// CB3: metadata ratio.
-	if _, pauseReason := cb.checkCB3(outcome); pauseReason != "" {
-		pauseReasons = append(pauseReasons, pauseReason)
+	// CB3: metadata ratio. Pause threshold (50%) is fatal; warn/critical are soft.
+	if warn, pauseReason := cb.checkCB3(outcome); pauseReason != "" {
+		fatalReasons = append(fatalReasons, pauseReason)
+		cost.ChecksFired++
+	} else if warn != "" {
+		softReasons = append(softReasons, warn)
 		cost.ChecksFired++
 	}
 
-	// CB4: effectiveness floor (informational, no pause).
+	// CB4 (soft): no effectiveness — skip, more files may accumulate.
 	if reason := cb.checkCB4(outcome); reason != "" {
+		softReasons = append(softReasons, reason)
 		cost.ChecksFired++
 	}
 
-	// CB7: daily byte budget.
+	// CB7 (soft): daily budget exceeded — skip, resets tomorrow.
 	if reason := cb.checkCB7(s, outcome); reason != "" {
-		pauseReasons = append(pauseReasons, reason)
+		softReasons = append(softReasons, reason)
 		cost.ChecksFired++
 	}
 
-	// CB9: lifetime rewrite ratio.
+	// CB9 (fatal): lifetime rewrite ratio — misconfigured aggressive compaction.
 	if reason := cb.checkCB9(s, outcome); reason != "" {
-		pauseReasons = append(pauseReasons, reason)
+		fatalReasons = append(fatalReasons, reason)
 		cost.ChecksFired++
 	}
 
-	// CB11: ROI estimate (informational for now).
+	// CB11 (soft): low ROI — skip, more files may accumulate to improve ROI.
 	if reason := cb.checkCB11(outcome); reason != "" {
+		softReasons = append(softReasons, reason)
 		cost.ChecksFired++
 	}
 
 	cost.EvalChecksMs = time.Since(evalStart).Milliseconds()
 
-	// Save state.
+	// Save state (always — CB2/CB7/CB9 updated counters).
 	saveStart := time.Now()
 	if err := state.Save(ctx, cb.Bucket, s); err != nil {
 		return cost, fmt.Errorf("circuit breaker: save state: %w", err)
 	}
 	cost.SaveStateMs = time.Since(saveStart).Milliseconds()
 
-	// Write pause file if any CB tripped.
-	if len(pauseReasons) > 0 {
+	// Fatal CBs → write pause file, return PausedError.
+	if len(fatalReasons) > 0 {
 		pauseStart := time.Now()
 		pause := &state.PauseFile{
 			TableUUID:   tableUUID,
-			Reason:      strings.Join(pauseReasons, "; "),
+			Reason:      strings.Join(fatalReasons, "; "),
 			TriggeredAt: now,
 			TriggeredBy: cb.triggeredBy(),
 			LastErrors:  append([]state.ErrorRecord(nil), s.LastErrors...),
@@ -492,6 +521,15 @@ func (cb *CircuitBreaker) RecordCompactOutcome(ctx context.Context, tableUUID st
 		}
 		cost.SavePauseMs = time.Since(pauseStart).Milliseconds()
 		cost.PauseTriggered = true
+	}
+
+	// Soft CBs → return SkippedError (no pause file, next run retries).
+	if len(fatalReasons) == 0 && len(softReasons) > 0 {
+		cost.TotalMs = time.Since(totalStart).Milliseconds()
+		return cost, &SkippedError{
+			TableUUID: tableUUID,
+			Reason:    strings.Join(softReasons, "; "),
+		}
 	}
 
 	cost.TotalMs = time.Since(totalStart).Milliseconds()
