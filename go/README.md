@@ -55,3 +55,34 @@ make mvp-query-local       # DuckDB round-trip verification
 ```
 
 For the same loop against MinIO over docker compose, replace `-local` with the docker variants (`mvp-up`, `mvp-seed`, `mvp-discover`, `mvp-analyze`).
+
+## Schema evolution and compaction
+
+Iceberg tables can evolve their schema over time — columns added, renamed, widened, or dropped. Each schema version is recorded in the table metadata, and each data file is implicitly associated with the schema that was current when it was written. Compaction must handle files written under different schema versions within the same partition.
+
+### How iceberg-janitor handles schema evolution today
+
+**Master check I2 (schema identity)** prevents the compactor from silently changing the table's current schema. If a foreign writer evolves the schema between the compactor's load and commit, the CAS requirement validation fails and the compactor retries against the new schema.
+
+**The stitch path (byte-copy)** preserves each source file as a separate row group in the output. Files written under different schemas produce an output file with heterogeneous row groups — some row groups may have fewer columns than others. This is valid Parquet (each row group has its own column set) but readers must handle missing columns per-row-group. No data is decoded or re-encoded, so column data is preserved byte-identically.
+
+**The pqarrow fallback path** normalizes everything to the table's current Arrow schema. Missing columns in older files are null-filled during the Arrow decode. The output file has uniform columns across all row groups. This is the correct behavior but introduces nulls that weren't in the original data (the I4 null-count check still passes because the nulls are real in the output).
+
+### Planned improvement: schema-version grouping
+
+The right long-term approach — and what Spark's `rewriteDataFiles` does with `partial-progress.enabled` — is to group files by schema version during `CompactTable`'s partition discovery:
+
+1. **Same-schema files** → stitch (byte-copy, no decode, fast)
+2. **Older-schema files** → upgrade via pqarrow (decode under old schema, re-encode under current schema with null-filled new columns)
+3. **Never mix schemas in a single stitch** — the output file should have uniform columns across all row groups
+
+This ensures:
+- The stitch fast path fires for the common case (uniform schema within a partition)
+- Schema-evolved files get a one-time upgrade to the current schema (slower, but only happens once per file per schema evolution)
+- The output is always a well-formed Parquet file with a single schema, which is what every downstream reader expects
+
+### What this means for operators
+
+- **No action needed for tables that don't evolve.** The stitch path handles uniform-schema tables at full speed.
+- **For tables that evolve infrequently** (e.g. a column added once a quarter): the first compact after a schema evolution will be slightly slower on partitions that contain files from both schema versions. Subsequent compacts on those partitions are fast (all files now under the new schema).
+- **For tables that evolve frequently**: consider running compact with `--compact` after each schema evolution to upgrade all files, rather than waiting for the natural maintenance cycle to encounter the mixed-schema case.
