@@ -321,8 +321,13 @@ call_maintain() {
     return 1
   fi
 
+  # Poll up to 2400 seconds (40 min). compact_hot on real S3 runs
+  # SEQUENTIALLY over ~50 partitions and each partition does its own
+  # LoadTable + master check + CAS commit, so 20-30 min wall time
+  # per maintain is normal until parallel partition compaction lands.
+  # See BENCHMARKS.md Run 18 and the compact_hot.go investigation.
   local poll_url="${SERVER_URL}/v1/jobs/${job_id}"
-  for _ in $(seq 1 300); do
+  for _ in $(seq 1 2400); do
     local status_resp status
     status_resp=$(curl -sf "$poll_url" 2>/dev/null || echo "")
     status=$(echo "$status_resp" | json_field status)
@@ -337,17 +342,8 @@ call_maintain() {
         return 1 ;;
     esac
   done
-  echo "maintain job $job_id timed out" >> "$JANITOR_LOG"
+  echo "maintain job $job_id timed out after 2400s" >> "$JANITOR_LOG"
   return 1
-}
-
-MAINTAIN_ROUND=0
-run_maintain() {
-  MAINTAIN_ROUND=$((MAINTAIN_ROUND + 1))
-  log "maintain round ${MAINTAIN_ROUND}: server auto-classifies + picks mode"
-  call_maintain "${NAMESPACE}.db/store_sales"   || log "  warning: maintain store_sales returned non-zero"
-  call_maintain "${NAMESPACE}.db/store_returns" || log "  warning: maintain store_returns returned non-zero"
-  call_maintain "${NAMESPACE}.db/catalog_sales" || log "  warning: maintain catalog_sales returned non-zero"
 }
 
 # glue_refresh re-registers every table in a warehouse with its
@@ -359,6 +355,21 @@ run_maintain() {
 # current when the tables were first registered — which makes every
 # query measurement noise, not signal.
 #
+# Called as an EXTERNAL ORCHESTRATOR step after every successful
+# maintain job in addition to the before/after-phase refreshes —
+# downstream systems (Athena, Trino, any catalog-backed query
+# engine) can't see a janitor compaction win until Glue is pointed
+# at the new metadata_location. The janitor itself is catalog-less
+# by design; propagating "metadata changed" is the orchestrator's
+# job.
+#
+# The prefix argument to janitor-cli glue-register is NOT the
+# namespace name — it's the bucket-relative path. iceberg-go's
+# default location provider puts tables at `<ns>.db/<name>/`, so
+# the correct discover prefix is `<ns>.db` (or empty for whole
+# bucket). Passing just `<ns>` finds nothing — this was the bug
+# in Run 18 that made the A/B signal zero.
+#
 # Only called in aws mode (local/minio don't use Glue).
 glue_refresh() {
   [[ "$MODE" != "aws" ]] && return 0
@@ -366,8 +377,26 @@ glue_refresh() {
   log "glue-register $label → $glue_db"
   JANITOR_WAREHOUSE_URL="$warehouse_url" \
   AWS_REGION="$AWS_REGION" \
-    janitor-cli glue-register --database "$glue_db" "$NAMESPACE" >> "$JANITOR_LOG" 2>&1 \
+    janitor-cli glue-register --database "$glue_db" "${NAMESPACE}.db" >> "$JANITOR_LOG" 2>&1 \
     || log "  warning: glue-register $label returned non-zero"
+}
+
+MAINTAIN_ROUND=0
+run_maintain() {
+  MAINTAIN_ROUND=$((MAINTAIN_ROUND + 1))
+  log "maintain round ${MAINTAIN_ROUND}: server auto-classifies + picks mode"
+  # After each successful maintain, refresh Glue so downstream
+  # query engines (Athena) see the new metadata_location. The
+  # janitor is catalog-less — bench.sh is the orchestration layer
+  # that propagates "snapshot changed" to Glue. Without this,
+  # every A/B measurement queries the pre-maintain snapshot.
+  for table in store_sales store_returns catalog_sales; do
+    if call_maintain "${NAMESPACE}.db/${table}"; then
+      glue_refresh "with (post-maintain ${table})" "$WH_WITH_URL" "${GLUE_DB_WITH:-}"
+    else
+      log "  warning: maintain ${table} returned non-zero — skipping glue refresh"
+    fi
+  done
 }
 
 # === Phase 4: query engines ===

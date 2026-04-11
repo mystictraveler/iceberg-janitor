@@ -122,6 +122,155 @@ func TestPartitionKeyStableSortOrder(t *testing.T) {
 	}
 }
 
+func TestComputeTriggers_StaleRewriteBootstrap(t *testing.T) {
+	// The regression test for the chicken-and-egg bug: a cold table
+	// that has never been janitored should still fire stale-rewrite
+	// once its commits age past the threshold. The old implementation
+	// required a prior rewrite in LastRewriteAges to fire, which
+	// meant a quiet small table could never trigger cold compaction.
+	now := time.Date(2026, 4, 11, 12, 0, 0, 0, time.UTC)
+	ph := &PartitionHealth{
+		PartitionKey:   "region=us",
+		FileCount:      10,
+		LatestCommitAt: now.Add(-48 * time.Hour),
+	}
+	opts := &PartitionHealthOptions{
+		StaleRewriteAge:      24 * time.Hour,
+		MinStaleRewriteFiles: 2,
+		LastRewriteAges:      nil, // NEVER janitored
+	}
+	computeTriggers(ph, opts, now)
+	if !ph.NeedsStaleRewrite {
+		t.Error("bootstrap case: expected NeedsStaleRewrite=true on a 48h-old partition with no prior rewrite")
+	}
+}
+
+func TestComputeTriggers_StaleRewriteWithinCooldown(t *testing.T) {
+	// If the janitor rewrote this partition recently, don't fire
+	// stale-rewrite again — we'd just re-do the work.
+	now := time.Date(2026, 4, 11, 12, 0, 0, 0, time.UTC)
+	ph := &PartitionHealth{
+		PartitionKey:   "region=us",
+		FileCount:      10,
+		LatestCommitAt: now.Add(-48 * time.Hour),
+	}
+	opts := &PartitionHealthOptions{
+		StaleRewriteAge:      24 * time.Hour,
+		MinStaleRewriteFiles: 2,
+		LastRewriteAges: map[string]time.Duration{
+			"region=us": 2 * time.Hour, // cooldown: janitored 2h ago
+		},
+	}
+	computeTriggers(ph, opts, now)
+	if ph.NeedsStaleRewrite {
+		t.Error("cooldown case: expected NeedsStaleRewrite=false on recently-rewritten partition")
+	}
+}
+
+func TestComputeTriggers_StaleRewriteExpiredCooldown(t *testing.T) {
+	// Cooldown has expired — fire again.
+	now := time.Date(2026, 4, 11, 12, 0, 0, 0, time.UTC)
+	ph := &PartitionHealth{
+		PartitionKey:   "region=us",
+		FileCount:      10,
+		LatestCommitAt: now.Add(-48 * time.Hour),
+	}
+	opts := &PartitionHealthOptions{
+		StaleRewriteAge:      24 * time.Hour,
+		MinStaleRewriteFiles: 2,
+		LastRewriteAges: map[string]time.Duration{
+			"region=us": 36 * time.Hour, // cooldown expired
+		},
+	}
+	computeTriggers(ph, opts, now)
+	if !ph.NeedsStaleRewrite {
+		t.Error("expired-cooldown case: expected NeedsStaleRewrite=true")
+	}
+}
+
+func TestComputeTriggers_StaleRewriteBelowMinFiles(t *testing.T) {
+	// A 1-file partition that's been quiet for a year should NOT
+	// fire stale-rewrite — nothing to compact.
+	now := time.Date(2026, 4, 11, 12, 0, 0, 0, time.UTC)
+	ph := &PartitionHealth{
+		PartitionKey:   "region=us",
+		FileCount:      1,
+		LatestCommitAt: now.Add(-365 * 24 * time.Hour),
+	}
+	opts := &PartitionHealthOptions{
+		StaleRewriteAge:      24 * time.Hour,
+		MinStaleRewriteFiles: 2,
+	}
+	computeTriggers(ph, opts, now)
+	if ph.NeedsStaleRewrite {
+		t.Error("below-min-files case: expected NeedsStaleRewrite=false for 1-file partition")
+	}
+}
+
+func TestComputeTriggers_StaleRewriteNotOldEnough(t *testing.T) {
+	// Commit age is under the threshold — don't fire.
+	now := time.Date(2026, 4, 11, 12, 0, 0, 0, time.UTC)
+	ph := &PartitionHealth{
+		PartitionKey:   "region=us",
+		FileCount:      10,
+		LatestCommitAt: now.Add(-6 * time.Hour),
+	}
+	opts := &PartitionHealthOptions{
+		StaleRewriteAge:      24 * time.Hour,
+		MinStaleRewriteFiles: 2,
+	}
+	computeTriggers(ph, opts, now)
+	if ph.NeedsStaleRewrite {
+		t.Error("recent-commit case: expected NeedsStaleRewrite=false for 6h-old commit")
+	}
+}
+
+func TestComputeTriggers_StaleRewriteNoCommitTime(t *testing.T) {
+	// If LatestCommitAt is zero (v1 manifests without AddedSnapshotID,
+	// or expired snapshots) the trigger must NOT fire — fail-safe.
+	now := time.Date(2026, 4, 11, 12, 0, 0, 0, time.UTC)
+	ph := &PartitionHealth{
+		PartitionKey: "region=us",
+		FileCount:    100,
+		// LatestCommitAt is zero
+	}
+	opts := &PartitionHealthOptions{
+		StaleRewriteAge:      24 * time.Hour,
+		MinStaleRewriteFiles: 2,
+	}
+	computeTriggers(ph, opts, now)
+	if ph.NeedsStaleRewrite {
+		t.Error("no-commit-time case: expected NeedsStaleRewrite=false (fail-safe)")
+	}
+}
+
+func TestComputeTriggers_SmallFileTriggerIndependent(t *testing.T) {
+	// SmallFileCompact and StaleRewrite can fire independently.
+	now := time.Date(2026, 4, 11, 12, 0, 0, 0, time.UTC)
+	ph := &PartitionHealth{
+		PartitionKey:   "region=us",
+		FileCount:      100,
+		SmallFileCount: 75,
+		LatestCommitAt: now.Add(-48 * time.Hour),
+	}
+	opts := &PartitionHealthOptions{
+		SmallFileTrigger:     50,
+		FileCountTrigger:     200,
+		StaleRewriteAge:      24 * time.Hour,
+		MinStaleRewriteFiles: 2,
+	}
+	computeTriggers(ph, opts, now)
+	if !ph.NeedsSmallFileCompact {
+		t.Error("expected NeedsSmallFileCompact=true for 75 small files > 50 threshold")
+	}
+	if !ph.NeedsStaleRewrite {
+		t.Error("expected NeedsStaleRewrite=true")
+	}
+	if ph.NeedsMetadataReduction {
+		t.Error("100 files < 200 FileCountTrigger; NeedsMetadataReduction should be false")
+	}
+}
+
 func TestAnalyzerOptionsDefaults(t *testing.T) {
 	var o AnalyzerOptions
 	o.defaults()

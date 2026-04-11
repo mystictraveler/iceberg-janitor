@@ -32,16 +32,86 @@ type Job struct {
 }
 
 // jobStore is a simple in-memory job tracker.
+//
+// Per-table in-flight guard: inflight[operationKey] maps
+// "maintain|<ns>.<table>" (or "compact|..." etc) to the
+// currently-running job ID for that table+operation. create()
+// atomically checks this map: if there's already an in-flight
+// job for the same (operation, table), it returns (existingJob,
+// false) instead of spawning a duplicate. Without this guard, a
+// caller that POSTs /maintain twice in quick succession spawns
+// two jobs that race for the same metadata.json CAS, exhaust
+// their retry budgets, and mark partitions failed. This is the
+// pathology Run 18 surfaced: the bench's 300s client timeout
+// fired before maintain finished, the bench retried, and round-1
+// and round-2 maintain jobs for the same table overlapped on
+// the server for 8.5 minutes, fighting themselves.
+//
+// LIMITATION — single-replica only. This guard is IN-PROCESS.
+// If the janitor-server ECS service is scaled to desired_count
+// > 1, each replica has its own jobStore and its own inflight
+// map; two replicas can independently accept the same table's
+// maintain POST and spawn overlapping jobs that self-collide on
+// the metadata.json CAS. The AWS deployment pins
+// desired_count = 1 (see deploy/aws/terraform/ecs.tf) which
+// makes this guard sufficient today.
+//
+// When the server needs to scale, replace this in-process map
+// with a distributed lease keyed on (operation, table). The
+// natural primitive is an S3 "lease file" at
+// _janitor/state/<table_uuid>/<operation>.lease created via
+// conditional CAS (If-None-Match: *), held for the job duration,
+// and deleted on completion. This was the original CB1 design
+// before it was removed as premature. The same guard shape
+// works across any number of replicas because S3 conditional
+// write is atomic.
 type jobStore struct {
-	mu   sync.RWMutex
-	jobs map[string]*Job
+	mu       sync.RWMutex
+	jobs     map[string]*Job
+	inflight map[string]string // operationKey -> job_id of running job
 }
 
 func newJobStore() *jobStore {
-	return &jobStore{jobs: make(map[string]*Job)}
+	return &jobStore{
+		jobs:     make(map[string]*Job),
+		inflight: make(map[string]string),
+	}
 }
 
-func (s *jobStore) create(table, operation string) *Job {
+// inflightKey is the dedup key for the in-flight guard. Operations
+// of different kinds (maintain vs compact) can run concurrently on
+// the same table; only same-operation same-table jobs are deduped.
+func inflightKey(operation, table string) string {
+	return operation + "|" + table
+}
+
+// create atomically checks for an in-flight job and returns a
+// snapshot of the existing job if one is already running. Returns
+// (job, true) if a NEW job was created, (existingJob, false) if an
+// in-flight job was returned. Callers that get (_, false) must NOT
+// start a new goroutine — the existing job is already running.
+//
+// The returned Job is a VALUE COPY, not a pointer into the store.
+// This is load-bearing: without the copy, the handler that marshals
+// the job to JSON would race against the background goroutine that
+// mutates the job via complete(). The race is a silent correctness
+// bug — json.Encode reads Status/DoneAt/Result while complete()
+// writes them — and is caught by `go test -race`.
+func (s *jobStore) create(table, operation string) (Job, bool) {
+	key := inflightKey(operation, table)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if existingID, ok := s.inflight[key]; ok {
+		if existing, ok2 := s.jobs[existingID]; ok2 {
+			// Only dedup against pending/running jobs. A completed or
+			// failed job leaving a stale inflight entry is a bug, but
+			// defensively we just ignore it and create a new one.
+			if existing.Status == "pending" || existing.Status == "running" {
+				return *existing, false
+			}
+			delete(s.inflight, key)
+		}
+	}
 	j := &Job{
 		ID:        uuid.New().String(),
 		Status:    "pending",
@@ -49,17 +119,23 @@ func (s *jobStore) create(table, operation string) *Job {
 		Operation: operation,
 		CreatedAt: time.Now(),
 	}
-	s.mu.Lock()
 	s.jobs[j.ID] = j
-	s.mu.Unlock()
-	return j
+	s.inflight[key] = j.ID
+	return *j, true
 }
 
-func (s *jobStore) get(id string) (*Job, bool) {
+// get returns a value snapshot of the job. Returning a pointer
+// would leak the store's internal mutable state and race against
+// complete()/setRunning(). Callers that need to observe progress
+// must call get() repeatedly (e.g. the handleJobStatus poll).
+func (s *jobStore) get(id string) (Job, bool) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	j, ok := s.jobs[id]
-	return j, ok
+	if !ok {
+		return Job{}, false
+	}
+	return *j, true
 }
 
 func (s *jobStore) complete(id string, result any, err error) {
@@ -80,6 +156,12 @@ func (s *jobStore) complete(id string, result any, err error) {
 	if result != nil {
 		data, _ := json.Marshal(result)
 		j.Result = data
+	}
+	// Release the in-flight slot so a subsequent POST for the same
+	// (operation, table) is allowed to start a fresh job.
+	key := inflightKey(j.Operation, j.Table)
+	if s.inflight[key] == id {
+		delete(s.inflight, key)
 	}
 }
 
@@ -151,7 +233,13 @@ func (s *server) handleCompactAsync(w http.ResponseWriter, r *http.Request) {
 	compactOpts := parseCompactOpts(r)
 
 	tableName := fmt.Sprintf("%s.%s", ident[0], ident[1])
-	job := s.jobs.create(tableName, "compact")
+	job, isNew := s.jobs.create(tableName, "compact")
+	if !isNew {
+		s.logger.Info("compact job dedup — returning in-flight job",
+			"job_id", job.ID, "table", tableName)
+		writeJSON(w, http.StatusAccepted, job)
+		return
+	}
 
 	s.logger.Info("compact job created",
 		"job_id", job.ID,
@@ -240,7 +328,13 @@ func (s *server) handleExpireAsync(w http.ResponseWriter, r *http.Request) {
 	}
 	expireOpts := parseExpireOpts(r)
 	tableName := fmt.Sprintf("%s.%s", ident[0], ident[1])
-	job := s.jobs.create(tableName, "expire")
+	job, isNew := s.jobs.create(tableName, "expire")
+	if !isNew {
+		s.logger.Info("expire job dedup — returning in-flight job",
+			"job_id", job.ID, "table", tableName)
+		writeJSON(w, http.StatusAccepted, job)
+		return
+	}
 	s.logger.Info("expire job created", "job_id", job.ID, "table", tableName,
 		"keep_last", expireOpts.KeepLast, "keep_within", expireOpts.KeepWithin)
 
@@ -268,7 +362,13 @@ func (s *server) handleRewriteManifestsAsync(w http.ResponseWriter, r *http.Requ
 		return
 	}
 	tableName := fmt.Sprintf("%s.%s", ident[0], ident[1])
-	job := s.jobs.create(tableName, "rewrite-manifests")
+	job, isNew := s.jobs.create(tableName, "rewrite-manifests")
+	if !isNew {
+		s.logger.Info("rewrite-manifests job dedup — returning in-flight job",
+			"job_id", job.ID, "table", tableName)
+		writeJSON(w, http.StatusAccepted, job)
+		return
+	}
 	s.logger.Info("rewrite-manifests job created", "job_id", job.ID, "table", tableName)
 
 	go func() {
@@ -345,7 +445,21 @@ func (s *server) handleMaintainAsync(w http.ResponseWriter, r *http.Request) {
 		plan.Mode = classify.MaintainMode(v)
 	}
 
-	job := s.jobs.create(tableName, "maintain")
+	job, isNew := s.jobs.create(tableName, "maintain")
+	if !isNew {
+		// In-flight guard: a previous maintain POST for this table
+		// is still running. Return its job_id instead of spawning
+		// a duplicate — the client can poll the same ID and will
+		// see the running job complete. This prevents the Run 18
+		// self-collision pathology where a client timeout fired
+		// mid-maintain and the client retried, causing two
+		// concurrent maintain jobs on the same table to fight for
+		// the same metadata.json CAS.
+		s.logger.Info("maintain job dedup — returning in-flight job",
+			"job_id", job.ID, "table", tableName)
+		writeJSON(w, http.StatusAccepted, job)
+		return
+	}
 	s.logger.Info("maintain job created",
 		"job_id", job.ID,
 		"table", tableName,

@@ -52,6 +52,16 @@ type PartitionHealth struct {
 	// HOT, the rest are COLD.
 	MaxSequenceNumber int64 `json:"max_sequence_number"`
 
+	// LatestCommitAt is the wall-clock time of the most recent
+	// snapshot that added a file to this partition. Derived from the
+	// TimestampMs of the snapshot whose id matches the manifest's
+	// AddedSnapshotID. Used by the stale-rewrite trigger so a quiet
+	// cold table that has never been janitored still gets compacted
+	// once its commits are older than StaleRewriteAge. Zero value
+	// means the partition's commit timestamps couldn't be resolved
+	// (e.g. v1 manifests missing AddedSnapshotID).
+	LatestCommitAt time.Time `json:"latest_commit_at,omitempty"`
+
 	// IsHot is true when MaxSequenceNumber is within the hot window
 	// (typically the last N snapshots, configurable per workload class).
 	IsHot bool `json:"is_hot"`
@@ -93,14 +103,31 @@ type PartitionHealthOptions struct {
 
 	// LastRewriteAges — optional per-partition map of how long ago
 	// each partition was last rewritten by the janitor. Read from
-	// _janitor/state/<table>/partitions.json. Partitions whose
-	// rewrite age exceeds StaleRewriteAge get NeedsStaleRewrite=true.
+	// _janitor/state/<table>/partitions.json. Used as a cooldown:
+	// a partition that was JUST rewritten should not fire the
+	// stale-rewrite trigger again regardless of commit age.
 	LastRewriteAges map[string]time.Duration
 
-	// StaleRewriteAge — partitions whose last rewrite is older than
-	// this get NeedsStaleRewrite=true. Maps to
-	// classify.MaintainOptions.StaleRewriteAge.
+	// StaleRewriteAge — partitions whose latest COMMIT is older than
+	// this get NeedsStaleRewrite=true. The trigger used to require
+	// a prior janitor rewrite to exist before firing, which created
+	// a chicken-and-egg bug on cold tables that were never janitored:
+	// they accumulated files forever and the trigger never fired. It
+	// now fires on commit age and uses LastRewriteAges as a cooldown.
+	// Maps to classify.MaintainOptions.StaleRewriteAge.
 	StaleRewriteAge time.Duration
+
+	// MinStaleRewriteFiles — guards against firing stale-rewrite on
+	// trivially small partitions that have been quiet for a long time
+	// but are not worth rewriting (e.g. a 1-file partition in a year-
+	// quiet table). Partition must have at least this many files to
+	// be considered for the stale-rewrite trigger. Default 2.
+	MinStaleRewriteFiles int
+
+	// Now is the clock used to compute commit ages. Tests inject a
+	// fixed time here; production callers leave it zero and the
+	// analyzer uses time.Now().
+	Now time.Time
 }
 
 func (o *PartitionHealthOptions) defaults() {
@@ -118,6 +145,9 @@ func (o *PartitionHealthOptions) defaults() {
 	}
 	if o.StaleRewriteAge <= 0 {
 		o.StaleRewriteAge = 24 * time.Hour
+	}
+	if o.MinStaleRewriteFiles <= 0 {
+		o.MinStaleRewriteFiles = 2
 	}
 }
 
@@ -147,6 +177,15 @@ func AnalyzePartitions(ctx context.Context, tbl *icebergtable.Table, opts Partit
 
 	spec := tbl.Spec()
 
+	// Build a snapshot-id → commit-time map once so the manifest walk
+	// can resolve each manifest's AddedSnapshotID to a wall-clock
+	// timestamp without hitting the snapshot list per file. Used by
+	// the stale-rewrite trigger to compute partition commit age.
+	snapTimes := map[int64]time.Time{}
+	for _, snap := range tbl.Metadata().Snapshots() {
+		snapTimes[snap.SnapshotID] = time.UnixMilli(snap.TimestampMs)
+	}
+
 	// Aggregate by partition key.
 	parts := map[string]*PartitionHealth{}
 	maxSnapSeq := int64(0)
@@ -166,6 +205,15 @@ func AnalyzePartitions(ctx context.Context, tbl *icebergtable.Table, opts Partit
 		if mSeq > maxSnapSeq {
 			maxSnapSeq = mSeq
 		}
+		// Resolve this manifest's added-snapshot-id to a wall-clock
+		// time for the stale-rewrite trigger. May be zero if the
+		// manifest has no AddedSnapshotID (v1 manifests sometimes)
+		// or the snapshot isn't in the current metadata's snapshot
+		// list (expired). In those cases partitions touched only
+		// from this manifest will have a zero LatestCommitAt and
+		// the stale-rewrite trigger will not fire for them — which
+		// is the correct fail-safe behavior.
+		manifestCommitAt := snapTimes[m.SnapshotID()]
 
 		for _, e := range entries {
 			df := e.DataFile()
@@ -198,23 +246,22 @@ func AnalyzePartitions(ctx context.Context, tbl *icebergtable.Table, opts Partit
 			if mSeq > ph.MaxSequenceNumber {
 				ph.MaxSequenceNumber = mSeq
 			}
+			if manifestCommitAt.After(ph.LatestCommitAt) {
+				ph.LatestCommitAt = manifestCommitAt
+			}
 		}
 	}
 
 	// Compute hot/cold + triggers.
+	now := opts.Now
+	if now.IsZero() {
+		now = time.Now()
+	}
 	hotThreshold := maxSnapSeq - int64(opts.HotWindowSnapshots)
 	out := make([]PartitionHealth, 0, len(parts))
 	for _, ph := range parts {
 		ph.IsHot = ph.MaxSequenceNumber > hotThreshold
-		ph.NeedsSmallFileCompact = ph.SmallFileCount >= opts.SmallFileTrigger
-		// Metadata reduction trigger: a partition with very high file
-		// count (small or not) burdens the manifest layer.
-		ph.NeedsMetadataReduction = ph.FileCount >= opts.FileCountTrigger
-		// Stale rewrite: only fire if we have state for this partition
-		// AND its last rewrite is older than the threshold.
-		if age, ok := opts.LastRewriteAges[ph.PartitionKey]; ok && age > opts.StaleRewriteAge {
-			ph.NeedsStaleRewrite = true
-		}
+		computeTriggers(ph, &opts, now)
 		out = append(out, *ph)
 	}
 
@@ -222,6 +269,36 @@ func AnalyzePartitions(ctx context.Context, tbl *icebergtable.Table, opts Partit
 		return out[i].PartitionKey < out[j].PartitionKey
 	})
 	return out, nil
+}
+
+// computeTriggers fills the three trigger flags on a PartitionHealth
+// in place. Extracted from AnalyzePartitions so it can be unit-tested
+// with synthetic PartitionHealth values without a real iceberg-go
+// Table. The small/metadata triggers are simple thresholds; the
+// stale-rewrite trigger is commit-age based with a cooldown guard
+// against re-rewriting a partition we just touched. See
+// PartitionHealthOptions docs for the full rationale.
+func computeTriggers(ph *PartitionHealth, opts *PartitionHealthOptions, now time.Time) {
+	ph.NeedsSmallFileCompact = ph.SmallFileCount >= opts.SmallFileTrigger
+	ph.NeedsMetadataReduction = ph.FileCount >= opts.FileCountTrigger
+	ph.NeedsStaleRewrite = false
+	if ph.LatestCommitAt.IsZero() {
+		return
+	}
+	if now.Sub(ph.LatestCommitAt) <= opts.StaleRewriteAge {
+		return
+	}
+	if ph.FileCount < opts.MinStaleRewriteFiles {
+		return
+	}
+	// Cooldown: skip if the janitor rewrote this partition more recently
+	// than StaleRewriteAge. An absent entry means no prior rewrite,
+	// which does NOT block the trigger (the whole point of the
+	// commit-age fix is to bootstrap it).
+	if rewriteAge, hadPriorRewrite := opts.LastRewriteAges[ph.PartitionKey]; hadPriorRewrite && rewriteAge <= opts.StaleRewriteAge {
+		return
+	}
+	ph.NeedsStaleRewrite = true
 }
 
 // dataFilePartitionTuple converts a DataFile's partition record into
