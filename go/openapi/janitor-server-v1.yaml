@@ -1,12 +1,56 @@
 openapi: 3.1.0
 info:
   title: iceberg-janitor (Go) — janitor-server HTTP API
-  version: 0.1.0
+  version: 0.4.0
   description: |
     HTTP adapter for the Go janitor's `pkg/janitor.Core` entry points.
     Same code path as `cmd/janitor-cli` (in-process mode) — both
     binaries call into the same shared library, the only difference is
     which process holds the warehouse credentials.
+
+    ## Async job model
+
+    All mutating maintenance operations
+    (`/compact`, `/expire`, `/rewrite-manifests`, `/maintain`) are
+    **asynchronous**. The handler returns **HTTP 202 Accepted** with
+    a `Job` envelope containing a `job_id` immediately, and the
+    actual work runs in a background goroutine on the server. Clients
+    poll `GET /v1/jobs/{id}` to observe the job's lifecycle:
+    `pending → running → completed | failed`. The `result` field is
+    populated on completion with the operation-specific result
+    document (CompactResult, ExpireResult, etc).
+
+    ### Per-table in-flight dedup
+
+    The server enforces a **per-(operation, table) in-flight guard**:
+    if a maintain job is already running for a given table when a
+    second client POSTs the same endpoint, the server returns **the
+    EXISTING job's ID** (still HTTP 202) instead of spawning a
+    duplicate. This prevents the self-collision pathology where two
+    concurrent maintain jobs for the same table fight each other for
+    the metadata.json CAS, exhaust their retry budgets, and mark
+    partitions failed.
+
+    The guard works in two layers:
+
+    1. **In-process map** (load-bearing for single-replica deployments).
+       The jobStore tracks the running job per (operation, table)
+       pair under a mutex. Same-replica concurrent POSTs dedup
+       instantly without touching the warehouse.
+
+    2. **S3-backed lease** (load-bearing for multi-replica deployments).
+       Before spawning a job, the server CAS-creates a lease file at
+       `_janitor/state/leases/<ns>.<table>/<op>.lease` via
+       `gocloud.dev/blob.NewWriter(IfNotExist: true)`. Other replicas
+       see the lease and return the existing job's ID. The lease
+       primitive is in `pkg/lease`; the conditional create maps to
+       S3's `If-None-Match: *` for genuine cross-process atomicity.
+
+    Persistent job records live at
+    `_janitor/state/jobs/<job_id>.json` so any replica can answer
+    `GET /v1/jobs/{id}` regardless of which replica is doing the
+    work. The local in-process job map serves as a fast-path cache;
+    cache miss falls back to a warehouse read.
 
     ## Auth model
 
@@ -195,87 +239,265 @@ paths:
   /v1/tables/{namespace}/{name}/compact:
     post:
       tags: [maintenance]
-      summary: Compact a table (full table, no partition scope, MVP)
+      summary: Compact a table (async)
       description: |
-        Reads all data from the table, rewrites it via streaming
-        Overwrite (one record batch at a time, memory-bounded), runs
-        the mandatory pre-commit master check (I1 row count, I2 schema,
-        I7 manifest references), and commits via the directory
-        catalog's atomic CAS path.
+        Spawns a background goroutine to rewrite the table's small
+        files into target-sized files via the byte-copy stitch path
+        (`pkg/janitor.Compact`), runs the mandatory pre-commit master
+        check, and commits via the directory catalog's atomic CAS path.
 
-        On a CAS conflict (another writer beat us to v(N+1)), the
-        server reloads the table and retries from scratch up to 5
-        attempts with exponential backoff. The optimistic-concurrency
-        retry happens server-side; the client just sees the final
-        result.
+        Returns **HTTP 202 Accepted** with a `Job` envelope. Poll
+        `GET /v1/jobs/{id}` for status. On completion, the job's
+        `result` field contains a `CompactResult`.
 
-        ## Master check is mandatory
+        ### Per-table in-flight dedup
 
-        If the master check fails, the server returns **HTTP 412
-        Precondition Failed** with the failing invariant in the
-        verification record. The commit is aborted, the new files
-        become orphans (cleanable on the next orphan run), and the
-        table is left untouched. There is no `--force` bypass.
+        If a compact job is already running for this table, the
+        server returns the **existing** job's ID (still 202) instead
+        of spawning a duplicate. See the API description for the
+        full lease + persistent jobrecord protocol.
 
-        ## CAS exhaustion
+        ### Master check is mandatory and per-commit
 
-        If the retry loop exhausts MaxAttempts, the server returns
-        **HTTP 409 Conflict** with the result so far.
-
-        ## MVP scope
-
-        - Full table only — no partition scoping yet
-        - Streaming overwrite (decode/encode), not byte-level stitching
-        - I1+I2+I7 of the 9 planned master check invariants
-
-        Each gap is tracked in the design plan and lands in a
-        subsequent release.
+        Every CAS commit goes through `safety.VerifyCompactionConsistency`
+        which validates invariants I1-I9 (row count, schema, per-column
+        value/null counts, bounds presence, manifest references). The
+        check is non-bypassable. Failures are recorded in the job's
+        `result.verification` field with the failing invariant.
       parameters:
         - $ref: '#/components/parameters/Namespace'
         - $ref: '#/components/parameters/TableName'
-      requestBody:
-        required: false
-        content:
-          application/json:
-            schema:
-              $ref: '#/components/schemas/CompactRequest'
+        - in: query
+          name: partition
+          required: false
+          schema:
+            type: string
+          description: |
+            Optional partition scope, formatted as `col=value`. When
+            set, compaction only touches files in that partition. The
+            in-flight dedup key is still per-table, not per-partition.
+        - in: query
+          name: target_file_size
+          required: false
+          schema:
+            type: string
+          description: |
+            Pattern B threshold for the skip-already-large-files filter.
+            Accepts byte counts or human-readable sizes (e.g. `1MB`,
+            `64MB`, `1GB`). Files at or above this size are kept in
+            place; only the small-file tail is rewritten.
       responses:
-        '200':
-          description: Compaction succeeded; full result
+        '202':
+          description: Compact job accepted (or in-flight dedup hit)
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/CompactResult'
+                $ref: '#/components/schemas/Job'
         '404':
           description: Table not found
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/ErrorResponse'
-        '409':
-          description: |
-            CAS-retry exhausted. Another writer kept beating the
-            server to v(N+1). The result so far is included in the
-            response body.
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/CompactErrorResponse'
-        '412':
-          description: |
-            Master check failed. The verification record in the
-            response body shows which invariant failed. The commit
-            was aborted; the table is unchanged.
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/CompactErrorResponse'
         '500':
-          description: Internal error
+          description: Internal error (lease acquire failure, etc)
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/CompactErrorResponse'
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /v1/tables/{namespace}/{name}/maintain:
+    post:
+      tags: [maintenance]
+      summary: Run the full maintain pipeline (async, zero-knob)
+      description: |
+        The **load-bearing entry point** for the janitor. Runs:
+
+          1. **expire** — drop snapshots beyond keep_last / keep_within
+          2. **rewrite-manifests** (pre-compact) — fold per-commit
+             micro-manifests into partition-organized layout
+          3. **compact** — dispatched per the workload classifier:
+             - `streaming → hot` ⇒ `pkg/janitor.CompactHot` parallel
+               delta-stitch with single-snapshot batched commit
+             - `batch | slow_changing | dormant → cold` ⇒
+               `pkg/janitor.CompactCold` per-partition trigger-based
+               full compact
+             - explicit `?mode=full` override ⇒ `pkg/janitor.CompactTable`
+          4. **rewrite-manifests** (post-compact) — fold the new
+             commit's micro-manifest back into the partition layout
+
+        ### Zero-knob
+
+        The handler classifies the table on every call by reading
+        the snapshot history (`pkg/strategy/classify.Classify`) and
+        maps the resulting `WorkloadClass` to a `MaintainOptions`
+        struct via `ClassToOptions`. Callers pass nothing; the server
+        decides mode and per-class thresholds. The optional `?mode=`
+        query param exists for testing and is not part of normal
+        operation.
+
+        ### In-flight dedup applies
+
+        Concurrent maintain POSTs for the same table return the
+        existing job's ID (HTTP 202). Run-18 surfaced the
+        self-collision pathology where two duplicate maintain jobs
+        on the same table fought for the metadata.json CAS — the
+        in-flight guard prevents this.
+      parameters:
+        - $ref: '#/components/parameters/Namespace'
+        - $ref: '#/components/parameters/TableName'
+        - in: query
+          name: mode
+          required: false
+          schema:
+            type: string
+            enum: [hot, cold, full]
+          description: |
+            Override for the classifier-derived mode. Reserved for
+            testing and operator one-offs; production callers should
+            leave this unset.
+      responses:
+        '202':
+          description: Maintain job accepted (or in-flight dedup hit)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Job'
+        '404':
+          description: Table not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /v1/tables/{namespace}/{name}/expire:
+    post:
+      tags: [maintenance]
+      summary: Expire old snapshots (async)
+      description: |
+        Spawns a background goroutine to drop snapshots beyond
+        `keep_last` / `keep_within` from the table's parent chain.
+        The current snapshot is always retained. Master check
+        (different invariants from compact: row count of CURRENT
+        snapshot must not change; snapshot set must be a subset of
+        the input; current snapshot id must not change) runs
+        per-commit and is non-bypassable.
+
+        In-flight dedup applies per (operation=expire, table).
+      parameters:
+        - $ref: '#/components/parameters/Namespace'
+        - $ref: '#/components/parameters/TableName'
+        - in: query
+          name: keep_last
+          required: false
+          schema:
+            type: integer
+            minimum: 1
+            default: 5
+          description: Minimum number of recent snapshots to retain
+        - in: query
+          name: keep_within
+          required: false
+          schema:
+            type: string
+          description: |
+            Go duration string (e.g. `24h`, `7d` is not valid use
+            `168h`). Snapshots older than this are eligible for
+            removal subject to keep_last.
+      responses:
+        '202':
+          description: Expire job accepted (or in-flight dedup hit)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Job'
+        '404':
+          description: Table not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /v1/tables/{namespace}/{name}/rewrite-manifests:
+    post:
+      tags: [maintenance]
+      summary: Rewrite manifests into partition-organized layout (async)
+      description: |
+        Spawns a background goroutine that consolidates per-commit
+        micro-manifests into a partition-organized layout. After this
+        op, the next compact's manifest walk reads dramatically
+        fewer manifests because each manifest's bounds are tighter.
+
+        Master check guarantees data file count + row count are
+        unchanged across the rewrite. In-flight dedup applies per
+        (operation=rewrite-manifests, table).
+      parameters:
+        - $ref: '#/components/parameters/Namespace'
+        - $ref: '#/components/parameters/TableName'
+      responses:
+        '202':
+          description: Rewrite-manifests job accepted (or in-flight dedup hit)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Job'
+        '404':
+          description: Table not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /v1/jobs/{id}:
+    get:
+      tags: [maintenance]
+      summary: Poll an async job's status
+      description: |
+        Returns the current status of a job created by any of the
+        async maintenance endpoints. The same job ID is observable
+        from any replica because job records live on the warehouse
+        object store at `_janitor/state/jobs/<job_id>.json`.
+
+        ### Status lifecycle
+
+        ```
+        pending  → job created, goroutine has not started yet
+        running  → goroutine is processing
+        completed → result field is populated
+        failed    → error field is populated
+        ```
+
+        Clients should poll until status reaches `completed` or
+        `failed`. Recommended poll interval: 1-5 seconds for fast
+        operations, 10-30 seconds for long-running maintain jobs.
+
+        ### Cross-replica reads
+
+        Any replica in the cluster can answer this endpoint for any
+        job, not just the replica that owns the job's lease. The
+        replica's local jobStore acts as a fast-path cache; cache
+        miss falls back to a warehouse read of the job record.
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema:
+            type: string
+            format: uuid
+          description: The `job_id` returned by an async POST endpoint.
+      responses:
+        '200':
+          description: Job status
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Job'
+        '404':
+          description: Job not found (id is unknown OR record was garbage-collected)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
 
 components:
   parameters:
@@ -298,6 +520,70 @@ components:
       description: Table name (no namespace prefix)
 
   schemas:
+    Job:
+      type: object
+      description: |
+        Async job envelope returned by `/compact`, `/maintain`,
+        `/expire`, `/rewrite-manifests`, and `/v1/jobs/{id}`. The
+        `result` field is populated on completion with the
+        operation-specific result document (CompactResult,
+        ExpireResult, RewriteManifestsResult, or MaintainResult).
+
+        Backed by a persistent record at
+        `_janitor/state/jobs/<job_id>.json` so any replica can read
+        it. The local jobStore caches the record; cache miss falls
+        back to a warehouse read.
+      required: [job_id, status, table, operation, created_at]
+      properties:
+        job_id:
+          type: string
+          format: uuid
+        status:
+          type: string
+          enum: [pending, running, completed, failed]
+        table:
+          type: string
+          description: "Fully-qualified table name in the form `<namespace>.<table>`"
+          example: tpcds.store_sales
+        operation:
+          type: string
+          enum: [compact, maintain, expire, rewrite-manifests]
+        created_at:
+          type: string
+          format: date-time
+        done_at:
+          type: string
+          format: date-time
+          description: Wall-clock time the job completed (or failed). Absent while running.
+        result:
+          type: object
+          description: |
+            Operation-specific result document. Schema depends on
+            `operation`:
+              - `compact`           → CompactResult
+              - `maintain`          → MaintainResult (envelopes the
+                                       expire/rewrite/compact sub-results
+                                       and the per-step `steps_completed`
+                                       list)
+              - `expire`            → ExpireResult
+              - `rewrite-manifests` → RewriteManifestsResult
+            Absent until status reaches `completed`.
+        error:
+          type: string
+          description: |
+            Failure reason. Set when status is `failed`. Master check
+            failures, CAS exhaustion, lease acquire failures, and
+            other terminal errors all surface here.
+        owner:
+          type: string
+          description: |
+            Identity of the server replica that owns the lease for
+            this job. Format: `<hostname>:<pid>:<startup-uuid>`. Used
+            by operators for replica-attribution debugging. Empty
+            when the server runs in legacy in-process-only mode
+            (no warehouse-backed lease).
+          example: janitor-server-7c9d8f6b9d-x4w2k:1:8f3e2c4a-...
+
     TableLocation:
       type: object
       required: [Prefix, CurrentMetadata, CurrentVersion]
