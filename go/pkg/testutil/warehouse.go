@@ -125,6 +125,66 @@ func (w *Warehouse) WriteParquetFile(t testing.TB, key string, rows []SimpleFact
 	return "file://" + absPath
 }
 
+// SeedPartitionedFactTable creates a table partitioned by `region`
+// with `numPartitions` partitions, each containing
+// `filesPerPartition` parquet files of `rowsPerFile` rows. Used by
+// tests that need to exercise parallel multi-partition compaction.
+//
+// Each partition value is a synthetic region name ("r000", "r001",
+// ...). The parquet files for partition rNNN live under
+// `<warehouse>/<ns>.db/<name>/data/region=rNNN/part-NNNNN.parquet`.
+// AddFiles infers the partition value from the path on read, so
+// partition=region=rNNN files end up in the rNNN partition.
+//
+// Total row count = numPartitions × filesPerPartition × rowsPerFile.
+func (w *Warehouse) SeedPartitionedFactTable(t testing.TB, ns, name string, numPartitions, filesPerPartition, rowsPerFile int) (*icebergtable.Table, []string) {
+	t.Helper()
+	schema := SimpleFactSchema()
+	regionField, ok := schema.FindFieldByName("region")
+	if !ok {
+		t.Fatal("region field not found in SimpleFactSchema")
+	}
+	spec := icebergpkg.NewPartitionSpec(icebergpkg.PartitionField{
+		SourceID:  regionField.ID,
+		FieldID:   1000,
+		Name:      "region",
+		Transform: icebergpkg.IdentityTransform{},
+	})
+	tbl := w.CreateTable(t, ns, name, schema, icebergcat.WithPartitionSpec(&spec))
+
+	absFiles := make([]string, 0, numPartitions*filesPerPartition)
+	keys := make([]string, 0, numPartitions*filesPerPartition)
+	rowID := int64(0)
+	for p := 0; p < numPartitions; p++ {
+		region := fmt.Sprintf("r%03d", p)
+		for f := 0; f < filesPerPartition; f++ {
+			key := fmt.Sprintf("%s.db/%s/data/region=%s/part-%05d.parquet", ns, name, region, f)
+			rows := make([]SimpleFactRow, rowsPerFile)
+			for j := 0; j < rowsPerFile; j++ {
+				rows[j] = SimpleFactRow{
+					ID:     rowID,
+					Value:  int64(j),
+					Region: region,
+				}
+				rowID++
+			}
+			abs := w.WriteParquetFile(t, key, rows)
+			absFiles = append(absFiles, abs)
+			keys = append(keys, key)
+		}
+	}
+
+	tx := tbl.NewTransaction()
+	if err := tx.AddFiles(context.Background(), absFiles, nil, false); err != nil {
+		t.Fatalf("AddFiles: %v", err)
+	}
+	newTbl, err := tx.Commit(context.Background())
+	if err != nil {
+		t.Fatalf("Commit: %v", err)
+	}
+	return newTbl, keys
+}
+
 // SeedFactTable creates a table with numFiles small parquet files,
 // each containing rowsPerFile rows with monotonically increasing
 // ids. Returns the committed table (after AddFiles) and the list

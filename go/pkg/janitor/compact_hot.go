@@ -5,14 +5,152 @@ import (
 	"fmt"
 	"hash/fnv"
 	"sort"
+	"sync"
+	"sync/atomic"
 	"time"
 
+	"github.com/apache/arrow-go/v18/arrow/memory"
+	"github.com/apache/arrow-go/v18/parquet"
+	"github.com/apache/arrow-go/v18/parquet/pqarrow"
+	icebergio "github.com/apache/iceberg-go/io"
 	icebergtable "github.com/apache/iceberg-go/table"
+	"github.com/google/uuid"
+	"golang.org/x/sync/errgroup"
 
 	"github.com/mystictraveler/iceberg-janitor/go/pkg/analyzer"
 	"github.com/mystictraveler/iceberg-janitor/go/pkg/catalog"
 	"github.com/mystictraveler/iceberg-janitor/go/pkg/observe"
+	"github.com/mystictraveler/iceberg-janitor/go/pkg/safety"
 )
+
+// stitchedPartition is the per-partition output of the parallel
+// stitch phase. The CompactHot batched commit collects N of these
+// and stages them in a single Transaction.
+type stitchedPartition struct {
+	partitionKey string
+	anchor       string
+	bootstrap    bool
+	smallCount   int
+	oldPaths     []string
+	newFilePath  string
+	rowsWritten  int64
+	durationMs   int64
+}
+
+// stitchPartitionToFile is the stitch-only helper that the parallel
+// CompactHot worker calls. It mirrors the stitch+fallback logic of
+// executeStitchAndCommit's first half (lines ~360-477) but stops
+// before the ReplaceDataFiles + master check + commit. The caller
+// (CompactHot) collects N stitchedPartition results and stages them
+// all in one Transaction.
+//
+// On success returns the new file path and rows written. On failure
+// removes any partial output and returns the error.
+func stitchPartitionToFile(ctx context.Context, tbl *icebergtable.Table, fs icebergio.IO, oldPaths []string, expectedRows int64) (string, int64, error) {
+	icebergSchema := tbl.Metadata().CurrentSchema()
+	locProv, err := tbl.LocationProvider()
+	if err != nil {
+		return "", 0, fmt.Errorf("getting location provider: %w", err)
+	}
+	wfs, ok := fs.(icebergio.WriteFileIO)
+	if !ok {
+		return "", 0, fmt.Errorf("filesystem does not support writes")
+	}
+	newFileName := fmt.Sprintf("janitor-%s.parquet", uuid.New().String())
+	newFilePath := locProv.NewDataLocation(newFileName)
+
+	writeSchema, err := icebergtable.SchemaToArrowSchema(icebergSchema, nil, false, false)
+	if err != nil {
+		return "", 0, fmt.Errorf("building arrow write schema: %w", err)
+	}
+
+	out, err := wfs.Create(newFilePath)
+	if err != nil {
+		return "", 0, fmt.Errorf("creating output file %s: %w", newFilePath, err)
+	}
+
+	// Fast path: parquet-go byte-copy stitch.
+	rowsWritten, stitchErr := stitchParquetFiles(ctx, fs, oldPaths, out)
+	usedStitch := stitchErr == nil && rowsWritten == expectedRows
+	if !usedStitch {
+		// Fallback to pqarrow decode/encode path.
+		_ = out.Close()
+		_ = wfs.Remove(newFilePath)
+		out, err = wfs.Create(newFilePath)
+		if err != nil {
+			return "", 0, fmt.Errorf("creating output file %s for fallback: %w", newFilePath, err)
+		}
+		rowsWritten = 0
+		pqProps := parquet.NewWriterProperties(parquet.WithStats(true))
+		pqWriter, perr := pqarrow.NewFileWriter(writeSchema, out, pqProps, pqarrow.DefaultWriterProps())
+		if perr != nil {
+			_ = wfs.Remove(newFilePath)
+			return "", 0, fmt.Errorf("creating parquet writer: %w", perr)
+		}
+		mem := memory.DefaultAllocator
+		var pqWriterMu sync.Mutex
+		g2, gctx2 := errgroup.WithContext(ctx)
+		g2.SetLimit(parquetReadConcurrency)
+		for _, fpath := range oldPaths {
+			fpath := fpath
+			g2.Go(func() error {
+				if gctx2.Err() != nil {
+					return gctx2.Err()
+				}
+				batches, n, rerr := readParquetFileBatches(gctx2, fs, fpath, writeSchema, mem)
+				if rerr != nil {
+					return fmt.Errorf("copying %s: %w", fpath, rerr)
+				}
+				pqWriterMu.Lock()
+				defer pqWriterMu.Unlock()
+				for i, b := range batches {
+					if werr := pqWriter.Write(b); werr != nil {
+						for j := i; j < len(batches); j++ {
+							batches[j].Release()
+						}
+						return fmt.Errorf("write %s: %w", fpath, werr)
+					}
+					b.Release()
+				}
+				atomic.AddInt64(&rowsWritten, n)
+				return nil
+			})
+		}
+		if err := g2.Wait(); err != nil {
+			_ = pqWriter.Close()
+			_ = wfs.Remove(newFilePath)
+			return "", 0, err
+		}
+		if err := pqWriter.Close(); err != nil {
+			_ = wfs.Remove(newFilePath)
+			return "", 0, fmt.Errorf("closing parquet writer: %w", err)
+		}
+	} else {
+		if cerr := out.Close(); cerr != nil {
+			_ = wfs.Remove(newFilePath)
+			return "", 0, fmt.Errorf("closing stitched output %s: %w", newFilePath, cerr)
+		}
+	}
+
+	if rowsWritten != expectedRows {
+		_ = wfs.Remove(newFilePath)
+		return "", 0, fmt.Errorf("read/manifest row mismatch: read %d rows but expected %d", rowsWritten, expectedRows)
+	}
+	return newFilePath, rowsWritten, nil
+}
+
+// hotPartitionConcurrency caps the number of partitions stitched in
+// parallel within a single CompactHot call. Each worker calls
+// janitor.Compact() which has its own LoadTable + master check + CAS
+// commit + 15-retry-on-conflict loop, so workers will naturally
+// serialize at the CAS commit step. The concurrency limit caps the
+// in-flight stitch I/O (parquet reads + writes), not the commit rate.
+//
+// Run 18 sequential 50-partition compact_hot took 22 min on S3 and
+// 7 min on MinIO. The CAS retry loop is the floor; with 16-way
+// parallel stitch + serial CAS the same workload should be in the
+// 2-4 min range on S3 and 30-90 sec on MinIO.
+const hotPartitionConcurrency = 16
 
 // CompactHotOptions configures the hot-loop entry point.
 type CompactHotOptions struct {
@@ -134,6 +272,20 @@ func CompactHot(ctx context.Context, cat *catalog.DirectoryCatalog, ident iceber
 	}
 	rotationIndex := time.Now().Unix() / 60 / intervalMin
 
+	// Build the parallel work list. Each entry is a (partition,
+	// stitchInputs, expectedRows) tuple. The planning phase (which
+	// only reads PartitionHealth and is cheap) is sequential; the
+	// stitch phase (parquet read + write) is parallel; the commit
+	// phase (one Transaction with all partition replacements) is
+	// sequential at the end.
+	type stitchWork struct {
+		p             analyzer.PartitionHealth
+		anchor        analyzer.FileInfo
+		bootstrap     bool
+		inputs        []string
+		expectedRows  int64
+	}
+	work := make([]stitchWork, 0, len(parts))
 	for _, p := range parts {
 		if !p.IsHot {
 			continue
@@ -186,34 +338,240 @@ func CompactHot(ctx context.Context, cat *catalog.DirectoryCatalog, ident iceber
 			continue
 		}
 
-		// Run the delta stitch via Compact's fast path.
-		partStarted := time.Now()
-		compactResult, cerr := Compact(ctx, cat, ident, CompactOptions{
-			OldPathsOverride: stitchInputs,
+		// Compute expected total rows for this partition's stitch
+		// input set from the analyzer's per-file row counts. Used
+		// by stitchPartitionToFile's pre-flight row check.
+		var expectedRows int64
+		for _, fi := range p.Files {
+			for _, sp := range stitchInputs {
+				if fi.Path == sp {
+					expectedRows += fi.Rows
+					break
+				}
+			}
+		}
+
+		work = append(work, stitchWork{
+			p:            p,
+			anchor:       anchor,
+			bootstrap:    bootstrap,
+			inputs:       stitchInputs,
+			expectedRows: expectedRows,
 		})
-		partResult := HotPartitionResult{
-			PartitionKey: p.PartitionKey,
-			Anchor:       anchor.Path,
-			SmallCount:   p.SmallFileCount,
-			Bootstrap:    bootstrap,
-			DurationMs:   time.Since(partStarted).Milliseconds(),
-		}
-		if compactResult != nil {
-			partResult.BeforeFiles = compactResult.BeforeFiles
-			partResult.AfterFiles = compactResult.AfterFiles
-		}
-		if cerr != nil {
+	}
+
+	// === Parallel partition stitch (no commit) ===
+	//
+	// Each worker stitches ONE partition's source files into a new
+	// parquet file. No commit, no CAS, no master check yet. The
+	// parallel speedup comes from overlapping the stitch I/O
+	// (read sources, write new file) across partitions, which on
+	// S3 is the dominant cost. With hotPartitionConcurrency=16 and
+	// ~50 partitions, the wall time goes from 50 × stitch_time to
+	// roughly ceil(50/16) × stitch_time ≈ 3-4 × stitch_time.
+	//
+	// Per-worker output is a stitchedPartition with the new file
+	// path, the old paths it consumed, and the row count. The
+	// commit phase below assembles all of these into a single
+	// Transaction and commits ONCE.
+	fs, err := tbl.FS(ctx)
+	if err != nil {
+		return result, fmt.Errorf("getting fs: %w", err)
+	}
+	stitched := make([]stitchedPartition, len(work))
+	stitchErrs := make([]error, len(work))
+	g, gctx := errgroup.WithContext(ctx)
+	g.SetLimit(hotPartitionConcurrency)
+	for i, w := range work {
+		i, w := i, w
+		g.Go(func() error {
+			if gctx.Err() != nil {
+				return gctx.Err()
+			}
+			partStarted := time.Now()
+			newFilePath, rowsWritten, serr := stitchPartitionToFile(gctx, tbl, fs, w.inputs, w.expectedRows)
+			stitched[i] = stitchedPartition{
+				partitionKey: w.p.PartitionKey,
+				anchor:       w.anchor.Path,
+				bootstrap:    w.bootstrap,
+				smallCount:   w.p.SmallFileCount,
+				oldPaths:     w.inputs,
+				newFilePath:  newFilePath,
+				rowsWritten:  rowsWritten,
+				durationMs:   time.Since(partStarted).Milliseconds(),
+			}
+			if serr != nil {
+				stitchErrs[i] = serr
+			}
+			return nil // never bubble per-partition stitch errors — record per-partition
+		})
+	}
+	if err := g.Wait(); err != nil && !isContextCancelled(err) {
+		result.TotalDurationMs = time.Since(started).Milliseconds()
+		return result, fmt.Errorf("CompactHot stitch worker: %w", err)
+	}
+
+	// Collect successful stitches into the batched-commit input.
+	// Per-partition stitch failures are recorded in the result and
+	// excluded from the commit. A worker that produced a new file
+	// AND had a stitchErr is impossible (the helper either returns
+	// (path, rows, nil) or (\"\", 0, err)) so the path-empty check
+	// is sufficient.
+	var batchOldPaths []string
+	var batchNewPaths []string
+	var batchRows int64
+	for i, sp := range stitched {
+		if stitchErrs[i] != nil || sp.newFilePath == "" {
 			result.PartitionsFailed++
-			partResult.Error = cerr.Error()
+			result.Partitions = append(result.Partitions, HotPartitionResult{
+				PartitionKey: sp.partitionKey,
+				Anchor:       sp.anchor,
+				SmallCount:   sp.smallCount,
+				Bootstrap:    sp.bootstrap,
+				DurationMs:   sp.durationMs,
+				Error:        errString(stitchErrs[i]),
+			})
+			continue
+		}
+		batchOldPaths = append(batchOldPaths, sp.oldPaths...)
+		batchNewPaths = append(batchNewPaths, sp.newFilePath)
+		batchRows += sp.rowsWritten
+	}
+
+	if len(batchNewPaths) == 0 {
+		// Nothing to commit — every partition was skipped or
+		// failed. Done.
+		result.TotalDurationMs = time.Since(started).Milliseconds()
+		return result, nil
+	}
+
+	// === Batched commit ===
+	//
+	// Build ONE Transaction with ALL partition replacements,
+	// run the master check ONCE on the staged table, then CAS
+	// commit ONCE. On CAS conflict (a foreign writer commited
+	// between our LoadTable and our commit), reload the table
+	// and retry — but DO NOT re-stitch. The new files are already
+	// on disk and idempotent at the file level.
+	//
+	// 15 retry attempts with exponential backoff (capped at 5s)
+	// matches the existing single-partition Compact() retry
+	// shape. Persistent CAS conflict beyond that bubbles up as a
+	// hard failure.
+	const maxAttempts = 15
+	const initialBackoff = 100 * time.Millisecond
+	const maxBackoff = 5 * time.Second
+	commitStarted := time.Now()
+	backoff := initialBackoff
+	var commitErr error
+	var verification *safety.Verification
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		freshTbl, lerr := cat.LoadTable(ctx, ident)
+		if lerr != nil {
+			commitErr = fmt.Errorf("reloading table for batched commit: %w", lerr)
+			break
+		}
+		tx := freshTbl.NewTransaction()
+		if rerr := tx.ReplaceDataFiles(ctx, batchOldPaths, batchNewPaths, nil); rerr != nil {
+			commitErr = fmt.Errorf("staging batched ReplaceDataFiles (%d old, %d new): %w",
+				len(batchOldPaths), len(batchNewPaths), rerr)
+			break
+		}
+		staged, serr := tx.StagedTable()
+		if serr != nil {
+			commitErr = fmt.Errorf("getting staged table for batched commit: %w", serr)
+			break
+		}
+		v, verr := safety.VerifyCompactionConsistency(ctx, freshTbl, staged, cat.Props())
+		verification = v
+		if verr != nil {
+			commitErr = fmt.Errorf("master check failed on batched stage: %w", verr)
+			break
+		}
+		_, cerr := tx.Commit(ctx)
+		if cerr == nil {
+			commitErr = nil
+			break
+		}
+		if !IsRetryableConcurrencyError(cerr) {
+			commitErr = cerr
+			break
+		}
+		// Retryable: sleep + try again
+		commitErr = cerr
+		select {
+		case <-ctx.Done():
+			commitErr = ctx.Err()
+			break
+		case <-time.After(backoff):
+		}
+		backoff *= 2
+		if backoff > maxBackoff {
+			backoff = maxBackoff
+		}
+	}
+	commitElapsedMs := time.Since(commitStarted).Milliseconds()
+
+	// Record per-partition results based on the commit outcome.
+	// All partitions in the batch share the same commit result —
+	// either all succeeded together or all failed together.
+	for _, sp := range stitched {
+		if sp.newFilePath == "" {
+			continue // already recorded as failed above
+		}
+		pr := HotPartitionResult{
+			PartitionKey: sp.partitionKey,
+			Anchor:       sp.anchor,
+			SmallCount:   sp.smallCount,
+			Bootstrap:    sp.bootstrap,
+			DurationMs:   sp.durationMs + commitElapsedMs/int64(len(batchNewPaths)), // amortized
+		}
+		if commitErr != nil {
+			result.PartitionsFailed++
+			pr.Error = commitErr.Error()
 		} else {
 			result.PartitionsStitched++
-			partResult.Stitched = true
+			pr.Stitched = true
 		}
-		result.Partitions = append(result.Partitions, partResult)
+		result.Partitions = append(result.Partitions, pr)
+	}
+
+	if commitErr != nil {
+		// Commit failed. Best-effort cleanup of the orphan stitched
+		// files — orphan-removal will catch any we miss.
+		wfs, ok := fs.(icebergio.WriteFileIO)
+		if ok {
+			for _, np := range batchNewPaths {
+				_ = wfs.Remove(np)
+			}
+		}
+		result.TotalDurationMs = time.Since(started).Milliseconds()
+		return result, fmt.Errorf("batched commit failed after retries: %w (master check verification: %+v)", commitErr, verification)
 	}
 
 	result.TotalDurationMs = time.Since(started).Milliseconds()
 	return result, nil
+}
+
+// errString returns err.Error() or empty string if err is nil. Used
+// by the result aggregation to keep the per-partition Error field
+// empty when stitch+commit succeeded.
+func errString(err error) string {
+	if err == nil {
+		return ""
+	}
+	return err.Error()
+}
+
+// isContextCancelled reports whether err is a benign context
+// cancellation (Cancelled or DeadlineExceeded) versus a real error.
+// Used by CompactHot's errgroup wait to distinguish "we were
+// asked to stop" from "a worker hit something unexpected".
+func isContextCancelled(err error) bool {
+	if err == nil {
+		return false
+	}
+	return err == context.Canceled || err == context.DeadlineExceeded
 }
 
 // pickAnchor selects the anchor file for a partition's delta-stitch
