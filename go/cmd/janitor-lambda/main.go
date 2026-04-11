@@ -4,10 +4,18 @@ package main
 
 import (
 	"fmt"
+	"io"
 	"os"
 )
 
+// run writes the scaffold banner and returns the exit code.
+// Factored out of main so tests can exercise it in-process (the
+// subprocess-based test can't produce coverage instrumentation).
+func run(stderr io.Writer) int {
+	fmt.Fprintln(stderr, "janitor-lambda: scaffold only; Lambda adapter lands in Phase 4")
+	return 2
+}
+
 func main() {
-	fmt.Fprintln(os.Stderr, "janitor-lambda: scaffold only; Lambda adapter lands in Phase 4")
-	os.Exit(2)
+	os.Exit(run(os.Stderr))
 }
