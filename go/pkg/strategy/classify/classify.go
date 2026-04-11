@@ -176,6 +176,7 @@ var ClassDefaults = map[WorkloadClass]Thresholds{
 // HealthReport (and ultimately from _janitor/state/<table>.json).
 type Result struct {
 	Class                  WorkloadClass `json:"class"`
+	ForeignCommitsLast15m  int           `json:"foreign_commits_last_15m"`
 	ForeignCommitsLast24h  int           `json:"foreign_commits_last_24h"`
 	ForeignCommitsLast7d   int           `json:"foreign_commits_last_7d"`
 	LastForeignCommitAt    time.Time     `json:"last_foreign_commit_at,omitempty"`
@@ -214,6 +215,7 @@ func classifyAt(tbl *icebergtable.Table, now time.Time) Result {
 		return Result{Class: ClassDormant}
 	}
 
+	cutoff15m := now.Add(-15 * time.Minute)
 	cutoff24h := now.Add(-24 * time.Hour)
 	cutoff7d := now.Add(-7 * 24 * time.Hour)
 
@@ -240,6 +242,9 @@ func classifyAt(tbl *icebergtable.Table, now time.Time) Result {
 		if ts.After(cutoff24h) {
 			r.ForeignCommitsLast24h++
 		}
+		if ts.After(cutoff15m) {
+			r.ForeignCommitsLast15m++
+		}
 		if ts.After(lastForeignAt) {
 			lastForeignAt = ts
 		}
@@ -253,15 +258,37 @@ func classifyAt(tbl *icebergtable.Table, now time.Time) Result {
 // classifyFromCounts maps the (commits-in-window, last-commit-time)
 // signal into a workload class per the design plan thresholds:
 //
-//	streaming:    foreign commit rate > 6/h over the last 24h
-//	batch:        0.04 < commit rate <= 6/h
-//	slow_changing: 0 < commit rate <= 0.04/h
+//	streaming:    recent (15-min) rate > 6/h OR 24h rate > 6/h
+//	batch:        0.04 < 24h rate <= 6/h
+//	slow_changing: 0 < 24h rate <= 0.04/h
 //	dormant:      no commits in last 7d
+//
+// The recent-15m window is the load-bearing change for bench runs and
+// for tables that just started streaming: a fresh table with 40 commits
+// over the last 5 minutes has a 24h rate of 40/24 ≈ 1.7/h (below the
+// streaming threshold), but a 15-min rate of (40/15)*60 ≈ 160/h — clearly
+// streaming. Without this window the classifier waits ~4 hours for the
+// 24h running average to catch up, during which the hot path never fires
+// and the table accumulates small files unchecked.
+//
+// Sensitivity: the 15-min window needs at least 2 commits to trigger
+// streaming (2 commits / 15 min = 8/h, just above the threshold). This
+// avoids false-positive flips for tables that received a single late
+// commit after being idle.
 func classifyFromCounts(r Result, now time.Time) WorkloadClass {
 	if r.ForeignCommitsLast7d == 0 {
 		return ClassDormant
 	}
-	// commit rate per hour over the last 24h
+	// Short-window fast path: a sudden burst of recent commits is the
+	// strongest signal that the table is currently hot, independent of
+	// what the 24h average looks like.
+	if r.ForeignCommitsLast15m >= 2 {
+		recentRate := float64(r.ForeignCommitsLast15m) * 4.0 // per hour
+		if recentRate > 6.0 {
+			return ClassStreaming
+		}
+	}
+	// 24h rate per hour — the slower-moving signal.
 	rate := float64(r.ForeignCommitsLast24h) / 24.0
 	switch {
 	case rate > 6.0:

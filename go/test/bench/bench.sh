@@ -350,6 +350,26 @@ run_maintain() {
   call_maintain "${NAMESPACE}.db/catalog_sales" || log "  warning: maintain catalog_sales returned non-zero"
 }
 
+# glue_refresh re-registers every table in a warehouse with its
+# current Iceberg metadata_location. REQUIRED after any action that
+# changes the current snapshot (streamer commits, janitor maintain)
+# because Athena reads Iceberg tables via Glue, and the Glue table
+# parameter `metadata_location` is pinned at registration time.
+# Without this step, Athena reads the STALE metadata.json that was
+# current when the tables were first registered — which makes every
+# query measurement noise, not signal.
+#
+# Only called in aws mode (local/minio don't use Glue).
+glue_refresh() {
+  [[ "$MODE" != "aws" ]] && return 0
+  local label="$1" warehouse_url="$2" glue_db="$3"
+  log "glue-register $label → $glue_db"
+  JANITOR_WAREHOUSE_URL="$warehouse_url" \
+  AWS_REGION="$AWS_REGION" \
+    janitor-cli glue-register --database "$glue_db" "$NAMESPACE" >> "$JANITOR_LOG" 2>&1 \
+    || log "  warning: glue-register $label returned non-zero"
+}
+
 # === Phase 4: query engines ===
 
 TPCDS_TABLES=(store_sales store_returns catalog_sales item customer customer_address customer_demographics household_demographics date_dim time_dim store promotion)
@@ -543,10 +563,19 @@ for label in with without; do
   fi
 done
 
-# === Phase B: pause (let S3 writes settle) ===
+# === Phase B: pause + glue pre-refresh (let S3 writes settle) ===
 
 log "pause phase — sleeping ${PAUSE_SECONDS}s for S3 writes to settle"
 sleep "$PAUSE_SECONDS"
+
+# Re-register Glue tables for BOTH warehouses right after the stream
+# phase. This is the moment the streamer's final commits have landed
+# on S3 and we need Athena to see them. Without this refresh, Athena
+# would read the metadata_location that was registered before
+# streaming started — which means both with and without would query
+# the SAME stale data layout and the A/B signal would be zero.
+glue_refresh "with"    "$WH_WITH_URL"    "${GLUE_DB_WITH:-}"
+glue_refresh "without" "$WH_WITHOUT_URL" "${GLUE_DB_WITHOUT:-}"
 
 # === Phase C: maintain (WITH warehouse only, N rounds) ===
 
@@ -559,9 +588,21 @@ done
 MAINTAIN_ELAPSED=$(( $(date +%s) - MAINTAIN_START ))
 log "maintain phase done in ${MAINTAIN_ELAPSED}s"
 
-# === Phase D: query (both warehouses, back-to-back iterations) ===
+# Re-register Glue for the WITH warehouse ONLY — the maintain pipeline
+# wrote new metadata.json files that reseat the current snapshot.
+# The WITHOUT warehouse hasn't changed since the pre-maintain refresh,
+# so we don't need to touch it. This is the step that makes the
+# query phase actually measure post-maintain state on the with side.
+glue_refresh "with (post-maintain)" "$WH_WITH_URL" "${GLUE_DB_WITH:-}"
 
-log "query phase — ${QUERY_ITERATIONS} iterations against both warehouses"
+# === Phase D: query (both warehouses, back-to-back iterations) ===
+#
+# Iteration 1 is treated as a warmup and dropped from the summary
+# aggregates. Athena has significant cold-start variance on the first
+# query against a given table; including it inflates the with/without
+# comparison with noise that has nothing to do with the maintain work.
+
+log "query phase — ${QUERY_ITERATIONS} iterations against both warehouses (iter 1 = warmup, dropped from summary)"
 QUERY_START=$(date +%s)
 for ITERATION in $(seq 1 "$QUERY_ITERATIONS"); do
   log "query iteration ${ITERATION}/${QUERY_ITERATIONS}"
@@ -581,7 +622,7 @@ log "generating summary"
 if command -v duckdb >/dev/null 2>&1; then
   duckdb <<SQL > "$SUMMARY_TXT" 2>&1
 .mode markdown
-SELECT 'TPC-DS streaming benchmark — ${MODE} mode — $TS' AS title;
+SELECT 'TPC-DS streaming benchmark — ${MODE} mode — $TS (iter 1 dropped as warmup)' AS title;
 .headers on
 SELECT
   query,
@@ -592,6 +633,7 @@ SELECT
     AVG(CASE WHEN mode='without' THEN latency_ms END)
   ) / AVG(CASE WHEN mode='without' THEN latency_ms END), 1) AS pct_change
 FROM read_csv_auto('$RESULTS_CSV', header=true)
+WHERE iteration > 1
 GROUP BY query
 ORDER BY query;
 
@@ -601,20 +643,37 @@ SELECT
   ROUND(AVG(store_returns_files), 1) AS avg_sr_files,
   ROUND(AVG(catalog_sales_files), 1) AS avg_cs_files
 FROM read_csv_auto('$RESULTS_CSV', header=true)
+WHERE iteration > 1
 GROUP BY mode;
 SQL
 else
   # aws mode inside Fargate — awk fallback (no duckdb).
-  awk -F, 'NR>1 {
+  # Drop iteration 1 (first column of each row, after header). The
+  # first Athena run against a table is a cold-start outlier and
+  # contaminates the average.
+  awk -F, 'NR>1 && $1 > 1 {
     key=$3"/"$4; sum[key]+=$5; cnt[key]++
   } END {
-    printf "TPC-DS bench — %s\n", "'"$MODE"' $TS"
+    printf "TPC-DS bench — %s (iter 1 dropped as warmup)\n", "'"$MODE"' $TS"
     for (k in sum) printf "  %-20s %8.1f ms (n=%d)\n", k, sum[k]/cnt[k], cnt[k]
   }' "$RESULTS_CSV" | sort > "$SUMMARY_TXT"
 fi
 
+# Flush summary directly to stdout, belt-and-suspenders. CloudWatch
+# log batch flushing on container shutdown can truncate the last
+# few events; writing the summary via printf ensures each line is
+# its own libc write() which the awslogs driver picks up reliably.
 log "summary: $SUMMARY_TXT"
 log "raw CSV: $RESULTS_CSV"
 log "==== summary ===="
-cat "$SUMMARY_TXT"
+while IFS= read -r summary_line; do
+  printf '%s\n' "$summary_line"
+done < "$SUMMARY_TXT"
+log "================="
+# Also dump the raw CSV inline so the per-query rows survive in
+# CloudWatch even if the summary aggregation fails. Small cost.
+log "==== raw CSV ===="
+while IFS= read -r csv_line; do
+  printf '%s\n' "$csv_line"
+done < "$RESULTS_CSV"
 log "================="

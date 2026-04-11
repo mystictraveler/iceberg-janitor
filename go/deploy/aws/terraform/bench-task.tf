@@ -51,13 +51,16 @@ resource "aws_ecs_task_definition" "bench" {
         name  = "ATHENA_RESULTS_BUCKET"
         value = aws_s3_bucket.athena_results.id
       },
-      # Phased bench: STREAM -> PAUSE -> MAINTAIN -> QUERY. No interleaving.
-      # Upper bound on rows: 2 streamers × 1000 CPM × 3 facts × 300 avg/batch
-      # × 6 min / 60 = ~18M rows. CPM=1000 is aspirational; the streamer
-      # will flat-line on S3 PUT latency well below that.
+      # Phased bench: STREAM -> GLUE -> PAUSE -> MAINTAIN -> GLUE -> QUERY.
+      # Stream for 20 min to give the classifier's 15-min short window
+      # enough activity to pick streaming (which triggers the hot path),
+      # and to produce enough manifests for rewrite-manifests and
+      # compact_cold to have real work. The streamer is S3-PUT-bound at
+      # ~40 commits/min, so CPM=1000 is aspirational — actual output is
+      # ~800 commits per streamer over 20 min.
       {
         name  = "STREAM_DURATION_SECONDS"
-        value = "360"
+        value = "1200"
       },
       {
         name  = "PAUSE_SECONDS"
@@ -67,9 +70,12 @@ resource "aws_ecs_task_definition" "bench" {
         name  = "MAINTAIN_ROUNDS"
         value = "2"
       },
+      # 5 iterations with iter 1 dropped as warmup gives n=4 per query
+      # for the A/B aggregates. Each iteration is ~100-150 s of Athena
+      # wall time (20 queries × ~5-7 s), so query phase is ~10 min.
       {
         name  = "QUERY_ITERATIONS"
-        value = "3"
+        value = "5"
       },
       {
         name  = "COMMITS_PER_MINUTE"

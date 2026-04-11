@@ -5,6 +5,52 @@ import (
 	"time"
 )
 
+func TestClassifyFromCountsShortWindowStreaming(t *testing.T) {
+	// Fresh table: 40 commits in last 15 min, only 40 in last 24h
+	// (the bench run scenario). 24h rate = 1.67/h (below streaming
+	// threshold), but 15m rate = 160/h (well above). Short-window
+	// fast path should pick streaming.
+	r := Result{
+		ForeignCommitsLast15m: 40,
+		ForeignCommitsLast24h: 40,
+		ForeignCommitsLast7d:  40,
+	}
+	got := classifyFromCounts(r, time.Now())
+	if got != ClassStreaming {
+		t.Errorf("short-window burst: got %q, want streaming", got)
+	}
+}
+
+func TestClassifyFromCountsShortWindowMinimum(t *testing.T) {
+	// Single recent commit should NOT trigger streaming (false-positive
+	// guard). 1 commit / 15 min = 4/h, below the 6/h threshold even
+	// before the 2-commit floor kicks in.
+	r := Result{
+		ForeignCommitsLast15m: 1,
+		ForeignCommitsLast24h: 1,
+		ForeignCommitsLast7d:  1,
+	}
+	got := classifyFromCounts(r, time.Now())
+	if got == ClassStreaming {
+		t.Errorf("single recent commit: got streaming, want batch/slow_changing")
+	}
+}
+
+func TestClassifyFromCountsShortWindowDoesNotOverrideDormant(t *testing.T) {
+	// Dormant check runs before the short-window path. A table with
+	// zero 7d commits must stay dormant even if ForeignCommitsLast15m
+	// is somehow non-zero (shouldn't happen, but defensive).
+	r := Result{
+		ForeignCommitsLast15m: 0,
+		ForeignCommitsLast24h: 0,
+		ForeignCommitsLast7d:  0,
+	}
+	got := classifyFromCounts(r, time.Now())
+	if got != ClassDormant {
+		t.Errorf("zero 7d: got %q, want dormant", got)
+	}
+}
+
 func TestClassifyFromCountsDormant(t *testing.T) {
 	r := Result{ForeignCommitsLast24h: 0, ForeignCommitsLast7d: 0}
 	got := classifyFromCounts(r, time.Now())
