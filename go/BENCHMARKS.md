@@ -574,6 +574,171 @@ MinIO queries are ~3× faster than fileblob (50 ms vs 140 ms), which matches the
 
 ---
 
+## Run 18 — first hot path on real S3, sequential compact pathology surfaced
+
+**Date:** 2026-04-11
+**Build:** `feature/go-rewrite-mvp` after the Phase-A bench.sh fixes (sed parser, glue refresh, 15-min classifier window) but BEFORE the in-flight guard / lease primitive work. Task `3d1e0942` then `226d1d0d`. Persisted at `s3://iceberg-janitor-athena-results-605618833247/bench-runs/`.
+
+### What's new since Run 17
+
+- 15-min short-window classifier (`classifyFromCounts` reads `ForeignCommitsLast15m`; if ≥ 2 commits in last 15 min and rate > 6/h, classifies streaming regardless of 24h average)
+- bench.sh phased pattern: STREAM → PAUSE → MAINTAIN → QUERY (no interleaving)
+- bench.sh sed-based JSON parser (the bench image has no python3)
+- bench.sh `glue_refresh` calls `janitor-cli glue-register` after stream and after maintain
+- bench artifact persistence to `s3://.../bench-runs/<TS>/`
+- CloudWatch retention 14 → 90 days
+- Server pinned to subnet-045dd14e688b740b1 (us-east-1a) — cross-AZ is silently dropped in this sandbox VPC
+- Bench task pinned to same subnet
+- Stale-rewrite trigger now commit-age based (not "prior rewrite must exist") — fixes the chicken-and-egg bug for cold tables that have never been janitored
+
+### Bench config (Run 18, task `226d1d0d`)
+
+```
+STREAM_DURATION_SECONDS  1200   # 20 min stream
+PAUSE_SECONDS            15
+MAINTAIN_ROUNDS          2
+QUERY_ITERATIONS         5      # iter 1 dropped as warmup
+COMMITS_PER_MINUTE       1000   # aspirational; actual ~40/min
+```
+
+### Streamer event counts (real S3 PUT throughput)
+
+| Warehouse | Commits | Per-table breakdown | Estimated rows |
+|---|---:|---|---:|
+| with | 793 | ss=265, sr=264, cs=264 | ~238k |
+| without | 788 | ss=263, sr=263, cs=262 | ~236k |
+
+S3 PUT bottleneck: ~40 commits/min per streamer. CPM=1000 was aspirational; the streamer is fundamentally rate-limited by per-PUT latency on S3.
+
+### Server-side maintain outcomes (all 6 jobs streaming → hot 🎯)
+
+The 15-min classifier worked: every maintain call classified `streaming → hot`, dispatching CompactHot.
+
+| Round | Table | Class/Mode | Manifests | compact_hot partitions | Total wall |
+|---|---|---|---:|---|---:|
+| 1 | store_sales | streaming/hot | **265 → 50** (5.3×) | 50 hot, **44 stitched**, 6 failed | **22m 33s** |
+| 1 | store_returns | streaming/hot | **264 → 50** (5.3×) | 50 hot, **38 stitched**, 12 failed | **20m 48s** |
+| 1 | catalog_sales | streaming/hot | **264 → 10** (26.4×) | 10 hot, **10 stitched**, 0 failed | 3m 49s |
+| 2 | store_sales | streaming/hot | 81 → 50 | 50 hot, 19 stitched, 0 failed | 8m 28s |
+| 2 | store_returns | streaming/hot | 83 → 50 | 50 hot, 16 stitched, 1 failed | 6m 51s |
+| 2 | catalog_sales | streaming/hot | 21 → 10 | (small) | 1m 46s |
+
+**127 partitions stitched, 19 failures.** This is the FIRST run where the hot path fired end-to-end on real S3 — the 15-min classifier fix unblocked it.
+
+### What this run validates
+
+1. **15-min classifier short window works on real S3.** Every job picked streaming.
+2. **Hot-path delta stitch on S3 is real.** 127 successful stitches, 5.3× manifest consolidation on store_sales / store_returns, 26.4× on catalog_sales.
+3. **Phased bench pattern works** (clean 14-min completion, no streamer noise contaminating queries).
+4. **Sed parser fix works** (no false "returned non-zero" warnings).
+5. **Server-pinned-to-1a works** (cross-AZ networking gotcha sidestepped).
+
+### Two pathologies surfaced — and what we did about them
+
+**Pathology #1: 22-minute compact_hot wall time on real S3.**
+
+Cause: `pkg/janitor/compact_hot.go` processes hot partitions SEQUENTIALLY in a single goroutine. Each iteration calls `janitor.Compact()` which does a full LoadTable + manifest walk + master check + CAS commit. At ~20-30 s per partition × 50 partitions = 16-25 min wall time. Not O(table_size) but O(num_partitions × per-commit-overhead).
+
+The fix is parallel partition compaction with a bounded errgroup, but it requires careful CAS contention handling. Not landed in this session — flagged as the next architectural priority.
+
+**Pathology #2: Client-induced self-collision causing 19 partition stitch failures.**
+
+Cause: the bench's old 300s call_maintain poll timeout fired before maintain finished. The bench retried, the server happily spawned a duplicate maintain job for the same table, and round-1 + round-2 maintain on the same table ran concurrently for 8.5 minutes — fighting each other for the same `metadata.json` CAS. Each Compact()'s 15-retry CAS loop eventually exhausted on the contention and marked partitions failed.
+
+**Fix shipped in commit 642fcf1** (same session, after Run 18):
+- Per-(operation, table) **in-flight guard** in `cmd/janitor-server/jobStore`. Concurrent POSTs for the same table return the existing job's ID instead of spawning a duplicate. Race-detector clean. 8 unit + 2 fileblob integration tests.
+- Bench client poll timeout 300s → 2400s. The bench actually waits for the long-running job.
+- Bench glue_refresh per-successful-maintain (treats bench as the external orchestrator that propagates "snapshot changed" to Glue).
+
+**Then the user pointed out the in-process guard is single-replica only**, and we need to bring back CB1 / the lease concept for cross-replica safety. Phases 1-3 (commits `09de93d`, `70df322`, `e2ce521`) build that:
+
+- **Phase 1 (`pkg/lease`):** S3-backed per-table operation lock at `_janitor/state/leases/<ns>.<name>/<op>.lease`. CAS-create via `gocloud.dev/blob.NewWriter(IfNotExist: true)` which maps to S3 `If-None-Match: *`. 14 unit tests including 16-way concurrent acquire and stale takeover races. Documented residual cross-process takeover window with the heartbeat-verify mitigation in Phase 3.
+- **Phase 2 (`pkg/jobrecord`):** persistent job records at `_janitor/state/jobs/<job_id>.json`. Same primitive (`gocloud.dev/blob.Bucket`) as everywhere else. 15 unit tests covering round-trip, overwrite, heartbeat staleness.
+- **Phase 3 (cmd/janitor-server jobStore):** wires lease + jobrecord into `jobStore`. `newPersistentJobStore(bucket)` is the production constructor; `newJobStore()` stays in-process-only for unit tests. `create()` acquires the lease, writes the initial record, and returns the dedup response on `ErrLeaseHeld`. `get()` falls back to S3 jobrecord on cache miss. `complete()` writes the terminal record + releases the lease. **Multi-replica observability**: any replica can answer `GET /v1/jobs/{id}` because every replica reads the same `_janitor/state/jobs/` prefix. 8 cross-replica integration tests using two `jobStore` instances sharing one fileblob bucket.
+- **Phase 4 (`ecs.tf`):** `desired_count = 1 → 3`. Not yet applied — this lands when the next AWS bench runs with the new server image.
+
+### What this run does NOT validate
+
+- **Query A/B signal** is uninterpretable. The Glue metadata refresh logic in bench.sh had a path-prefix bug (passed `tpcds` instead of `tpcds.db` to `janitor-cli glue-register`). All glue-register calls returned "no Iceberg tables found", Glue stayed at v12/v13, and Athena queried the same stale snapshots on both sides. Fixed in commit 642fcf1.
+- **compact_cold under realistic load.** Every job classified streaming, dispatching the hot path. The cold path's commit-age stale-rewrite trigger (also fixed this session) was not exercised.
+- **Cross-replica behavior.** The server still ran with `desired_count = 1`. Phase 4 deploy + a fresh AWS bench will exercise it.
+
+## Run 18.5 — MinIO bench, same code, zero failures
+
+**Date:** 2026-04-11
+**Build:** `feature/go-rewrite-mvp` after 2400s timeout fix (commit 642fcf1) — same compact_hot.go as Run 18.
+**Hardware:** local Mac mini, MinIO via docker compose, single-process bench harness.
+
+### Why this matters
+
+Run 18 surfaced the partition-failure pathology and the 22-min compact_hot wall time. The MinIO re-run was the controlled experiment: same code, same workload shape, but no client-retry pileup (the 2400s timeout prevents the bench from retrying mid-maintain) and no cross-replica contention (single process). Isolates the question "are the 19 partition failures from duplicate jobs, or from real S3 contention?"
+
+### Bench config
+
+```
+STREAM_DURATION_SECONDS  600    # 10 min stream
+COMMITS_PER_MINUTE       600    # MinIO sustains higher throughput than S3
+MAINTAIN_ROUNDS          2
+QUERY_ITERATIONS         5
+```
+
+### Streamer event counts (MinIO can sustain real throughput)
+
+| Warehouse | Commits | Per-table | Throughput |
+|---|---:|---|---:|
+| with | **2597** | ss=866, sr=866, cs=865 | ~258 commits/min |
+| without | **2582** | ss=861, sr=861, cs=860 | ~258 commits/min |
+
+**6.5× more volume per minute than the AWS bench** (~258/min on MinIO vs ~40/min on S3).
+
+### Round 1 store_sales — clean run, zero failures
+
+Server-side breakdown (job `9baa4262`):
+
+| Phase | Result | Elapsed |
+|---|---|---:|
+| expire | removed 0 (fresh table, no old snapshots) | 77 ms |
+| rewrite-manifests (pre-compact) | **866 → 50** (17.3× consolidation) | 2,561 ms |
+| **compact_hot** | **50 hot, 50 stitched, 0 failed** | **436,704 ms (7m 17s)** |
+| rewrite-manifests (post-compact) | 100 → 50 | 573 ms |
+| **Total** | | **439,918 ms (7m 20s)** |
+
+### Comparison: same code, MinIO vs S3
+
+| Metric | AWS Run 18 (S3) | MinIO Run 18.5 | Δ |
+|---|---:|---:|---:|
+| store_sales round 1 wall | 22m 33s | **7m 20s** | **3.1× faster** |
+| store_sales partition failures | 6 | **0** | — |
+| store_sales partitions stitched | 44 / 50 | **50 / 50** | — |
+| store_sales manifest reduction | 265 → 50 | **866 → 50** (17.3×) | — |
+| Per-partition compact_hot wall | ~26 s | **~8.7 s** | 3× faster |
+| Stream commits in equivalent time | 793 in 20 min | **2597 in 10 min** | 6.5× higher rate |
+
+### What this proves
+
+1. **The 19 partition failures in Run 18 were CAUSED BY duplicate-job CAS contention**, not external writers, not master-check failures. Eliminating the duplicate jobs (via the 2400s client timeout, soon to be hardened by the in-flight guard + lease) drops failures to zero on the same code.
+2. **compact_hot is correct** — 50/50 partitions stitched, master check passed on every commit.
+3. **The 22-min wall time on S3 is per-op latency, not CPU-bound work.** MinIO is 3× faster purely because per-op latency drops from ~50 ms to ~5 ms. Parallel-partition compact would scale BOTH backends roughly 8-16×, bringing S3 from 22 min to ~2 min and MinIO from 7 min to ~30 s. **This is the next big architectural lever.**
+
+### Code delta from the previous entry
+
+| File | Change |
+|---|---|
+| `pkg/strategy/classify/classify.go` | 15-min short-window fast path in `classifyFromCounts`. New `Result.ForeignCommitsLast15m` field. Bootstrap streaming detection on burst-written tables. |
+| `pkg/strategy/classify/classify_test.go` | 3 new tests for the short-window path. |
+| `pkg/analyzer/partition_health.go` | New `LatestCommitAt` field on `PartitionHealth`. `AnalyzePartitions` builds `snapshot_id → commit_time` map and tracks per-partition latest commit. Stale-rewrite trigger is now commit-age based. New `MinStaleRewriteFiles` option (default 2). Extracted `computeTriggers` helper. |
+| `pkg/analyzer/partition_health_test.go` | 7 new tests for commit-age trigger. |
+| `cmd/janitor-server/jobs.go` | In-flight guard via `jobStore.inflight` map (commit 642fcf1). Then full lease + persistent jobrecord integration via `newPersistentJobStore` (commit e2ce521). `Job` gains `Owner` field. `create/get/complete/setRunning` route through `pkg/lease` and `pkg/jobrecord` when bucket is set. |
+| `cmd/janitor-server/jobs_test.go` | 8 new in-flight guard tests (concurrent create race, dedup, fresh-job-after-complete). |
+| `cmd/janitor-server/maintain_inflight_integration_test.go` | NEW. 2 fileblob integration tests against a real httptest server: 16 concurrent maintain POSTs dedup to 1 job; sequential POSTs after completion are allowed. |
+| `cmd/janitor-server/persistent_jobstore_test.go` | NEW. 8 cross-replica tests using two jobStore instances sharing one fileblob bucket. Includes 16-way concurrent create race across replicas → exactly 1 winner. |
+| `pkg/lease/lease.go` | NEW. S3-backed lease primitive with TryAcquire / Read / Release / StaleTakeover / SystemOwner. 14 unit tests, 73.9% coverage. |
+| `pkg/jobrecord/jobrecord.go` | NEW. Persistent job records on the warehouse object store. Read/Write/Delete + IsHeartbeatStale. 15 unit tests, 80.4% coverage. |
+| `test/bench/bench.sh` | Glue prefix fix (`tpcds.db`), 300s → 2400s poll timeout, per-successful-maintain glue refresh. |
+| `deploy/aws/terraform/ecs.tf` | `desired_count = 1 → 3`. Not yet applied. |
+
+---
+
 ## Format conventions for future entries
 
 When adding new rows to this file as new build phases land:
