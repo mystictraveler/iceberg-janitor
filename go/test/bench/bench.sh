@@ -246,7 +246,11 @@ fi
 
 start_streamer() {
   local label="$1" url="$2" catalog_db="$3" out_log="$4"
-  log "starting streamer ($label) → $url"
+  # log goes to stderr so command substitution only captures the PID.
+  # If we logged to stdout, `PID=$(start_streamer ...)` would capture
+  # the log line AND the PID together, and kill -0 would fail on the
+  # garbage string, making the stream phase exit at t+0.
+  log "starting streamer ($label) → $url" >&2
   JANITOR_WAREHOUSE_URL="$url" \
   CATALOG_DB="$catalog_db" \
   NAMESPACE="$NAMESPACE" \
@@ -268,6 +272,13 @@ rm -f "$CATALOG_DB_WITH" "$CATALOG_DB_WITHOUT"
 
 PID_WITH=$(start_streamer "with-janitor" "$WH_WITH_URL" "$CATALOG_DB_WITH" "$STREAMER_WITH_LOG")
 PID_WITHOUT=$(start_streamer "without-janitor" "$WH_WITHOUT_URL" "$CATALOG_DB_WITHOUT" "$STREAMER_WITHOUT_LOG")
+for pid_var in PID_WITH PID_WITHOUT; do
+  pid_val="${!pid_var}"
+  if ! [[ "$pid_val" =~ ^[0-9]+$ ]]; then
+    echo "FATAL: $pid_var is not a numeric PID: $pid_val" >&2
+    exit 3
+  fi
+done
 log "streamer PIDs: with=$PID_WITH without=$PID_WITHOUT"
 log "streaming for ${STREAM_DURATION_SECONDS}s..."
 
