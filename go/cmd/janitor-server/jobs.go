@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"strconv"
@@ -11,8 +12,11 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"gocloud.dev/blob"
 
 	"github.com/mystictraveler/iceberg-janitor/go/pkg/janitor"
+	"github.com/mystictraveler/iceberg-janitor/go/pkg/jobrecord"
+	"github.com/mystictraveler/iceberg-janitor/go/pkg/lease"
 	"github.com/mystictraveler/iceberg-janitor/go/pkg/maintenance"
 	"github.com/mystictraveler/iceberg-janitor/go/pkg/strategy/classify"
 
@@ -29,6 +33,12 @@ type Job struct {
 	DoneAt    *time.Time      `json:"done_at,omitempty"`
 	Result    json.RawMessage `json:"result,omitempty"`
 	Error     string          `json:"error,omitempty"`
+	// Owner identifies the server replica that created this job.
+	// Set to lease.SystemOwner() in persistent mode. Used by the
+	// jobStore to distinguish owned (we are the writer) from
+	// foreign (another replica is the writer) cached entries
+	// during get(). Empty in in-process-only mode.
+	Owner string `json:"owner,omitempty"`
 }
 
 // jobStore is a simple in-memory job tracker.
@@ -69,12 +79,66 @@ type jobStore struct {
 	mu       sync.RWMutex
 	jobs     map[string]*Job
 	inflight map[string]string // operationKey -> job_id of running job
+
+	// bucket is the optional warehouse bucket. When non-nil, the
+	// jobStore writes lease files to _janitor/state/leases/ and
+	// job records to _janitor/state/jobs/, making the dedup +
+	// observability work across multiple server replicas.
+	// When nil, the jobStore is in-process only — same behavior
+	// as the original implementation. Used by unit tests that
+	// only exercise the local cache primitive.
+	bucket *blob.Bucket
+	// owner is this server's identity, derived from lease.SystemOwner
+	// at construction time. Stable for the process lifetime.
+	owner string
+	// leaseTTL is how long lease entries live before being eligible
+	// for stale-takeover. Defaults to 60 minutes — long enough to
+	// cover the worst observed maintain wall time (Run 18: 22 min)
+	// with a comfortable margin. Operators can shorten this for
+	// testing or extend it for tables where maintain commonly
+	// runs longer.
+	leaseTTL time.Duration
 }
 
+// newJobStore returns an in-process-only jobStore. Used by unit
+// tests that exercise the cache primitive in isolation. For the
+// full cross-replica behavior, use newPersistentJobStore.
 func newJobStore() *jobStore {
 	return &jobStore{
 		jobs:     make(map[string]*Job),
 		inflight: make(map[string]string),
+	}
+}
+
+// newPersistentJobStore returns a jobStore backed by the given
+// warehouse bucket. lease and jobrecord files live under
+// _janitor/state/{leases,jobs}/. The in-process map remains the
+// fast-path cache; cache misses fall back to S3 reads.
+//
+// Multiple janitor-server replicas sharing the same bucket get
+// cross-replica dedup (any replica that POSTs /maintain for a
+// table that's already being processed gets the in-flight job's
+// ID, not a duplicate) and cross-replica observability (any
+// replica can answer GET /v1/jobs/{id} for a job that another
+// replica is running).
+func newPersistentJobStore(bucket *blob.Bucket) *jobStore {
+	return newPersistentJobStoreWithOwner(bucket, lease.SystemOwner())
+}
+
+// newPersistentJobStoreWithOwner is like newPersistentJobStore but
+// lets the caller specify the owner identity explicitly. Used by
+// tests that simulate multiple replicas in a single process — in
+// production, lease.SystemOwner() is process-singleton, so two
+// stores constructed in the same process share identity. For
+// tests we need distinct owners to exercise the cross-replica
+// foreign-job code paths.
+func newPersistentJobStoreWithOwner(bucket *blob.Bucket, owner string) *jobStore {
+	return &jobStore{
+		jobs:     make(map[string]*Job),
+		inflight: make(map[string]string),
+		bucket:   bucket,
+		owner:    owner,
+		leaseTTL: 60 * time.Minute,
 	}
 }
 
@@ -99,17 +163,160 @@ func inflightKey(operation, table string) string {
 // writes them — and is caught by `go test -race`.
 func (s *jobStore) create(table, operation string) (Job, bool) {
 	key := inflightKey(operation, table)
-	s.mu.Lock()
-	defer s.mu.Unlock()
+
+	// In-process-only mode (no bucket): hold the lock for the
+	// entire check-and-create. This is the path used by unit
+	// tests and matches the pre-Phase-3 behavior. Releasing the
+	// lock between the fast-path check and the commit creates a
+	// TOCTOU window where multiple goroutines can pass the
+	// inflight check and create duplicate jobs — exactly what
+	// the in-flight guard is supposed to prevent.
+	if s.bucket == nil {
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		if existingID, ok := s.inflight[key]; ok {
+			if existing, ok2 := s.jobs[existingID]; ok2 {
+				if existing.Status == "pending" || existing.Status == "running" {
+					return *existing, false
+				}
+				delete(s.inflight, key)
+			}
+		}
+		j := &Job{
+			ID:        uuid.New().String(),
+			Status:    "pending",
+			Table:     table,
+			Operation: operation,
+			CreatedAt: time.Now(),
+		}
+		s.jobs[j.ID] = j
+		s.inflight[key] = j.ID
+		return *j, true
+	}
+
+	// Persistent mode: fast-path check first, then go through the
+	// lease primitive (which serializes cross-goroutine via its
+	// own per-key mutex). The lease is the source of truth — if
+	// the fast path misses but a concurrent goroutine wins the
+	// lease, our lease attempt returns ErrLeaseHeld and we dedup
+	// to that job.
+	s.mu.RLock()
 	if existingID, ok := s.inflight[key]; ok {
 		if existing, ok2 := s.jobs[existingID]; ok2 {
-			// Only dedup against pending/running jobs. A completed or
-			// failed job leaving a stale inflight entry is a bug, but
-			// defensively we just ignore it and create a new one.
 			if existing.Status == "pending" || existing.Status == "running" {
-				return *existing, false
+				snapshot := *existing
+				s.mu.RUnlock()
+				return snapshot, false
 			}
-			delete(s.inflight, key)
+		}
+	}
+	s.mu.RUnlock()
+
+	// Persistent mode: try to acquire the lease for this
+	// (operation, table) pair. If we win, write the initial job
+	// record and return a fresh job. If we lose, fetch the in-
+	// flight job's record from S3 and return it as the dedup
+	// response.
+	leasePath := lease.Path(table, operation)
+	jobID := uuid.New().String()
+	ctx := context.Background()
+	leaseObj, lerr := lease.TryAcquire(ctx, s.bucket, leasePath, lease.Options{
+		Owner: s.owner,
+		JobID: jobID,
+		TTL:   s.leaseTTL,
+	})
+	if errors.Is(lerr, lease.ErrLeaseHeld) {
+		// Another replica (or this one earlier) already holds the
+		// lease. Read the in-flight job from S3 and return it.
+		// If the existing lease is stale, attempt takeover.
+		if leaseObj != nil && leaseObj.IsStale(time.Now()) {
+			leaseObj, lerr = lease.StaleTakeover(ctx, s.bucket, leasePath, leaseObj.Nonce, lease.Options{
+				Owner: s.owner,
+				JobID: jobID,
+				TTL:   s.leaseTTL,
+			})
+		}
+		if errors.Is(lerr, lease.ErrLeaseHeld) {
+			// Still held by another live owner — return the
+			// existing job record. If we can't load the record,
+			// fall back to a synthetic "in-flight on another
+			// replica" Job pointer derived from the lease alone.
+			rec, rerr := jobrecord.Read(ctx, s.bucket, leaseObj.JobID)
+			if rerr == nil {
+				return s.cacheForeignRecord(recordFromJobrecord(rec)), false
+			}
+			// Lease exists but record doesn't yet — owner is
+			// still creating it. Return a placeholder Job that
+			// the client can poll. The client will eventually
+			// see the real record once the owner writes it.
+			return Job{
+				ID:        leaseObj.JobID,
+				Status:    "pending",
+				Table:     table,
+				Operation: operation,
+				CreatedAt: leaseObj.AcquiredAt,
+			}, false
+		}
+	}
+	if lerr != nil {
+		// Lease acquisition failed for an unexpected reason. Fall
+		// back to local-only behavior — we still create a job and
+		// run it, but other replicas won't see it. Operators can
+		// detect this via the WARN log line.
+		return s.createLocal(key, table, operation), true
+	}
+
+	// We won the lease. Build the job, write the initial record
+	// to S3, and store in local cache.
+	now := time.Now()
+	j := &Job{
+		ID:        leaseObj.JobID,
+		Status:    "pending",
+		Table:     table,
+		Operation: operation,
+		CreatedAt: now,
+		Owner:     s.owner,
+	}
+	rec := &Record{
+		ID:         j.ID,
+		Table:      table,
+		Operation:  operation,
+		Status:     "pending",
+		CreatedAt:  now,
+		LeaseNonce: leaseObj.Nonce,
+		Owner:      s.owner,
+	}
+	if _, werr := jobrecord.Write(ctx, s.bucket, recToJobrecord(rec)); werr != nil {
+		// Write failed — release the lease so another replica
+		// can take over and don't cache the job.
+		_ = lease.Release(ctx, s.bucket, leasePath)
+		return s.createLocal(key, table, operation), true
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.jobs[j.ID] = j
+	s.inflight[key] = j.ID
+	return *j, true
+}
+
+// createLocal is the in-process-only path used by both the
+// nil-bucket store (unit tests) and as a fallback when the
+// persistent path fails. Holds no lock; must be called with
+// caller responsible for serialization. NOTE: this version
+// does NOT touch S3 and so will not be visible to other
+// replicas — used only when persistent storage is unavailable
+// or in tests.
+func (s *jobStore) createLocal(key, table, operation string) Job {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	// Re-check inflight under the lock in case the fast-path
+	// missed by a hair.
+	if existingID, ok := s.inflight[key]; ok {
+		if existing, ok2 := s.jobs[existingID]; ok2 {
+			if existing.Status == "pending" || existing.Status == "running" {
+				return *existing
+			}
 		}
 	}
 	j := &Job{
@@ -121,28 +328,140 @@ func (s *jobStore) create(table, operation string) (Job, bool) {
 	}
 	s.jobs[j.ID] = j
 	s.inflight[key] = j.ID
-	return *j, true
+	return *j
+}
+
+// cacheForeignRecord stores a job record from another replica in
+// the local cache and returns a Job snapshot. The cached entry's
+// Owner field is set to the foreign owner from the record so the
+// jobStore can distinguish owned vs foreign cache entries on
+// subsequent get() calls. Foreign entries get refreshed from S3
+// on every get; owned entries are authoritative.
+func (s *jobStore) cacheForeignRecord(rec *Record) Job {
+	j := &Job{
+		ID:        rec.ID,
+		Status:    rec.Status,
+		Table:     rec.Table,
+		Operation: rec.Operation,
+		CreatedAt: rec.CreatedAt,
+		DoneAt:    rec.DoneAt,
+		Result:    rec.Result,
+		Error:     rec.Error,
+		Owner:     rec.Owner,
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	// Don't overwrite an existing OWNED entry with a foreign
+	// snapshot. (Shouldn't happen but defensive.)
+	if existing, ok := s.jobs[j.ID]; ok && existing.Owner == s.owner {
+		return *existing
+	}
+	s.jobs[j.ID] = j
+	return *j
+}
+
+// Record is the cmd/janitor-server-internal mirror of
+// jobrecord.Record. It's a separate type so the cmd/janitor-server
+// package owns its on-disk shape and can evolve it independently
+// of pkg/jobrecord. The recToJobrecord helper converts.
+type Record struct {
+	ID          string
+	Table       string
+	Operation   string
+	Status      string
+	CreatedAt   time.Time
+	HeartbeatAt time.Time
+	DoneAt      *time.Time
+	Result      json.RawMessage
+	Error       string
+	LeaseNonce  string
+	Owner       string
+}
+
+func recToJobrecord(r *Record) *jobrecord.Record {
+	return &jobrecord.Record{
+		ID:          r.ID,
+		Table:       r.Table,
+		Operation:   r.Operation,
+		Status:      r.Status,
+		CreatedAt:   r.CreatedAt,
+		HeartbeatAt: r.HeartbeatAt,
+		DoneAt:      r.DoneAt,
+		Result:      r.Result,
+		Error:       r.Error,
+		LeaseNonce:  r.LeaseNonce,
+		Owner:       r.Owner,
+	}
 }
 
 // get returns a value snapshot of the job. Returning a pointer
 // would leak the store's internal mutable state and race against
 // complete()/setRunning(). Callers that need to observe progress
 // must call get() repeatedly (e.g. the handleJobStatus poll).
+//
+// Persistent mode: cache miss falls back to a jobrecord.Read on
+// the bucket. The fetched record is cached as a foreign-record
+// snapshot so subsequent gets are fast. The cache is small and
+// foreign records DO NOT get invalidated automatically — for an
+// updated view, the client should poll repeatedly and the cache
+// will be re-populated each time the lookup goes through. (Phase
+// 4 may add a foreign-record TTL if this becomes an issue.)
 func (s *jobStore) get(id string) (Job, bool) {
 	s.mu.RLock()
-	defer s.mu.RUnlock()
 	j, ok := s.jobs[id]
-	if !ok {
+	if ok {
+		snapshot := *j
+		s.mu.RUnlock()
+		// Owned job in cache: cache is authoritative for "is this
+		// our work in progress?" but we still want to forward to
+		// S3 for foreign-record refreshes. Owned snapshot wins.
+		if snapshot.Owner == s.owner || s.bucket == nil {
+			return snapshot, true
+		}
+		// Foreign cached entry — refresh from S3 so the polling
+		// client sees the live progress on the owning replica.
+		if rec, rerr := jobrecord.Read(context.Background(), s.bucket, id); rerr == nil {
+			return s.cacheForeignRecord(recordFromJobrecord(rec)), true
+		}
+		// S3 read failed — return stale cached value rather than
+		// nothing. Better stale than 404.
+		return snapshot, true
+	}
+	s.mu.RUnlock()
+	// Cache miss + persistent mode: fall back to S3.
+	if s.bucket == nil {
 		return Job{}, false
 	}
-	return *j, true
+	rec, rerr := jobrecord.Read(context.Background(), s.bucket, id)
+	if rerr != nil {
+		return Job{}, false
+	}
+	return s.cacheForeignRecord(recordFromJobrecord(rec)), true
+}
+
+// (closing the function above)
+
+func recordFromJobrecord(r *jobrecord.Record) *Record {
+	return &Record{
+		ID:          r.ID,
+		Table:       r.Table,
+		Operation:   r.Operation,
+		Status:      r.Status,
+		CreatedAt:   r.CreatedAt,
+		HeartbeatAt: r.HeartbeatAt,
+		DoneAt:      r.DoneAt,
+		Result:      r.Result,
+		Error:       r.Error,
+		LeaseNonce:  r.LeaseNonce,
+		Owner:       r.Owner,
+	}
 }
 
 func (s *jobStore) complete(id string, result any, err error) {
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	j, ok := s.jobs[id]
 	if !ok {
+		s.mu.Unlock()
 		return
 	}
 	now := time.Now()
@@ -163,13 +482,57 @@ func (s *jobStore) complete(id string, result any, err error) {
 	if s.inflight[key] == id {
 		delete(s.inflight, key)
 	}
+	finalSnapshot := *j
+	s.mu.Unlock()
+
+	// Persist the terminal state to S3 and release the lease so
+	// other replicas can take over for the next maintain cycle.
+	// Failures here are best-effort: the job has already finished
+	// locally; an S3 outage shouldn't mask that.
+	if s.bucket != nil {
+		ctx := context.Background()
+		rec := &Record{
+			ID:          finalSnapshot.ID,
+			Table:       finalSnapshot.Table,
+			Operation:   finalSnapshot.Operation,
+			Status:      finalSnapshot.Status,
+			CreatedAt:   finalSnapshot.CreatedAt,
+			HeartbeatAt: time.Now(),
+			DoneAt:      finalSnapshot.DoneAt,
+			Result:      finalSnapshot.Result,
+			Error:       finalSnapshot.Error,
+			Owner:       s.owner,
+		}
+		_, _ = jobrecord.Write(ctx, s.bucket, recToJobrecord(rec))
+		_ = lease.Release(ctx, s.bucket, lease.Path(finalSnapshot.Table, finalSnapshot.Operation))
+	}
 }
 
 func (s *jobStore) setRunning(id string) {
 	s.mu.Lock()
-	defer s.mu.Unlock()
-	if j, ok := s.jobs[id]; ok {
-		j.Status = "running"
+	j, ok := s.jobs[id]
+	if !ok {
+		s.mu.Unlock()
+		return
+	}
+	j.Status = "running"
+	snapshot := *j
+	s.mu.Unlock()
+
+	// Persistent mode: write the running-state record so other
+	// replicas see we've started work.
+	if s.bucket != nil {
+		ctx := context.Background()
+		rec := &Record{
+			ID:          snapshot.ID,
+			Table:       snapshot.Table,
+			Operation:   snapshot.Operation,
+			Status:      "running",
+			CreatedAt:   snapshot.CreatedAt,
+			HeartbeatAt: time.Now(),
+			Owner:       s.owner,
+		}
+		_, _ = jobrecord.Write(ctx, s.bucket, recToJobrecord(rec))
 	}
 }
 

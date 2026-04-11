@@ -77,11 +77,16 @@ func main() {
 	}
 	defer cat.Close()
 
+	// Use the persistent jobStore so the lease + jobrecord layer
+	// is active in production. Multi-replica deployments rely on
+	// this for cross-replica dedup; single-replica deployments
+	// still get the local fast-path cache + persistent records
+	// for crash recovery and operator observability.
 	srv := &server{
 		cat:     cat,
 		logger:  logger,
 		started: time.Now(),
-		jobs:    newJobStore(),
+		jobs:    newPersistentJobStore(cat.Bucket()),
 	}
 
 	mux := http.NewServeMux()
