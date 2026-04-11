@@ -49,14 +49,9 @@ resource "aws_ecs_task_definition" "janitor_server" {
         "awslogs-stream-prefix" = "server"
       }
     }
-
-    healthCheck = {
-      command     = ["CMD-SHELL", "wget -q -O /dev/null http://localhost:8080/v1/healthz || exit 1"]
-      interval    = 15
-      timeout     = 5
-      retries     = 3
-      startPeriod = 10
-    }
+    # No container-level healthCheck — distroless image has no wget/curl
+    # to run the CMD-SHELL probe. The NLB target group already does an
+    # HTTP probe against /v1/healthz on the same port.
   }])
 }
 

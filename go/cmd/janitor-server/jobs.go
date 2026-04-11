@@ -14,6 +14,7 @@ import (
 
 	"github.com/mystictraveler/iceberg-janitor/go/pkg/janitor"
 	"github.com/mystictraveler/iceberg-janitor/go/pkg/maintenance"
+	"github.com/mystictraveler/iceberg-janitor/go/pkg/strategy/classify"
 
 	icebergtable "github.com/apache/iceberg-go/table"
 )
@@ -320,14 +321,42 @@ func (s *server) handleMaintainAsync(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	expireOpts := parseExpireOpts(r)
-	compactOpts := parseCompactOpts(r)
 	tableName := fmt.Sprintf("%s.%s", ident[0], ident[1])
-	job := s.jobs.create(tableName, "maintain")
-	s.logger.Info("maintain job created", "job_id", job.ID, "table", tableName,
-		"keep_last", expireOpts.KeepLast, "keep_within", expireOpts.KeepWithin)
 
-	go s.runMaintainJob(job.ID, ident, expireOpts, compactOpts)
+	// Load the table once here (cheap) so we can classify it and pick
+	// the right plan before spawning the job. If the table doesn't
+	// exist, fail fast with 404 instead of 202 + async error.
+	tbl, err := s.cat.LoadTable(r.Context(), ident)
+	if err != nil {
+		writeJSONError(w, http.StatusNotFound, "table not found", err)
+		return
+	}
+
+	// Classify the table from its commit history. The classifier is
+	// entirely offline — it walks the snapshot chain and counts
+	// foreign commits in the last 24h.
+	cr := classify.Classify(tbl)
+	plan := classify.ClassToOptions(cr.Class)
+
+	// Query params are OPTIONAL overrides. Callers who pass nothing
+	// get the class-driven defaults; callers who pass values get them
+	// merged over the plan.
+	if v := r.URL.Query().Get("mode"); v != "" {
+		plan.Mode = classify.MaintainMode(v)
+	}
+
+	job := s.jobs.create(tableName, "maintain")
+	s.logger.Info("maintain job created",
+		"job_id", job.ID,
+		"table", tableName,
+		"class", cr.Class,
+		"mode", plan.Mode,
+		"keep_last", plan.KeepLastSnapshots,
+		"keep_within", plan.KeepWithin,
+		"target_file_size", plan.TargetFileSizeBytes,
+	)
+
+	go s.runMaintainJob(job.ID, ident, plan)
 
 	writeJSON(w, http.StatusAccepted, job)
 }
@@ -335,25 +364,33 @@ func (s *server) handleMaintainAsync(w http.ResponseWriter, r *http.Request) {
 // maintainResult aggregates the outcomes of the three maintenance
 // steps so the caller can see exactly what happened in each phase.
 type maintainResult struct {
-	Expire              *maintenance.ExpireResult              `json:"expire,omitempty"`
-	RewriteManifests    *maintenance.RewriteManifestsResult    `json:"rewrite_manifests,omitempty"`
-	Compact             *janitor.CompactTableResult            `json:"compact,omitempty"`
-	PostCompactRewrite  *maintenance.RewriteManifestsResult    `json:"post_compact_rewrite,omitempty"`
-	Steps               []string                               `json:"steps_completed"`
-	TotalDurationMs     int64                                  `json:"total_duration_ms"`
+	Class               string                              `json:"class"`
+	Mode                string                              `json:"mode"`
+	Expire              *maintenance.ExpireResult           `json:"expire,omitempty"`
+	RewriteManifests    *maintenance.RewriteManifestsResult `json:"rewrite_manifests,omitempty"`
+	CompactFull         *janitor.CompactTableResult         `json:"compact_full,omitempty"`
+	CompactHot          *janitor.CompactHotResult           `json:"compact_hot,omitempty"`
+	CompactCold         *janitor.CompactColdResult          `json:"compact_cold,omitempty"`
+	PostCompactRewrite  *maintenance.RewriteManifestsResult `json:"post_compact_rewrite,omitempty"`
+	Steps               []string                            `json:"steps_completed"`
+	TotalDurationMs     int64                               `json:"total_duration_ms"`
 }
 
-func (s *server) runMaintainJob(jobID string, ident icebergtable.Identifier, expireOpts maintenance.ExpireOptions, compactOpts janitor.CompactOptions) {
+func (s *server) runMaintainJob(jobID string, ident icebergtable.Identifier, plan classify.MaintainOptions) {
 	s.jobs.setRunning(jobID)
 	started := time.Now()
 	tableName := fmt.Sprintf("%s.%s", ident[0], ident[1])
-	s.logger.Info("maintain job started", "job_id", jobID, "table", tableName)
+	s.logger.Info("maintain job started", "job_id", jobID, "table", tableName, "mode", plan.Mode)
 
 	ctx := context.Background()
-	mr := &maintainResult{}
+	mr := &maintainResult{Mode: string(plan.Mode)}
 
 	// Step 1: expire — drop old snapshots so the manifest list
 	// we're about to consolidate doesn't include dead references.
+	expireOpts := maintenance.ExpireOptions{
+		KeepLast:   plan.KeepLastSnapshots,
+		KeepWithin: plan.KeepWithin,
+	}
 	expireResult, err := maintenance.Expire(ctx, s.cat, ident, expireOpts)
 	mr.Expire = expireResult
 	if err != nil {
@@ -382,25 +419,72 @@ func (s *server) runMaintainJob(jobID string, ident icebergtable.Identifier, exp
 		"before_manifests", preRewrite.BeforeManifests, "after_manifests", preRewrite.AfterManifests,
 		"elapsed_ms", preRewrite.DurationMs)
 
-	// Step 3: compact ALL partitions with small files in parallel.
-	// Runs fast because the manifest list was just consolidated.
-	// CompactTable discovers partitions, fires a bounded worker pool
-	// (8 concurrent), and compacts each independently. Single-
-	// partition failures don't abort the others.
-	compactResult, err := janitor.CompactTable(ctx, s.cat, ident, compactOpts)
-	mr.Compact = compactResult
-	if err != nil {
+	// Step 3: compact. Dispatch by mode from the class-driven plan:
+	//
+	//   hot  — CompactHot: delta-stitch active partitions only
+	//   cold — CompactCold: trigger-based full compaction of cold partitions
+	//   full — CompactTable: parallel full compaction of all partitions (legacy)
+	//
+	// hot and cold are complementary — they touch disjoint partition
+	// sets. Running "full" is the safe override that handles everything
+	// in one pass.
+	var compactErr error
+	switch plan.Mode {
+	case classify.ModeHot:
+		hotResult, err := janitor.CompactHot(ctx, s.cat, ident, janitor.CompactHotOptions{
+			SmallFileThresholdBytes: plan.TargetFileSizeBytes,
+			HotWindowSnapshots:      5,
+			MinSmallFiles:           2,
+		})
+		mr.CompactHot = hotResult
+		compactErr = err
+		if err == nil && hotResult != nil {
+			s.logger.Info("maintain: compact_hot done", "job_id", jobID, "table", tableName,
+				"partitions_hot", hotResult.PartitionsHot,
+				"partitions_stitched", hotResult.PartitionsStitched,
+				"partitions_failed", hotResult.PartitionsFailed,
+				"elapsed_ms", hotResult.TotalDurationMs)
+		}
+	case classify.ModeCold:
+		coldResult, err := janitor.CompactCold(ctx, s.cat, ident, janitor.CompactColdOptions{
+			SmallFileThresholdBytes: plan.TargetFileSizeBytes,
+			SmallFileTrigger:        plan.SmallFileThreshold,
+			FileCountTrigger:        200,
+			StaleRewriteAge:         plan.StaleRewriteAge,
+			HotWindowSnapshots:      5,
+			TargetFileSizeBytes:     plan.TargetFileSizeBytes,
+		})
+		mr.CompactCold = coldResult
+		compactErr = err
+		if err == nil && coldResult != nil {
+			s.logger.Info("maintain: compact_cold done", "job_id", jobID, "table", tableName,
+				"partitions_cold", coldResult.PartitionsCold,
+				"partitions_triggered", coldResult.PartitionsTriggered,
+				"partitions_compacted", coldResult.PartitionsCompacted,
+				"partitions_failed", coldResult.PartitionsFailed,
+				"elapsed_ms", coldResult.TotalDurationMs)
+		}
+	default: // ModeFull or unknown
+		compactResult, err := janitor.CompactTable(ctx, s.cat, ident, janitor.CompactOptions{
+			TargetFileSizeBytes: plan.TargetFileSizeBytes,
+		})
+		mr.CompactFull = compactResult
+		compactErr = err
+		if err == nil && compactResult != nil {
+			s.logger.Info("maintain: compact_full done", "job_id", jobID, "table", tableName,
+				"partitions_found", compactResult.PartitionsFound,
+				"partitions_compacted", compactResult.PartitionsSucceeded,
+				"partitions_failed", compactResult.PartitionsFailed,
+				"elapsed_ms", compactResult.TotalDurationMs)
+		}
+	}
+	if compactErr != nil {
 		mr.TotalDurationMs = time.Since(started).Milliseconds()
-		s.jobs.complete(jobID, mr, fmt.Errorf("compact: %w", err))
-		s.logger.Error("maintain job failed at compact", "job_id", jobID, "table", tableName, "err", err)
+		s.jobs.complete(jobID, mr, fmt.Errorf("compact: %w", compactErr))
+		s.logger.Error("maintain job failed at compact", "job_id", jobID, "table", tableName, "err", compactErr)
 		return
 	}
 	mr.Steps = append(mr.Steps, "compact")
-	s.logger.Info("maintain: compact done", "job_id", jobID, "table", tableName,
-		"partitions_found", compactResult.PartitionsFound,
-		"partitions_compacted", compactResult.PartitionsSucceeded,
-		"partitions_failed", compactResult.PartitionsFailed,
-		"elapsed_ms", compactResult.TotalDurationMs)
 
 	// Step 4: rewrite-manifests (post-compact) — fold compact's new
 	// micro-manifest back into the partition-organized layout so the
@@ -421,7 +505,7 @@ func (s *server) runMaintainJob(jobID string, ident icebergtable.Identifier, exp
 	mr.TotalDurationMs = time.Since(started).Milliseconds()
 	s.jobs.complete(jobID, mr, nil)
 	s.logger.Info("maintain job completed", "job_id", jobID, "table", tableName,
-		"steps", mr.Steps, "total_ms", mr.TotalDurationMs)
+		"mode", plan.Mode, "steps", mr.Steps, "total_ms", mr.TotalDurationMs)
 }
 
 // handleJobStatus returns the current status of a job.

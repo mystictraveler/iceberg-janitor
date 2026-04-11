@@ -33,4 +33,4 @@ COPY --from=build /out/janitor-streamer /usr/local/bin/janitor-streamer
 COPY test/bench/ /bench/
 RUN chmod +x /bench/*.sh
 WORKDIR /bench
-ENTRYPOINT ["/bench/bench-tpcds-athena.sh"]
+ENTRYPOINT ["/bench/bench.sh", "aws"]

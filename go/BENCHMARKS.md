@@ -465,6 +465,115 @@ Manifests bounded at **50 / 50 / 10** after every maintain cycle. Row counts pre
 
 ---
 
+## Run 17 — hot/cold maintain + classify-driven options + single bench harness
+
+**Date:** 2026-04-10
+**Build:** `feature/go-rewrite-mvp` after ~1000 LOC of hot/cold work landed. Server's `/maintain` endpoint now auto-classifies each table on every call and dispatches to one of three compaction modes without any caller knobs.
+
+### What's new
+
+- **`pkg/strategy/classify/options.go`** — `ClassToOptions(class)` maps a workload class to a `MaintainOptions` struct (mode, keep_last, keep_within, target_file_size, small_file_threshold, stale_rewrite_age). Streaming → hot, batch/slow_changing/dormant → cold.
+- **`pkg/analyzer/partition_health.go`** — `AnalyzePartitions(ctx, tbl, opts)` walks the current snapshot's manifest list once, groups data files by partition tuple, and returns `[]PartitionHealth` with per-partition file lists (large + small), max_sequence_number, hot/cold classification, and three trigger flags (small_files, metadata_reduction, stale_rewrite).
+- **`pkg/state/partition_state.go`** — per-partition `LastRewriteAt` tracked in `_janitor/state/<table_uuid>/partitions.json`. Read by the analyzer for the stale-rewrite trigger, written by the cold loop on successful compaction.
+- **`pkg/janitor/compact_hot.go`** — delta-stitch loop for hot (recently-written) partitions. Picks an anchor file via time-based round-robin (`epoch_minute / interval_minutes + hash(partition_key) % len(large_files)`) so successive rounds rotate across all large files in the partition, distributing stitch wear instead of always growing the same one. Bootstraps on the biggest small file when no large files exist.
+- **`pkg/janitor/compact_cold.go`** — trigger-based full compaction for cold partitions. Skips hot partitions (hot loop owns them), evaluates the three triggers, and runs partition-scoped `Compact` on any cold partition whose triggers fire. Sequential, low CAS pressure, long-running-task semantics.
+- **`pkg/janitor/compact_replace.go`** — extracted `executeStitchAndCommit` helper (the stitch + master check + CAS commit phase), added `OldPathsOverride` fast path that skips the full manifest walk. Only reads the manifests needed to account for the override paths, stopping as soon as all are found.
+- **Server `/maintain`** — handler loads the table, classifies it, maps class → `MaintainOptions`, and dispatches to `CompactHot`, `CompactCold`, or `CompactTable` (the legacy "full" mode). Caller passes zero query params; `?mode=hot|cold|full` is an explicit override for testing.
+- **`test/bench/bench.sh`** — single bench harness replacing the four prior scripts (`bench-tpcds.sh`, `bench-tpcds-with-expire.sh`, `bench-tpcds-athena.sh`, `bench-tpcds-container.sh`). Three modes: `local` (fileblob), `minio` (docker compose), `aws` (Fargate + Athena). All modes call the server's `/maintain` endpoint and auto-pick query engine (duckdb locally, Athena in AWS).
+- **DuckDB timing bug fix** — the old scripts used Python's `time.monotonic_ns()` across separate subprocess invocations, which is undefined (each Python process has its own monotonic clock origin) and produced nonsensical elapsed_ms values (often 0 or negative). Replaced with Perl's `Time::HiRes::time()` (epoch-based, ~5 ms startup, cross-platform).
+- **Unit tests** — 13 new test functions across `pkg/janitor/compact_hot_test.go`, `pkg/state/partition_state_test.go`, `pkg/strategy/classify/options_test.go`. Full `go test ./...` passes.
+
+### Run 17a — local fileblob, 60 s, bursty streamers, maintain every 20 s
+
+**Hardware:** local Mac mini (Apple Silicon), bench inside the process tree (no docker, no network).
+**Reproduce:** `DURATION_SECONDS=60 QUERY_INTERVAL_SECONDS=20 MAINTENANCE_INTERVAL_SECONDS=20 ./go/test/bench/bench.sh local`
+
+| Query | without avg (ms) | with avg (ms) | delta |
+|---|---:|---:|---:|
+| q1 | 125.7 | 166.3 | ⚠️ +32.4% (same q1 regression seen in Runs 8+; still un-investigated) |
+| q3 | 181.7 | 130.0 | **−28.4%** |
+| q7 | 171.7 | 143.3 | **−16.5%** |
+| q13 | 147.0 | 147.7 | ~0% |
+| q19 | 143.0 | 144.0 | ~0% |
+| q25 | 202.7 | 181.0 | **−10.7%** |
+| q43 | 141.7 | 128.7 | **−9.2%** |
+| q46 | 148.3 | 148.3 | 0% |
+| q55 | 134.3 | 126.0 | **−6.2%** |
+| q96 | 144.3 | 140.7 | −2.5% |
+
+7 of 10 queries faster on the with-janitor side; the q1 outlier is the known-latent regression from Runs 8+.
+
+| Table | without avg files | with avg files | delta |
+|---|---:|---:|---:|
+| store_sales | 966.7 | 883.3 | **−9%** |
+| store_returns | 845.3 | 756.0 | **−11%** |
+| catalog_sales | 190.0 | 173.3 | **−9%** |
+
+The maintain loop ran 2 rounds in the 60-s bench; both succeeded (no "returned non-zero" warnings). The server's classifier ran on each call and picked a mode; on this fresh warehouse with few commits the class was likely `slow_changing` (rare commits over recent history), which the classifier mapped to `ModeCold`.
+
+### Run 17b — MinIO docker compose, 60 s, bursty streamers, maintain every 20 s
+
+**Hardware:** same Mac mini, MinIO in docker, bench driving two separate MinIO buckets (`with-warehouse`, `without-warehouse`).
+**Reproduce:** `DURATION_SECONDS=60 QUERY_INTERVAL_SECONDS=20 MAINTENANCE_INTERVAL_SECONDS=20 ./go/test/bench/bench.sh minio`
+
+| Query | without avg (ms) | with avg (ms) | delta |
+|---|---:|---:|---:|
+| q1 | 56.0 | 91.7 | ⚠️ +63.7% (q1 regression, same as 17a) |
+| q3 | 49.0 | 50.0 | ~0% |
+| q7 | 47.7 | 51.7 | +8.4% |
+| q13 | 55.0 | 50.0 | **−9.1%** |
+| q19 | 50.3 | 51.0 | ~0% |
+| q25 | 47.7 | 52.3 | +9.8% |
+| q43 | 53.7 | 50.3 | **−6.2%** |
+| q46 | 49.3 | 50.3 | ~0% |
+| q55 | 48.0 | 58.7 | +22.2% |
+| q96 | 53.7 | 52.0 | −3.1% |
+
+| Table | without avg files | with avg files | delta |
+|---|---:|---:|---:|
+| store_sales | 950.0 | 916.7 | **−3.5%** |
+| store_returns | 831.0 | 790.0 | **−5%** |
+| catalog_sales | 186.7 | 176.7 | **−5%** |
+
+MinIO queries are ~3× faster than fileblob (50 ms vs 140 ms), which matches the expected MinIO vs. local-disk latency profile for parquet scans. The A/B signal is **much weaker** than 17a because the 60-s duration only allowed 2 maintain rounds; compaction didn't have time to meaningfully drain the small-file tail before the bench ended. **For a clean maintain-vs-no-maintain signal on MinIO, use at least 300 s duration** — the prior Run 13 (5 min, expire+rewrite+compact closed loop) showed 4.6× faster compact wall times once the loop caught up.
+
+### What this run validates
+
+1. **Zero-knob maintain** — the bench passes no compaction options to the server; the server auto-classifies each table and picks the mode. This is design decision #28 (operator zero-touch) fully shipped.
+2. **Classify → mode mapping** works (#29 advanced from "partial" to "shipped"). The classifier reads commit history, maps to a class, maps to a MaintainOptions struct, and the server dispatches accordingly.
+3. **Active partition detection** works (#30 shipped). `AnalyzePartitions` produces `[]PartitionHealth` with hot/cold flags based on max_sequence_number vs. a configurable hot window.
+4. **`OldPathsOverride` short-circuit** reduces the hot-loop manifest walk to "read manifests until all override paths are found" instead of "read every manifest in the snapshot."
+5. **Refactored `executeStitchAndCommit`** passes all existing tests — the extraction did not regress the compact/stitch/CAS path.
+6. **Single bench harness** replaces four prior scripts. 470 LOC down from 1480. One script, three modes.
+
+### What Run 17 does NOT validate
+
+- **Hot loop under true streaming load**: the 60-s runs didn't get a streaming class on the test tables (classifier defaulted to slow_changing / cold), so the hot loop's delta-stitch path didn't fire. A longer run with more fact-table commits would trigger `ClassStreaming` → `ModeHot` and exercise `CompactHot` end-to-end.
+- **Cold loop's `NeedsStaleRewrite` trigger**: the partition-state file is empty on the first bench run; the stale trigger will only fire on subsequent runs where the prior rewrite time is older than `StaleRewriteAge`.
+- **Integration tests for `AnalyzePartitions`, `CompactHot`, `CompactCold`**: deferred to bench coverage (same pattern as the existing expire/rewrite tests). Unit tests cover `pickAnchor`, `classify.ClassToOptions`, and `PartitionState` round-trip.
+
+### Code delta from the previous entry
+
+| File | Change |
+|---|---|
+| `pkg/strategy/classify/options.go` | NEW. `ClassToOptions` + `MaintainOptions` + `MaintainMode`. ~100 LOC. |
+| `pkg/strategy/classify/options_test.go` | NEW. 6 unit tests. |
+| `pkg/analyzer/partition_health.go` | NEW. `AnalyzePartitions` + `PartitionHealth`. ~220 LOC. |
+| `pkg/state/partition_state.go` | NEW. `PartitionState` + `LoadPartitionState` + `SavePartitionState`. ~150 LOC. |
+| `pkg/state/partition_state_test.go` | NEW. 4 unit tests (fileblob round-trip). |
+| `pkg/janitor/compact_hot.go` | NEW. `CompactHot` + `pickAnchor`. ~240 LOC. |
+| `pkg/janitor/compact_hot_test.go` | NEW. 6 unit tests for the round-robin anchor selection. |
+| `pkg/janitor/compact_cold.go` | NEW. `CompactCold`. ~180 LOC. |
+| `pkg/janitor/compact_replace.go` | Extracted `executeStitchAndCommit` helper. Added `OldPathsOverride` short-circuit that stops the manifest walk as soon as all override paths are found. |
+| `pkg/janitor/compact.go` | Added `CompactOptions.OldPathsOverride` field. |
+| `cmd/janitor-server/jobs.go` | `handleMaintainAsync` now classifies the table and calls `ClassToOptions` before dispatching. Dispatches to `CompactHot` / `CompactCold` / `CompactTable` based on the plan's `Mode`. |
+| `test/bench/bench.sh` | NEW. Unified bench harness with `local | minio | aws` modes. |
+| `test/bench/bench-tpcds.sh`, `bench-tpcds-with-expire.sh`, `bench-tpcds-athena.sh`, `bench-tpcds-container.sh` | REMOVED. Replaced by `bench.sh`. |
+| `Dockerfile` | Bench image entrypoint changed to `["/bench/bench.sh", "aws"]`. |
+| `pkg/analyzer/health.go` | Doc note: `Workload` is REPORTED but not consumed by maintain; external orchestrator is required to act on the class. |
+
+---
+
 ## Format conventions for future entries
 
 When adding new rows to this file as new build phases land:

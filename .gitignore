@@ -43,4 +43,4 @@ Thumbs.db
 bench-results/
 go/streamer
 go/janitor-cli
-go/streamer
+go/janitor-cli-darwin

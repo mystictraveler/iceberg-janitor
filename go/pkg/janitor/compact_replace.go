@@ -19,6 +19,7 @@ import (
 	"golang.org/x/sync/errgroup"
 
 	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
 
 	"github.com/mystictraveler/iceberg-janitor/go/pkg/catalog"
 	"github.com/mystictraveler/iceberg-janitor/go/pkg/observe"
@@ -143,17 +144,82 @@ func compactOnce(ctx context.Context, cat *catalog.DirectoryCatalog, ident icebe
 		return fmt.Errorf("getting fs: %w", err)
 	}
 
-	// Step 1: walk the snapshot's manifest list and collect every
-	// data-file entry. Build the typed partition predicates once.
-	//
-	// buildPartitionLiterals parses the user's raw `--partition col=value`
-	// strings into typed iceberg.Literal values keyed by partition
-	// field id. The two predicates below — matchPart (per-data-file
-	// equality) and matchManifest (per-manifest bound check, used
-	// to prune the GET storm before reading any manifests) — both
-	// take this same typed binding slice and operate at different
-	// layers. See compact_partition_types.go for the type-aware
-	// parsing and comparison primitives.
+	// Hot-loop fast path: if the caller provided OldPathsOverride,
+	// short-circuit the full manifest walk. We still need per-file row
+	// counts for the master check, so we walk manifests sequentially
+	// and stop AS SOON as every override path has been accounted for.
+	// On a hot streaming table the override files are typically the
+	// most recent commits, so they live in the youngest manifests at
+	// the head of the list — we expect to read 1-2 manifests instead
+	// of hundreds. Saves the dominant cost of the hot loop.
+	if len(opts.OldPathsOverride) > 0 {
+		_, fastSpan := tr.Start(ctx, "manifest_walk_override")
+		want := make(map[string]int64, len(opts.OldPathsOverride))
+		for _, p := range opts.OldPathsOverride {
+			want[p] = -1 // sentinel: not yet found
+		}
+		manifests, err := snap.Manifests(fs)
+		if err != nil {
+			fastSpan.End()
+			return fmt.Errorf("listing manifests: %w", err)
+		}
+		manifestsRead := 0
+		for _, m := range manifests {
+			mf, err := fs.Open(m.FilePath())
+			if err != nil {
+				fastSpan.End()
+				return fmt.Errorf("opening manifest %s: %w", m.FilePath(), err)
+			}
+			entries, err := icebergpkg.ReadManifest(m, mf, true)
+			mf.Close()
+			manifestsRead++
+			if err != nil {
+				fastSpan.End()
+				return fmt.Errorf("reading manifest %s: %w", m.FilePath(), err)
+			}
+			for _, e := range entries {
+				df := e.DataFile()
+				if df == nil || df.ContentType() != icebergpkg.EntryContentData {
+					continue
+				}
+				if rows, ok := want[df.FilePath()]; ok && rows < 0 {
+					want[df.FilePath()] = df.Count()
+				}
+			}
+			// Early exit: all override paths accounted for.
+			done := true
+			for _, rows := range want {
+				if rows < 0 {
+					done = false
+					break
+				}
+			}
+			if done {
+				break
+			}
+		}
+		var oldPaths []string
+		var expectedRows int64
+		for _, p := range opts.OldPathsOverride {
+			rows := want[p]
+			if rows < 0 {
+				fastSpan.End()
+				return fmt.Errorf("override path not found in current snapshot: %s", p)
+			}
+			oldPaths = append(oldPaths, p)
+			expectedRows += rows
+		}
+		fastSpan.SetAttributes(
+			observe.Manifests(manifestsRead),
+			observe.Files(len(oldPaths)),
+			observe.Rows(expectedRows),
+		)
+		fastSpan.End()
+		return executeStitchAndCommit(ctx, tr, tbl, fs, ident, oldPaths, expectedRows, opts, result, cat)
+	}
+
+	// Slow path: walk the full manifest list with per-partition
+	// predicates and Pattern B filtering.
 	icebergSchema := tbl.Metadata().CurrentSchema()
 	partitionBindings, err := buildPartitionLiterals(opts.PartitionTuple, icebergSchema, tbl.Spec())
 	if err != nil {
@@ -260,6 +326,27 @@ func compactOnce(ctx context.Context, cat *catalog.DirectoryCatalog, ident icebe
 		return nil // nothing to compact
 	}
 
+	return executeStitchAndCommit(ctx, tr, tbl, fs, ident, oldPaths, expectedRows, opts, result, cat)
+}
+
+// executeStitchAndCommit takes a resolved file selection (oldPaths +
+// expectedRows) and runs the stitch → master check → commit phases.
+// Both the slow path (full manifest walk) and the hot loop fast path
+// (OldPathsOverride) call this function. Extracted so the hot loop
+// doesn't have to duplicate ~180 lines of stitch + commit code.
+func executeStitchAndCommit(
+	ctx context.Context,
+	tr trace.Tracer,
+	tbl *icebergtable.Table,
+	fs icebergio.IO,
+	ident icebergtable.Identifier,
+	oldPaths []string,
+	expectedRows int64,
+	opts CompactOptions,
+	result *CompactResult,
+	cat *catalog.DirectoryCatalog,
+) error {
+	icebergSchema := tbl.Metadata().CurrentSchema()
 	// Step 2: open the destination Parquet file. The location
 	// provider gives us <table>/data/<filename>.
 	locProv, err := tbl.LocationProvider()

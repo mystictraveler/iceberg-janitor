@@ -11,7 +11,7 @@
 //
 //	go build -tags bench ./test/bench/streamer
 //
-// The bench harness (test/bench/bench-tpcds.sh) and the Makefile mvp
+// The bench harness (test/bench/bench.sh) and the Makefile mvp
 // targets pass `-tags bench` for this purpose.
 //
 // It seeds the 9 dimension tables once at startup and then streams

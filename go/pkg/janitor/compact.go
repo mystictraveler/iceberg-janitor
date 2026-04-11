@@ -166,6 +166,23 @@ type CompactOptions struct {
 	// This is the implementation of github.com/mystictraveler/iceberg-janitor#2
 	// (CB8: consecutive failure pause).
 	CircuitBreaker *safety.CircuitBreaker
+
+	// OldPathsOverride, if non-empty, replaces the manifest-walk file
+	// selection with this exact list. The compactor stitches these
+	// files into one new file and replaces them via CAS, skipping the
+	// per-partition discovery logic. Used by the hot loop to do delta
+	// stitching: the orchestrator picks an "anchor" large file plus
+	// the small files added since the last round, and the compactor
+	// just executes the replace.
+	//
+	// All paths must belong to the same partition (the master check
+	// will fail otherwise on the row count invariant). The orchestrator
+	// is responsible for the file selection; this option is the escape
+	// hatch that lets it inject the result.
+	//
+	// When set, PartitionTuple and TargetFileSizeBytes are ignored —
+	// the file list is taken at face value.
+	OldPathsOverride []string
 }
 
 func (o *CompactOptions) defaults() {
