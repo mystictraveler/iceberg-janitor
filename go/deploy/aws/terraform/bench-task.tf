@@ -96,5 +96,5 @@ resource "aws_ecs_task_definition" "bench" {
 
 resource "aws_cloudwatch_log_group" "bench" {
   name              = "/ecs/${var.project}-bench"
-  retention_in_days = 14
+  retention_in_days = 90
 }

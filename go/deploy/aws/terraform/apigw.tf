@@ -154,7 +154,7 @@ resource "aws_api_gateway_stage" "main" {
 
 resource "aws_cloudwatch_log_group" "apigw" {
   name              = "/apigateway/${var.project}"
-  retention_in_days = 14
+  retention_in_days = 90
 }
 
 # --- VPC endpoint for execute-api (reuse existing in default VPC) ---

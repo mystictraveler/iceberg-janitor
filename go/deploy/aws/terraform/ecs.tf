@@ -9,7 +9,7 @@ resource "aws_ecs_cluster" "main" {
 
 resource "aws_cloudwatch_log_group" "janitor" {
   name              = "/ecs/${var.project}"
-  retention_in_days = 14
+  retention_in_days = 90
 }
 
 resource "aws_ecs_task_definition" "janitor_server" {

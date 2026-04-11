@@ -677,3 +677,37 @@ while IFS= read -r csv_line; do
   printf '%s\n' "$csv_line"
 done < "$RESULTS_CSV"
 log "================="
+
+# === Phase 7: persist artifacts to S3 (aws mode only) ===
+#
+# The bench container's /bench-results directory is ephemeral — it
+# dies with the Fargate task. Without this upload, a future user who
+# wants to revisit the numbers has to archaeology through CloudWatch
+# for the raw CSV rows. Instead, copy everything to a durable S3
+# prefix that survives the task and is keyed by the run timestamp.
+#
+# Bucket: ATHENA_RESULTS_BUCKET is already provisioned by terraform
+# and already writable by the bench task role (it's used for Athena
+# results). Reusing it avoids a new IAM policy.
+#
+# Layout:
+#   s3://$ATHENA_RESULTS_BUCKET/bench-runs/$TS/
+#     ├── bench-summary.txt
+#     ├── bench-results.csv
+#     ├── streamer-with.log
+#     ├── streamer-without.log
+#     └── janitor-runs.log
+if [[ "$MODE" == "aws" && -n "${ATHENA_RESULTS_BUCKET:-}" ]]; then
+  s3_prefix="s3://${ATHENA_RESULTS_BUCKET}/bench-runs/${TS}"
+  log "persisting bench artifacts to ${s3_prefix}/"
+  for f in "$SUMMARY_TXT" "$RESULTS_CSV" "$STREAMER_WITH_LOG" "$STREAMER_WITHOUT_LOG" "$JANITOR_LOG"; do
+    [[ -f "$f" ]] || continue
+    base=$(basename "$f")
+    if aws s3 cp "$f" "${s3_prefix}/${base}" --region "$AWS_REGION" --only-show-errors 2>>"$JANITOR_LOG"; then
+      log "  uploaded $base"
+    else
+      log "  warning: failed to upload $base"
+    fi
+  done
+  log "bench artifacts persisted at ${s3_prefix}/"
+fi
