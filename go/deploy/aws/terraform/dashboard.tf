@@ -4,10 +4,13 @@
 #   Row 1 — System health (Fargate CPU/mem, S3 bytes)
 #   Row 2 — Namespace overview: job throughput by operation
 #   Row 3 — Maintain pipeline: phase timings rolled up across all tables
-#   Row 4 — Per-table compact effectiveness (file count reduction)
-#   Row 5 — Per-table manifest consolidation
-#   Row 6 — Per-table maintain wall time (table-level drill-down)
-#   Row 7 — Errors (last 50)
+#   Row 4 — Hot/cold classifier decisions per table (NEW)
+#   Row 5 — Hot-path telemetry (delta stitch, per table) (NEW)
+#   Row 6 — Cold-path telemetry (trigger-based compact, per table) (NEW)
+#   Row 7 — Per-table compact effectiveness (file count reduction)
+#   Row 8 — Per-table manifest consolidation
+#   Row 9 — Per-table maintain wall time + expire
+#   Row 10 — Errors (last 50)
 #
 # Drill-down model: top widgets are namespace rollups; bottom widgets
 # break down by table. Filter the dashboard time range or click a row
@@ -132,11 +135,125 @@ resource "aws_cloudwatch_dashboard" "main" {
         }
       },
 
-      # === Row 4: Per-table compact effectiveness ===
+      # === Row 4: Classifier decisions per table (hot vs cold vs full) ===
       {
         type   = "log"
         x      = 0
         y      = 18
+        width  = 12
+        height = 6
+        properties = {
+          title  = "Classifier decisions per table (class → mode)"
+          region = var.region
+          query  = <<-EOQ
+            SOURCE '${aws_cloudwatch_log_group.janitor.name}'
+            | filter msg = "maintain job created"
+            | stats count() as calls, latest(class) as latest_class, latest(mode) as latest_mode by table
+            | sort calls desc
+          EOQ
+          view = "table"
+        }
+      },
+      {
+        type   = "log"
+        x      = 12
+        y      = 18
+        width  = 12
+        height = 6
+        properties = {
+          title  = "Mode mix over time (streaming=hot, batch/slow/dormant=cold)"
+          region = var.region
+          query  = <<-EOQ
+            SOURCE '${aws_cloudwatch_log_group.janitor.name}'
+            | filter msg = "maintain job created"
+            | stats count() by mode, bin(2m)
+          EOQ
+          view    = "timeSeries"
+          stacked = true
+        }
+      },
+
+      # === Row 5: Hot-path telemetry (delta stitch) ===
+      {
+        type   = "log"
+        x      = 0
+        y      = 24
+        width  = 12
+        height = 6
+        properties = {
+          title  = "Hot tables — partitions stitched (delta-stitch outcomes)"
+          region = var.region
+          query  = <<-EOQ
+            SOURCE '${aws_cloudwatch_log_group.janitor.name}'
+            | filter msg = "maintain: compact_hot done"
+            | stats sum(partitions_hot) as total_hot, sum(partitions_stitched) as total_stitched, sum(partitions_failed) as total_failed, avg(elapsed_ms) as avg_ms, count() as rounds by table
+            | sort total_stitched desc
+          EOQ
+          view = "table"
+        }
+      },
+      {
+        type   = "log"
+        x      = 12
+        y      = 24
+        width  = 12
+        height = 6
+        properties = {
+          title  = "Hot path — stitch throughput (partitions/round, all tables)"
+          region = var.region
+          query  = <<-EOQ
+            SOURCE '${aws_cloudwatch_log_group.janitor.name}'
+            | filter msg = "maintain: compact_hot done"
+            | stats sum(partitions_stitched) as stitched, sum(partitions_failed) as failed by bin(2m)
+          EOQ
+          view    = "timeSeries"
+          stacked = false
+        }
+      },
+
+      # === Row 6: Cold-path telemetry (trigger-based compact) ===
+      {
+        type   = "log"
+        x      = 0
+        y      = 30
+        width  = 12
+        height = 6
+        properties = {
+          title  = "Cold tables — trigger hit rate (per table)"
+          region = var.region
+          query  = <<-EOQ
+            SOURCE '${aws_cloudwatch_log_group.janitor.name}'
+            | filter msg = "maintain: compact_cold done"
+            | stats sum(partitions_cold) as total_cold, sum(partitions_triggered) as total_triggered, sum(partitions_compacted) as total_compacted, sum(partitions_failed) as total_failed, avg(elapsed_ms) as avg_ms, count() as rounds by table
+            | sort total_compacted desc
+          EOQ
+          view = "table"
+        }
+      },
+      {
+        type   = "log"
+        x      = 12
+        y      = 30
+        width  = 12
+        height = 6
+        properties = {
+          title  = "Cold path — trigger firings over time"
+          region = var.region
+          query  = <<-EOQ
+            SOURCE '${aws_cloudwatch_log_group.janitor.name}'
+            | filter msg = "maintain: compact_cold done"
+            | stats sum(partitions_triggered) as triggered, sum(partitions_compacted) as compacted by bin(2m)
+          EOQ
+          view    = "timeSeries"
+          stacked = false
+        }
+      },
+
+      # === Row 7: Per-table compact effectiveness ===
+      {
+        type   = "log"
+        x      = 0
+        y      = 36
         width  = 24
         height = 6
         properties = {
@@ -152,11 +269,11 @@ resource "aws_cloudwatch_dashboard" "main" {
         }
       },
 
-      # === Row 5: Per-table manifest consolidation ===
+      # === Row 8: Per-table manifest consolidation ===
       {
         type   = "log"
         x      = 0
-        y      = 24
+        y      = 42
         width  = 24
         height = 6
         properties = {
@@ -172,11 +289,11 @@ resource "aws_cloudwatch_dashboard" "main" {
         }
       },
 
-      # === Row 6: Per-table maintain wall time ===
+      # === Row 9: Per-table maintain wall time ===
       {
         type   = "log"
         x      = 0
-        y      = 30
+        y      = 48
         width  = 12
         height = 6
         properties = {
@@ -185,7 +302,7 @@ resource "aws_cloudwatch_dashboard" "main" {
           query  = <<-EOQ
             SOURCE '${aws_cloudwatch_log_group.janitor.name}'
             | filter msg = "maintain job completed"
-            | stats avg(total_ms) as avg_ms, max(total_ms) as max_ms, count() as runs by table
+            | stats avg(total_ms) as avg_ms, max(total_ms) as max_ms, count() as runs by table, mode
             | sort avg_ms desc
           EOQ
           view = "table"
@@ -194,7 +311,7 @@ resource "aws_cloudwatch_dashboard" "main" {
       {
         type   = "log"
         x      = 12
-        y      = 30
+        y      = 48
         width  = 12
         height = 6
         properties = {
@@ -210,11 +327,11 @@ resource "aws_cloudwatch_dashboard" "main" {
         }
       },
 
-      # === Row 7: Errors ===
+      # === Row 10: Errors ===
       {
         type   = "log"
         x      = 0
-        y      = 36
+        y      = 54
         width  = 24
         height = 6
         properties = {
