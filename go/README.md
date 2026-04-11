@@ -35,7 +35,7 @@ test/
 
 ## Status
 
-**19/30 design decisions fully shipped, 5 partially shipped, 6 pending.** The core maintenance pipeline (compact + expire + rewrite-manifests + all 11 circuit breakers) is proven end-to-end with bench evidence on bursty streaming workloads. AWS deployment on ECS Fargate is operational.
+**22/30 design decisions fully shipped, 3 partially shipped, 5 pending.** The core maintenance pipeline (compact + expire + rewrite-manifests + all 11 circuit breakers) is proven end-to-end with bench evidence on bursty streaming workloads. The server's `/maintain` endpoint is now **zero-knob**: every call auto-classifies the table and dispatches to one of three per-partition modes — **hot** (delta stitch with time-based round-robin anchor), **cold** (trigger-based full compaction, one partition at a time), or **full** (legacy all-partition parallel, retained as an explicit override). Per-partition state is persisted under `_janitor/state/<table_uuid>/partitions.json`. AWS deployment on ECS Fargate is operational with a single-script bench harness (`test/bench/bench.sh`) that runs identically in `local` / `minio` / `aws` modes.
 
 **[Executive Summary](EXECUTIVE_SUMMARY.md)** — one-page overview: what iceberg-janitor is, what it provides, architectural principles, bench evidence, deployment, and how it compares to Spark `rewriteDataFiles`, AWS Glue auto-compaction, and Confluent Tableflow.
 
@@ -56,14 +56,19 @@ foreign-commit rate over the last 24 hours:
 - **dormant** — no recent commits; touch only for safety
 
 The class is exposed via `GET /v1/tables/{ns}/{name}/health` (and the
-analyzer's `HealthReport.Workload` field). **It is not consumed by the
-maintenance pipeline today.** The server's `POST /v1/tables/{ns}/{name}/
-maintain` endpoint runs the same `expire → rewrite-manifests → compact →
-rewrite-manifests` sequence on every call regardless of the table's
-class.
+analyzer's `HealthReport.Workload` field). **It is now consumed by the
+maintenance pipeline.** On every call to `POST /v1/tables/{ns}/{name}/
+maintain` the server re-classifies the table, maps the class to a
+`MaintainOptions` struct (`pkg/strategy/classify/options.go`), and
+dispatches to one of three modes: **hot** (delta stitch for streaming),
+**cold** (per-partition full compact when a trigger fires, for
+batch / slow_changing / dormant), or **full** (legacy all-partition
+parallel, retained as an explicit override). The caller passes no
+compaction options; the server decides.
 
-**An external orchestrator is required** to map the class to a cadence
-and decide when to call `maintain` for each table. Recommended cadences:
+**An external orchestrator is still required** to decide *when* to call
+`maintain` for each table — the server is a stateless worker, not a
+scheduler. Recommended cadences:
 
 | class | maintain cadence |
 |---|---|

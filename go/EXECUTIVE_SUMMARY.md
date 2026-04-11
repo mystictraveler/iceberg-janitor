@@ -69,6 +69,16 @@ Total cold-start latency on Lambda: **~200 ms**. Steady-state idle cost on Knati
 
 ## Status
 
-**19/30 design decisions fully shipped**, 5 partially shipped, 6 pending. Core maintenance pipeline (compact + expire + rewrite-manifests + all 11 circuit breakers) is proven on bursty streaming workloads. AWS deployment on ECS Fargate is operational with the maintain endpoint, async job API, OpenTelemetry tracing, and a CloudWatch dashboard.
+**22/30 design decisions fully shipped**, 3 partially shipped, 5 pending. Core maintenance pipeline (compact + expire + rewrite-manifests + all 11 circuit breakers) is proven on bursty streaming workloads. The server's `/maintain` endpoint is now zero-knob: on every call the server classifies the table (streaming / batch / slow_changing / dormant), maps the class to a `MaintainOptions` struct, and dispatches to one of three per-partition modes:
 
-**Next:** wire the workload classifier into an external orchestrator (cron/EventBridge), AWS Lambda runtime adapter, on-commit dispatcher (Pattern C), 1B-event stress test on real S3.
+- **hot** (streaming tables) — delta stitch with time-based round-robin anchor selection across large files, so successive rounds rotate wear instead of always growing the same file; bootstraps on the biggest small file when no large file exists.
+- **cold** (batch / slow_changing / dormant) — per-partition full compaction, but only when one of three triggers fires: `small_files`, `metadata_ratio`, or `stale_rewrite` (last rewrite older than threshold, read from per-partition state at `_janitor/state/<uuid>/partitions.json`).
+- **full** — legacy all-partition parallel compaction, retained as an explicit override for initial imports.
+
+AWS deployment on ECS Fargate is operational with the maintain endpoint, async job API, OpenTelemetry tracing, per-table-drill-down CloudWatch dashboard, and a containerized bench that runs as a Fargate task driving two separate S3 warehouses in parallel.
+
+**Bench harness** is a single script (`test/bench/bench.sh`) with three modes (`local` fileblob, `minio` docker, `aws` Fargate+Athena), replacing four prior scripts (1480 LOC → 470 LOC).
+
+**Run 17a (local, 60 s):** 7 of 10 TPC-DS queries faster on the maintain side (q3 −28.4%, q7 −16.5%, q25 −10.7%, q43 −9.2%, q55 −6.2%); file-count reduction of 9–11% across store_sales / store_returns / catalog_sales; q1 shows a +32% regression that has been latent since Run 8 and is not yet investigated.
+
+**Next:** AWS-tier bench with the new hot/cold build; long-duration MinIO run (≥300 s) to exercise the hot loop under a true streaming class; q1 regression root-cause; AWS Lambda runtime adapter; on-commit dispatcher (Pattern C); 1B-event stress test on real S3.
