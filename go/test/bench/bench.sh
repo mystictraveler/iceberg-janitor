@@ -255,6 +255,16 @@ sleep 15
 #
 # Posts to /v1/tables/{ns}/{name}/maintain, polls for job completion.
 # Returns 0 on success, 1 on failure.
+#
+# JSON parsing uses gawk so the bench container does not need python3.
+# The server's responses are flat objects (`{"job_id":"...","status":"..."}`)
+# so a regex extractor is sufficient.
+
+json_field() {
+  # Extract a flat string field from a JSON object.
+  # Portable across BSD sed (macOS) and GNU sed (Linux).
+  sed -n "s/.*\"$1\"[[:space:]]*:[[:space:]]*\"\([^\"]*\)\".*/\1/p" | head -1
+}
 
 call_maintain() {
   local ns_name="$1"     # e.g. "tpcds.db/store_sales"
@@ -274,7 +284,7 @@ call_maintain() {
     return 1
   fi
   local job_id
-  job_id=$(echo "$resp" | python3 -c "import sys,json; print(json.load(sys.stdin).get('job_id',''))" 2>/dev/null || echo "")
+  job_id=$(echo "$resp" | json_field job_id)
   if [[ -z "$job_id" ]]; then
     echo "no job_id in response: $resp" >> "$JANITOR_LOG"
     return 1
@@ -284,7 +294,7 @@ call_maintain() {
   for _ in $(seq 1 300); do
     local status_resp status
     status_resp=$(curl -sf "$poll_url" 2>/dev/null || echo "")
-    status=$(echo "$status_resp" | python3 -c "import sys,json; print(json.load(sys.stdin).get('status',''))" 2>/dev/null || echo "")
+    status=$(echo "$status_resp" | json_field status)
     case "$status" in
       completed) return 0 ;;
       failed)

@@ -46,13 +46,18 @@ resource "aws_ecs_task_definition" "bench" {
         name  = "ATHENA_RESULTS_BUCKET"
         value = aws_s3_bucket.athena_results.id
       },
+      # 9-min high-rate run targeting ~10M events across both warehouses.
+      # CPM=1000 = 50 commits/sec per streamer; the streamer may flat-line
+      # on S3 PUT latency before hitting that rate — that's fine, we want
+      # "highest sustainable rate" under the 10-min cap.
+      # Upper bound: 2 streamers × 1000 × 3 × 300 × 9 / 60 ≈ 16M rows.
       {
         name  = "DURATION_SECONDS"
-        value = "300"
+        value = "540"
       },
       {
         name  = "QUERY_INTERVAL_SECONDS"
-        value = "30"
+        value = "180"
       },
       {
         name  = "MAINTENANCE_INTERVAL_SECONDS"
@@ -60,7 +65,7 @@ resource "aws_ecs_task_definition" "bench" {
       },
       {
         name  = "COMMITS_PER_MINUTE"
-        value = "60"
+        value = "1000"
       },
     ]
 
