@@ -37,11 +37,47 @@ test/
 
 **19/30 design decisions fully shipped, 5 partially shipped, 6 pending.** The core maintenance pipeline (compact + expire + rewrite-manifests + all 11 circuit breakers) is proven end-to-end with bench evidence on bursty streaming workloads. AWS deployment on ECS Fargate is operational.
 
+**[Executive Summary](EXECUTIVE_SUMMARY.md)** — one-page overview: what iceberg-janitor is, what it provides, architectural principles, bench evidence, deployment, and how it compares to Spark `rewriteDataFiles`, AWS Glue auto-compaction, and Confluent Tableflow.
+
 **[Full project scorecard](https://gist.github.com/mystictraveler/1c075afc793e3507ada484f3153cdf27)** — status of every design decision, bench results, architecture overview.
 
 **Measured benchmark results live at [BENCHMARKS.md](BENCHMARKS.md)** and are updated every time a new build phase lands.
 
 **For an architectural comparison against [Confluent Tableflow](https://www.confluent.io/product/tableflow/)'s compaction subsystem**, see [TABLEFLOW_COMPARISON.md](TABLEFLOW_COMPARISON.md). TL;DR: same correctness story with stronger guarantees (mandatory master check, snapshot-internal audit), no managed control plane, multi-cloud by construction, zero idle cost, and an open-source compaction algorithm you can audit in an afternoon.
+
+## Workload classification and orchestration
+
+`pkg/strategy/classify` auto-detects each table's workload class from its
+foreign-commit rate over the last 24 hours:
+
+- **streaming** — high commit rate; needs frequent small-file compaction
+- **batch** — periodic large commits; benefits from manifest consolidation
+- **slow_changing** — sporadic edits; long quiet periods
+- **dormant** — no recent commits; touch only for safety
+
+The class is exposed via `GET /v1/tables/{ns}/{name}/health` (and the
+analyzer's `HealthReport.Workload` field). **It is not consumed by the
+maintenance pipeline today.** The server's `POST /v1/tables/{ns}/{name}/
+maintain` endpoint runs the same `expire → rewrite-manifests → compact →
+rewrite-manifests` sequence on every call regardless of the table's
+class.
+
+**An external orchestrator is required** to map the class to a cadence
+and decide when to call `maintain` for each table. Recommended cadences:
+
+| class | maintain cadence |
+|---|---|
+| streaming | every 5 min |
+| batch | every 1 hr |
+| slow_changing | daily |
+| dormant | weekly |
+
+The orchestrator is intentionally outside the janitor-server: the server
+is a stateless, request-response maintenance worker, and scheduling
+belongs to a higher layer (a cron, an EventBridge rule, a Knative
+PingSource, a Lambda Function URL on a schedule, or a custom
+controller). This separation keeps the server cold-start fast and
+its memory model trivial.
 
 ## MVP test loop
 

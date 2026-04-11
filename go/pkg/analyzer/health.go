@@ -58,6 +58,17 @@ type HealthReport struct {
 	// over the last 24h). Drives per-class trigger thresholds and is
 	// the prerequisite for the middle-path on-commit compaction
 	// dispatcher.
+	//
+	// NOTE: as of 2026-04-10 the classification is REPORTED here but
+	// NOT consumed by the maintenance pipeline. The server's maintain
+	// endpoint runs the same (rewrite → expire → compact → rewrite)
+	// sequence on every call regardless of class. Acting on the class
+	// (e.g. streaming → every 5 min, batch → every 1 hr,
+	// slow_changing → daily, dormant → weekly) is the responsibility
+	// of an EXTERNAL ORCHESTRATOR — it should call /v1/tables/{ns}/
+	// {name}/health to read the class, then call /v1/tables/{ns}/
+	// {name}/maintain on the appropriate cadence per class. The
+	// janitor-server intentionally has no built-in scheduler.
 	Workload classify.Result `json:"workload"`
 }
 

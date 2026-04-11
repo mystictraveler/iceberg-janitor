@@ -125,7 +125,7 @@ register_iceberg_tables() {
 
 # === Phase 1: Start streamers ===
 
-log "starting streamers"
+log "starting streamers (bursty=${BURSTY:-true})"
 JANITOR_WAREHOUSE_URL="$WH_WITH_URL" \
   NAMESPACE="$NAMESPACE" \
   COMMITS_PER_MINUTE="$COMMITS_PER_MINUTE" \
@@ -134,6 +134,8 @@ JANITOR_WAREHOUSE_URL="$WH_WITH_URL" \
   CATALOG_SALES_PER_BATCH="$CATALOG_SALES_PER_BATCH" \
   DURATION_SECONDS="$((DURATION_SECONDS + 30))" \
   TRUNCATE_TABLES=false \
+  BURSTY="${BURSTY:-true}" \
+  BURST_MAX="${BURST_MAX:-10}" \
   janitor-streamer > "$STREAMER_WITH_LOG" 2>&1 &
 PID_WITH=$!
 
@@ -145,6 +147,8 @@ JANITOR_WAREHOUSE_URL="$WH_WITHOUT_URL" \
   CATALOG_SALES_PER_BATCH="$CATALOG_SALES_PER_BATCH" \
   DURATION_SECONDS="$((DURATION_SECONDS + 30))" \
   TRUNCATE_TABLES=false \
+  BURSTY="${BURSTY:-true}" \
+  BURST_MAX="${BURST_MAX:-10}" \
   janitor-streamer > "$STREAMER_WITHOUT_LOG" 2>&1 &
 PID_WITHOUT=$!
 
@@ -205,29 +209,29 @@ run_athena_benchmarks() {
   done
 }
 
-COMPACT_ROUND=0
-run_janitor_compact() {
-  COMPACT_ROUND=$((COMPACT_ROUND + 1))
-  log "janitor compact round ${COMPACT_ROUND}"
-  # Use API mode if JANITOR_API_URL is set (server runs co-located with S3).
-  # Otherwise fall back to in-process compact.
-  set +e
-  # Call janitor-server directly via Cloud Map (same private subnet, port 8080).
+MAINTAIN_ROUND=0
+run_janitor_maintain() {
+  MAINTAIN_ROUND=$((MAINTAIN_ROUND + 1))
+  log "janitor maintain round ${MAINTAIN_ROUND}"
+  # Call the maintain endpoint: rewrite → expire → compact → rewrite.
+  # Server runs co-located with S3, so round trips are ~1ms.
   # Async: POST returns 202 with job_id, then poll GET /v1/jobs/{id}.
+  set +e
   local server_url="${JANITOR_SERVER_URL:-http://server.iceberg-janitor.local:8080}"
+  local query="keep_last=${EXPIRE_KEEP_LAST:-5}&keep_within=${EXPIRE_KEEP_WITHIN:-1m}&target_file_size=${TARGET_FILE_SIZE:-1MB}"
   local job_ids=()
   for tbl in store_sales store_returns catalog_sales; do
-    local url="${server_url}/v1/tables/${NAMESPACE}/${tbl}/compact"
+    local url="${server_url}/v1/tables/${NAMESPACE}/${tbl}/maintain?${query}"
     log "  POST $url"
     local resp
     resp=$(curl -s -X POST -H 'Accept: application/json' "$url" 2>&1) || true
     local job_id
     job_id=$(echo "$resp" | grep -o '"job_id"[[:space:]]*:[[:space:]]*"[^"]*"' | sed 's/.*"job_id"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/')
     if [[ -n "$job_id" ]]; then
-      log "  $tbl: job $job_id submitted"
+      log "  $tbl: maintain job $job_id submitted"
       job_ids+=("$tbl:$job_id")
     else
-      log "  warning: $tbl compact submit failed: $resp"
+      log "  warning: $tbl maintain submit failed: $resp"
     fi
   done
   # Poll all jobs until done (max 5 min total).
@@ -290,7 +294,7 @@ while true; do
   fi
 
   if (( NOW >= NEXT_MAINTENANCE )); then
-    run_janitor_compact "$WH_WITH_URL"
+    run_janitor_maintain
     NEXT_MAINTENANCE=$((NOW + MAINTENANCE_INTERVAL_SECONDS))
   fi
 

@@ -8,7 +8,7 @@ COPY . .
 RUN go mod tidy
 RUN CGO_ENABLED=0 go build -o /out/janitor-server  ./cmd/janitor-server \
  && CGO_ENABLED=0 go build -o /out/janitor-cli     ./cmd/janitor-cli \
- && CGO_ENABLED=0 go build -o /out/janitor-streamer ./cmd/janitor-streamer
+ && CGO_ENABLED=0 go build -tags bench -o /out/janitor-streamer ./test/bench/streamer
 
 # --- Server image (default) ---
 FROM gcr.io/distroless/static-debian12 AS server
