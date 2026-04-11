@@ -84,8 +84,17 @@ resource "aws_ecs_service" "janitor_server" {
   name            = "${var.project}-server"
   cluster         = aws_ecs_cluster.main.id
   task_definition = aws_ecs_task_definition.janitor_server.arn
-  desired_count   = 1
-  launch_type     = "FARGATE"
+  # 3 replicas exercises the lease + persistent jobrecord
+  # cross-replica path. The in-process inflight guard alone is
+  # insufficient for multi-replica deployments — it dedupes
+  # within one process, not across the fleet. With desired_count
+  # = 3, concurrent client POSTs to different replicas land on
+  # the lease primitive (pkg/lease), which uses S3
+  # If-None-Match: * for cross-process atomicity. See
+  # _janitor/state/leases/ for the live lease files and
+  # _janitor/state/jobs/ for the persistent job records.
+  desired_count = 3
+  launch_type   = "FARGATE"
 
   network_configuration {
     # Pinned to 1a only: cross-AZ traffic to 1a from 1b was silently dropped
