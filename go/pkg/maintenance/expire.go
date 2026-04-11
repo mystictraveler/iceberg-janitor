@@ -221,7 +221,7 @@ func expireOnce(ctx context.Context, cat *catalog.DirectoryCatalog, ident iceber
 	if cur := tbl.CurrentSnapshot(); cur != nil {
 		result.BeforeSnapshotID = cur.SnapshotID
 	}
-	result.BeforeFiles, _, result.BeforeRows = janitor.SnapshotFileStats(ctx, tbl)
+	result.BeforeFiles, result.BeforeRows = janitor.SnapshotFileStatsFast(ctx, tbl)
 
 	// Stage the expiration. iceberg-go's ExpireSnapshots requires
 	// BOTH WithRetainLast AND WithOlderThan to be set when the table's
@@ -286,7 +286,7 @@ func expireOnce(ctx context.Context, cat *catalog.DirectoryCatalog, ident iceber
 		result.AfterSnapshotID = cur.SnapshotID
 	}
 	result.AfterSnapshots = len(newTbl.Metadata().Snapshots())
-	result.AfterFiles, _, result.AfterRows = janitor.SnapshotFileStats(ctx, newTbl)
+	result.AfterFiles, result.AfterRows = janitor.SnapshotFileStatsFast(ctx, newTbl)
 
 	// Defense in depth: the master check already asserts row count
 	// preservation, but we re-assert it here against the post-commit

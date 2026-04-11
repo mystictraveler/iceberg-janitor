@@ -137,7 +137,11 @@ func compactOnce(ctx context.Context, cat *catalog.DirectoryCatalog, ident icebe
 		return nil
 	}
 	result.BeforeSnapshotID = snap.SnapshotID
-	result.BeforeFiles, result.BeforeBytes, result.BeforeRows = SnapshotFileStats(ctx, tbl)
+	// Fast path: read file/row counts from the manifest-list summary
+	// instead of walking every manifest body. BeforeBytes is left at
+	// zero — the caller (test assertions, log lines) should use the
+	// files+rows pair, which is what the master check cares about.
+	result.BeforeFiles, result.BeforeRows = SnapshotFileStatsFast(ctx, tbl)
 
 	fs, err := tbl.FS(ctx)
 	if err != nil {
@@ -521,7 +525,7 @@ func executeStitchAndCommit(
 	if newSnap := newTbl.CurrentSnapshot(); newSnap != nil {
 		result.AfterSnapshotID = newSnap.SnapshotID
 	}
-	result.AfterFiles, result.AfterBytes, result.AfterRows = SnapshotFileStats(ctx, newTbl)
+	result.AfterFiles, result.AfterRows = SnapshotFileStatsFast(ctx, newTbl)
 	if result.AfterRows != result.BeforeRows {
 		return fmt.Errorf("post-commit row count mismatch: before=%d after=%d", result.BeforeRows, result.AfterRows)
 	}

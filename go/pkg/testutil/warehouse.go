@@ -8,6 +8,9 @@
 // pkg/maintenance, and pkg/safety exercise their end-to-end paths
 // against a real Iceberg table without requiring docker or the bench
 // harness.
+//
+// All helpers take testing.TB so they can be called from both
+// *testing.T (integration tests) and *testing.B (benchmarks).
 package testutil
 
 import (
@@ -49,7 +52,7 @@ type Warehouse struct {
 // NewWarehouse creates a fresh file:// warehouse at t.TempDir() and
 // opens a DirectoryCatalog on it. The catalog is registered with
 // t.Cleanup so tests do not need to close it.
-func NewWarehouse(t *testing.T) *Warehouse {
+func NewWarehouse(t testing.TB) *Warehouse {
 	t.Helper()
 	dir := t.TempDir()
 	url := "file://" + dir
@@ -74,7 +77,7 @@ func SimpleFactSchema() *icebergpkg.Schema {
 
 // CreateTable wraps DirectoryCatalog.CreateTable with t.Fatal on
 // failure so the test reads linearly.
-func (w *Warehouse) CreateTable(t *testing.T, ns, name string, schema *icebergpkg.Schema, opts ...icebergcat.CreateTableOpt) *icebergtable.Table {
+func (w *Warehouse) CreateTable(t testing.TB, ns, name string, schema *icebergpkg.Schema, opts ...icebergcat.CreateTableOpt) *icebergtable.Table {
 	t.Helper()
 	ident := icebergtable.Identifier{ns, name}
 	tbl, err := w.Cat.CreateTable(context.Background(), ident, schema, opts...)
@@ -87,7 +90,7 @@ func (w *Warehouse) CreateTable(t *testing.T, ns, name string, schema *icebergpk
 // LoadTable loads an existing table by (namespace, name). Useful after
 // a Compact/Expire/RewriteManifests call that mutates the table —
 // callers reload to see the post-op state.
-func (w *Warehouse) LoadTable(t *testing.T, ns, name string) *icebergtable.Table {
+func (w *Warehouse) LoadTable(t testing.TB, ns, name string) *icebergtable.Table {
 	t.Helper()
 	ident := icebergtable.Identifier{ns, name}
 	tbl, err := w.Cat.LoadTable(context.Background(), ident)
@@ -100,7 +103,7 @@ func (w *Warehouse) LoadTable(t *testing.T, ns, name string) *icebergtable.Table
 // WriteParquetFile writes a parquet file containing the given rows
 // at the given bucket-relative key. Returns the absolute file://
 // URL the file lives at, which AddFiles can consume directly.
-func (w *Warehouse) WriteParquetFile(t *testing.T, key string, rows []SimpleFactRow) string {
+func (w *Warehouse) WriteParquetFile(t testing.TB, key string, rows []SimpleFactRow) string {
 	t.Helper()
 	absPath := filepath.Join(w.Dir, key)
 	if err := os.MkdirAll(filepath.Dir(absPath), 0o755); err != nil {
@@ -127,7 +130,7 @@ func (w *Warehouse) WriteParquetFile(t *testing.T, key string, rows []SimpleFact
 // ids. Returns the committed table (after AddFiles) and the list
 // of bucket-relative keys of the parquet files. Total row count =
 // numFiles × rowsPerFile.
-func (w *Warehouse) SeedFactTable(t *testing.T, ns, name string, numFiles, rowsPerFile int) (*icebergtable.Table, []string) {
+func (w *Warehouse) SeedFactTable(t testing.TB, ns, name string, numFiles, rowsPerFile int) (*icebergtable.Table, []string) {
 	t.Helper()
 	tbl := w.CreateTable(t, ns, name, SimpleFactSchema())
 

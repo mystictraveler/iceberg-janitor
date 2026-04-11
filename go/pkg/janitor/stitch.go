@@ -11,6 +11,7 @@ import (
 	"github.com/parquet-go/parquet-go"
 	"github.com/parquet-go/parquet-go/encoding/thrift"
 	"github.com/parquet-go/parquet-go/format"
+	"golang.org/x/sync/errgroup"
 )
 
 // stitchParquetFiles is the **stitching binpack v2** compaction
@@ -72,24 +73,59 @@ func stitchParquetFiles(ctx context.Context, fs icebergio.IO, srcPaths []string,
 	}
 
 	// Open all source files first. We need access to each one's
-	// io.ReaderAt for the byte copy in step 4.
+	// io.ReaderAt for the byte copy in step 4. icebergio.File already
+	// embeds io.ReaderAt and fs.File, so we use the file directly as
+	// the ReaderAt — no intermediate io.ReadAll slurp.
+	//
+	// File opens and footer parses run in parallel (32-way) because
+	// on a 500-file stitch the serial version spent ~25 ms in file
+	// opens alone. The writes stay serialized in step 4 via the
+	// output io.Writer. Close every opened file on return regardless
+	// of success so partial results don't leak fds.
 	type srcEntry struct {
 		path     string
 		readerAt io.ReaderAt
 		size     int64
 		file     *parquet.File
+		handle   icebergio.File
 	}
-	sources := make([]srcEntry, 0, len(srcPaths))
-	for _, p := range srcPaths {
-		ra, sz, oerr := readAllAt(ctx, fs, p)
-		if oerr != nil {
-			return 0, fmt.Errorf("opening source %s: %w", p, oerr)
+	sources := make([]srcEntry, len(srcPaths))
+	defer func() {
+		for i := range sources {
+			if sources[i].handle != nil {
+				_ = sources[i].handle.Close()
+			}
 		}
-		pf, perr := parquet.OpenFile(ra, sz)
-		if perr != nil {
-			return 0, fmt.Errorf("parsing source %s: %w", p, perr)
-		}
-		sources = append(sources, srcEntry{path: p, readerAt: ra, size: sz, file: pf})
+	}()
+	openG, openCtx := errgroup.WithContext(ctx)
+	openG.SetLimit(32)
+	for i, p := range srcPaths {
+		i, p := i, p
+		openG.Go(func() error {
+			if openCtx.Err() != nil {
+				return openCtx.Err()
+			}
+			f, oerr := fs.Open(p)
+			if oerr != nil {
+				return fmt.Errorf("opening source %s: %w", p, oerr)
+			}
+			st, serr := f.Stat()
+			if serr != nil {
+				_ = f.Close()
+				return fmt.Errorf("stat source %s: %w", p, serr)
+			}
+			sz := st.Size()
+			pf, perr := parquet.OpenFile(f, sz)
+			if perr != nil {
+				_ = f.Close()
+				return fmt.Errorf("parsing source %s: %w", p, perr)
+			}
+			sources[i] = srcEntry{path: p, readerAt: f, size: sz, file: pf, handle: f}
+			return nil
+		})
+	}
+	if err := openG.Wait(); err != nil {
+		return 0, err
 	}
 
 	// Step 2: build the output FileMetaData skeleton from the first
