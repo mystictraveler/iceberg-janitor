@@ -27,9 +27,14 @@ resource "aws_ecs_task_definition" "bench" {
         name  = "AWS_REGION"
         value = var.region
       },
-      # JANITOR_API_URL omitted — compact runs in-process from the bench
-      # container (co-located with S3 in the same region, ~5ms latency).
-      # API Gateway compact will be tested separately.
+      # Bench reaches the server via the internal NLB (port 80 → 8080 on
+      # Fargate). Cloud Map registration was flaky after force-new-
+      # deployment (stale A record) so we bypass it. The NLB is in the
+      # same private subnets as the bench, no API Gateway hop, direct TCP.
+      {
+        name  = "JANITOR_SERVER_URL"
+        value = "http://${aws_lb.internal.dns_name}"
+      },
       {
         name  = "ATHENA_WORKGROUP"
         value = aws_athena_workgroup.main.name
@@ -46,22 +51,25 @@ resource "aws_ecs_task_definition" "bench" {
         name  = "ATHENA_RESULTS_BUCKET"
         value = aws_s3_bucket.athena_results.id
       },
-      # 9-min high-rate run targeting ~10M events across both warehouses.
-      # CPM=1000 = 50 commits/sec per streamer; the streamer may flat-line
-      # on S3 PUT latency before hitting that rate — that's fine, we want
-      # "highest sustainable rate" under the 10-min cap.
-      # Upper bound: 2 streamers × 1000 × 3 × 300 × 9 / 60 ≈ 16M rows.
+      # Phased bench: STREAM -> PAUSE -> MAINTAIN -> QUERY. No interleaving.
+      # Upper bound on rows: 2 streamers × 1000 CPM × 3 facts × 300 avg/batch
+      # × 6 min / 60 = ~18M rows. CPM=1000 is aspirational; the streamer
+      # will flat-line on S3 PUT latency well below that.
       {
-        name  = "DURATION_SECONDS"
-        value = "540"
+        name  = "STREAM_DURATION_SECONDS"
+        value = "360"
       },
       {
-        name  = "QUERY_INTERVAL_SECONDS"
-        value = "180"
+        name  = "PAUSE_SECONDS"
+        value = "15"
       },
       {
-        name  = "MAINTENANCE_INTERVAL_SECONDS"
-        value = "60"
+        name  = "MAINTAIN_ROUNDS"
+        value = "2"
+      },
+      {
+        name  = "QUERY_ITERATIONS"
+        value = "3"
       },
       {
         name  = "COMMITS_PER_MINUTE"

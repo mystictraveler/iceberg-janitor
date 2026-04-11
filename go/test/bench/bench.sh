@@ -15,17 +15,38 @@
 #   bench.sh minio   # MinIO via docker compose. Mid-fidelity S3.
 #   bench.sh aws     # Runs inside the bench Fargate container in AWS.
 #
+# Pattern: phased A/B, NOT interleaved
+# ====================================
+#
+# Phase 1  STREAM    Both streamers write to WITH and WITHOUT warehouses
+#                    for STREAM_DURATION_SECONDS, then self-terminate.
+#                    Identical data lands on both sides.
+# Phase 2  PAUSE     Short pause (PAUSE_SECONDS) so in-flight S3 writes
+#                    settle before we look at the warehouses.
+# Phase 3  MAINTAIN  Call /maintain on the WITH warehouse only. Run
+#                    MAINTAIN_ROUNDS rounds so the hot path gets the
+#                    chance to stitch multiple times. WITHOUT warehouse
+#                    stays raw — this is the baseline.
+# Phase 4  QUERY     Run the TPC-DS query suite QUERY_ITERATIONS times
+#                    against BOTH warehouses. Clean measurement with no
+#                    streamer noise and no mid-query maintain calls.
+#
 # Config (all modes)
 # ==================
 #
-#   DURATION_SECONDS           Total bench duration        [300]
-#   QUERY_INTERVAL_SECONDS     Seconds between query rounds [30]
-#   MAINTENANCE_INTERVAL_SECONDS  Seconds between maintain  [60]
-#   COMMITS_PER_MINUTE         Streamer commit rate        [60]
-#   BURSTY                     Streamer bursty mode        [true]
-#   BURST_MAX                  Max commits per burst       [10]
-#   TARGET_FILE_SIZE           Pattern B threshold         [1MB]
-#   NAMESPACE                  Iceberg namespace           [tpcds]
+#   STREAM_DURATION_SECONDS    How long to stream before stopping   [300]
+#   PAUSE_SECONDS              Settle time between stream+maintain  [15]
+#   MAINTAIN_ROUNDS            How many maintain passes on WITH     [2]
+#   QUERY_ITERATIONS           How many query rounds after maintain [3]
+#   COMMITS_PER_MINUTE         Streamer commit rate                 [60]
+#   BURSTY                     Streamer bursty mode                 [true]
+#   BURST_MAX                  Max commits per burst                [10]
+#   TARGET_FILE_SIZE           Pattern B threshold                  [1MB]
+#   NAMESPACE                  Iceberg namespace                    [tpcds]
+#
+# Legacy env vars (DURATION_SECONDS, QUERY_INTERVAL_SECONDS,
+# MAINTENANCE_INTERVAL_SECONDS) are still honored: DURATION_SECONDS
+# maps to STREAM_DURATION_SECONDS for backward compatibility.
 #
 # Output
 # ======
@@ -53,9 +74,10 @@ esac
 
 # === Common config ===
 
-DURATION_SECONDS="${DURATION_SECONDS:-300}"
-QUERY_INTERVAL_SECONDS="${QUERY_INTERVAL_SECONDS:-30}"
-MAINTENANCE_INTERVAL_SECONDS="${MAINTENANCE_INTERVAL_SECONDS:-60}"
+STREAM_DURATION_SECONDS="${STREAM_DURATION_SECONDS:-${DURATION_SECONDS:-300}}"
+PAUSE_SECONDS="${PAUSE_SECONDS:-15}"
+MAINTAIN_ROUNDS="${MAINTAIN_ROUNDS:-2}"
+QUERY_ITERATIONS="${QUERY_ITERATIONS:-3}"
 COMMITS_PER_MINUTE="${COMMITS_PER_MINUTE:-60}"
 STORE_SALES_PER_BATCH="${STORE_SALES_PER_BATCH:-500}"
 STORE_RETURNS_PER_BATCH="${STORE_RETURNS_PER_BATCH:-100}"
@@ -232,7 +254,7 @@ start_streamer() {
   STORE_SALES_PER_BATCH="$STORE_SALES_PER_BATCH" \
   STORE_RETURNS_PER_BATCH="$STORE_RETURNS_PER_BATCH" \
   CATALOG_SALES_PER_BATCH="$CATALOG_SALES_PER_BATCH" \
-  DURATION_SECONDS="$((DURATION_SECONDS + 30))" \
+  DURATION_SECONDS="$STREAM_DURATION_SECONDS" \
   TRUNCATE_TABLES=true \
   BURSTY="$BURSTY" \
   BURST_MAX="$BURST_MAX" \
@@ -247,9 +269,7 @@ rm -f "$CATALOG_DB_WITH" "$CATALOG_DB_WITHOUT"
 PID_WITH=$(start_streamer "with-janitor" "$WH_WITH_URL" "$CATALOG_DB_WITH" "$STREAMER_WITH_LOG")
 PID_WITHOUT=$(start_streamer "without-janitor" "$WH_WITHOUT_URL" "$CATALOG_DB_WITHOUT" "$STREAMER_WITHOUT_LOG")
 log "streamer PIDs: with=$PID_WITH without=$PID_WITHOUT"
-
-log "waiting 15s for dimensions to seed and first fact commits to land..."
-sleep 15
+log "streaming for ${STREAM_DURATION_SECONDS}s..."
 
 # === Phase 3: call_maintain helper ===
 #
@@ -477,35 +497,71 @@ run_queries() {
   esac
 }
 
-# === Phase 5: main loop ===
+# === Phase A: stream (wait for self-termination) ===
 
 echo "iteration,timestamp,mode,query,latency_ms,row_count,store_sales_files,store_returns_files,catalog_sales_files" > "$RESULTS_CSV"
 
 START=$(date +%s)
-NEXT_QUERY=$START
-NEXT_MAINTENANCE=$((START + MAINTENANCE_INTERVAL_SECONDS))
-ITERATION=0
 
-while true; do
-  NOW=$(date +%s)
-  ELAPSED=$((NOW - START))
-  if (( ELAPSED >= DURATION_SECONDS )); then break; fi
-
-  if (( NOW >= NEXT_QUERY )); then
-    ITERATION=$((ITERATION + 1))
-    log "[t+${ELAPSED}s] iteration $ITERATION — querying both warehouses"
-    run_queries "with"    "$ITERATION"
-    run_queries "without" "$ITERATION"
-    NEXT_QUERY=$((NOW + QUERY_INTERVAL_SECONDS))
+# Streamers are configured with DURATION_SECONDS=STREAM_DURATION_SECONDS
+# and will self-exit. We just wait for them. Pass a small grace window
+# for dimension seed + shutdown flush (~45s) before timing out.
+STREAM_DEADLINE=$(( START + STREAM_DURATION_SECONDS + 45 ))
+while (( $(date +%s) < STREAM_DEADLINE )); do
+  if ! kill -0 "$PID_WITH" 2>/dev/null && ! kill -0 "$PID_WITHOUT" 2>/dev/null; then
+    break
   fi
-
-  if (( NOW >= NEXT_MAINTENANCE )); then
-    run_maintain
-    NEXT_MAINTENANCE=$((NOW + MAINTENANCE_INTERVAL_SECONDS))
-  fi
-
   sleep 2
 done
+kill "$PID_WITH" 2>/dev/null || true
+kill "$PID_WITHOUT" 2>/dev/null || true
+wait "$PID_WITH" 2>/dev/null || true
+wait "$PID_WITHOUT" 2>/dev/null || true
+PID_WITH=""
+PID_WITHOUT=""
+STREAM_ELAPSED=$(( $(date +%s) - START ))
+log "stream phase done in ${STREAM_ELAPSED}s"
+
+# Capture streamer totals from their log tail — last progress line has
+# per-fact commit counts. Best-effort; logged for visibility only.
+for label in with without; do
+  log_file="$RESULTS_DIR/streamer-${label}-$TS.log"
+  if [[ -f "$log_file" ]]; then
+    tail_line=$(grep -E '^\[.+\] total [0-9]+ commits' "$log_file" | tail -1 || true)
+    [[ -n "$tail_line" ]] && log "streamer[$label]: $tail_line"
+  fi
+done
+
+# === Phase B: pause (let S3 writes settle) ===
+
+log "pause phase — sleeping ${PAUSE_SECONDS}s for S3 writes to settle"
+sleep "$PAUSE_SECONDS"
+
+# === Phase C: maintain (WITH warehouse only, N rounds) ===
+
+log "maintain phase — ${MAINTAIN_ROUNDS} rounds on WITH warehouse"
+MAINTAIN_START=$(date +%s)
+for round in $(seq 1 "$MAINTAIN_ROUNDS"); do
+  log "maintain round ${round}/${MAINTAIN_ROUNDS}"
+  run_maintain
+done
+MAINTAIN_ELAPSED=$(( $(date +%s) - MAINTAIN_START ))
+log "maintain phase done in ${MAINTAIN_ELAPSED}s"
+
+# === Phase D: query (both warehouses, back-to-back iterations) ===
+
+log "query phase — ${QUERY_ITERATIONS} iterations against both warehouses"
+QUERY_START=$(date +%s)
+for ITERATION in $(seq 1 "$QUERY_ITERATIONS"); do
+  log "query iteration ${ITERATION}/${QUERY_ITERATIONS}"
+  run_queries "with"    "$ITERATION"
+  run_queries "without" "$ITERATION"
+done
+QUERY_ELAPSED=$(( $(date +%s) - QUERY_START ))
+log "query phase done in ${QUERY_ELAPSED}s"
+
+TOTAL_ELAPSED=$(( $(date +%s) - START ))
+log "total bench wall time: ${TOTAL_ELAPSED}s (stream=${STREAM_ELAPSED}s pause=${PAUSE_SECONDS}s maintain=${MAINTAIN_ELAPSED}s query=${QUERY_ELAPSED}s)"
 
 # === Phase 6: summary ===
 

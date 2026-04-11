@@ -88,7 +88,11 @@ resource "aws_ecs_service" "janitor_server" {
   launch_type     = "FARGATE"
 
   network_configuration {
-    subnets          = local.private_subnets
+    # Pinned to 1a only: cross-AZ traffic to 1a from 1b was silently dropped
+    # in this sandbox VPC (NACL or routing — not a config we control).
+    # Keeping the server single-AZ avoids the bench-vs-server AZ mismatch
+    # that caused bench runs 2+ to fail with 131 s TCP SYN timeouts.
+    subnets          = [aws_subnet.private[0].id]
     security_groups  = [aws_security_group.fargate.id]
     assign_public_ip = false
   }
