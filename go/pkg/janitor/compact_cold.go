@@ -41,6 +41,13 @@ type CompactColdOptions struct {
 	// TargetFileSizeBytes — Pattern B threshold passed through to
 	// the per-partition Compact call.
 	TargetFileSizeBytes int64
+
+	// DryRun, when true, forwards to every per-partition Compact
+	// call so each partition's manifest walk runs but no side
+	// effects happen. The aggregate result reports which partitions
+	// WOULD be compacted; each sub-result carries its own DryRun
+	// and ContentionDetected flags.
+	DryRun bool
 }
 
 func (o *CompactColdOptions) defaults() {
@@ -170,6 +177,7 @@ func CompactCold(ctx context.Context, cat *catalog.DirectoryCatalog, ident icebe
 		compactResult, cerr := Compact(ctx, cat, ident, CompactOptions{
 			PartitionTuple:      p.PartitionTuple,
 			TargetFileSizeBytes: opts.TargetFileSizeBytes,
+			DryRun:              opts.DryRun,
 		})
 		partResult := ColdPartitionResult{
 			PartitionKey:      p.PartitionKey,

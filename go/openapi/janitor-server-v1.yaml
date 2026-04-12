@@ -286,6 +286,7 @@ paths:
             Accepts byte counts or human-readable sizes (e.g. `1MB`,
             `64MB`, `1GB`). Files at or above this size are kept in
             place; only the small-file tail is rewritten.
+        - $ref: '#/components/parameters/DryRun'
       responses:
         '202':
           description: Compact job accepted (or in-flight dedup hit)
@@ -356,6 +357,7 @@ paths:
             Override for the classifier-derived mode. Reserved for
             testing and operator one-offs; production callers should
             leave this unset.
+        - $ref: '#/components/parameters/DryRun'
       responses:
         '202':
           description: Maintain job accepted (or in-flight dedup hit)
@@ -404,6 +406,7 @@ paths:
             Go duration string (e.g. `24h`, `7d` is not valid use
             `168h`). Snapshots older than this are eligible for
             removal subject to keep_last.
+        - $ref: '#/components/parameters/DryRun'
       responses:
         '202':
           description: Expire job accepted (or in-flight dedup hit)
@@ -434,6 +437,7 @@ paths:
       parameters:
         - $ref: '#/components/parameters/Namespace'
         - $ref: '#/components/parameters/TableName'
+        - $ref: '#/components/parameters/DryRun'
       responses:
         '202':
           description: Rewrite-manifests job accepted (or in-flight dedup hit)
@@ -518,6 +522,48 @@ components:
       schema:
         type: string
       description: Table name (no namespace prefix)
+
+    DryRun:
+      name: dry_run
+      in: query
+      required: false
+      schema:
+        type: boolean
+        default: false
+      description: |
+        When `true`, the server runs the operation's full planning
+        phase (manifest walk, entry grouping, transaction staging,
+        master check where applicable), then **stops before any
+        side effects** — no parquet / manifest files are written
+        and no commit happens.
+
+        The response body's `result` field carries the operation's
+        usual `CompactResult` / `CompactHotResult` / `ExpireResult` /
+        `RewriteManifestsResult` / `MaintainResult` populated with:
+
+          - `dry_run: true` — echoes the request flag so the client
+            can't mistake a dry-run result for a real run
+          - `contention_detected: <bool>` — the server reloaded the
+            table at the end of the planning phase and compared its
+            current snapshot id to the pre-walk value. If they
+            differ, a foreign writer committed during the plan, and
+            a real run would have hit a CAS conflict (expect retry
+            spin or a partial-success outcome if run immediately)
+          - projected `after_*` counts (file count, row count, etc.)
+            computed from the staged / grouped state — no second
+            round-trip
+          - `partitions_planned` (CompactHot only) — the set the
+            real run would stitch, with each entry's
+            `stitched=false, dry_run=true`
+
+        Use-case: operator sanity check before a risky maintain run,
+        CI gating on "would this diverge from a known-good state",
+        or dashboards that want a continuous "compactable-small-file
+        tail" estimate without paying the commit cost.
+
+        Dry-run forwards through `/maintain` to every sub-op (expire,
+        pre-rewrite, compact [hot|cold|full], post-rewrite), so one
+        call gives an end-to-end projection of the full pipeline.
 
   schemas:
     Job:

@@ -540,6 +540,7 @@ func (s *jobStore) setRunning(id string) {
 //
 //	?partition=col=value         — scope to one partition
 //	?target_file_size=1MB        — Pattern B threshold (KB/MB/GB suffixes)
+//	?dry_run=true                — plan only, no side effects (see pkg docs)
 func parseCompactOpts(r *http.Request) janitor.CompactOptions {
 	opts := janitor.CompactOptions{}
 	if v := r.URL.Query().Get("partition"); v != "" {
@@ -557,7 +558,23 @@ func parseCompactOpts(r *http.Request) janitor.CompactOptions {
 			opts.TargetFileSizeBytes = n
 		}
 	}
+	if parseBoolQuery(r, "dry_run") {
+		opts.DryRun = true
+	}
 	return opts
+}
+
+// parseBoolQuery reads a boolean query parameter. Accepts the usual
+// truthy strings "true", "1", "yes", "on" (case-insensitive). Any
+// other value — including missing — is false. Shared by every
+// maintenance handler that needs a ?dry_run=... flag.
+func parseBoolQuery(r *http.Request, name string) bool {
+	v := strings.TrimSpace(strings.ToLower(r.URL.Query().Get(name)))
+	switch v {
+	case "true", "1", "yes", "on":
+		return true
+	}
+	return false
 }
 
 // parseFileSizeServer is a minimal size parser for query params.
@@ -679,7 +696,18 @@ func parseExpireOpts(r *http.Request) maintenance.ExpireOptions {
 			opts.KeepWithin = d
 		}
 	}
+	if parseBoolQuery(r, "dry_run") {
+		opts.DryRun = true
+	}
 	return opts
+}
+
+// parseRewriteManifestsOpts reads ?dry_run=true from the request.
+// RewriteManifests has no other operator-facing knobs yet.
+func parseRewriteManifestsOpts(r *http.Request) maintenance.RewriteManifestsOptions {
+	return maintenance.RewriteManifestsOptions{
+		DryRun: parseBoolQuery(r, "dry_run"),
+	}
 }
 
 // handleExpireAsync accepts an expire request and runs it in a
@@ -724,6 +752,7 @@ func (s *server) handleRewriteManifestsAsync(w http.ResponseWriter, r *http.Requ
 	if !ok {
 		return
 	}
+	rewriteOpts := parseRewriteManifestsOpts(r)
 	tableName := fmt.Sprintf("%s.%s", ident[0], ident[1])
 	job, isNew := s.jobs.create(tableName, "rewrite-manifests")
 	if !isNew {
@@ -737,7 +766,7 @@ func (s *server) handleRewriteManifestsAsync(w http.ResponseWriter, r *http.Requ
 	go func() {
 		s.jobs.setRunning(job.ID)
 		ctx := context.Background()
-		result, err := maintenance.RewriteManifests(ctx, s.cat, ident, maintenance.RewriteManifestsOptions{})
+		result, err := maintenance.RewriteManifests(ctx, s.cat, ident, rewriteOpts)
 		s.jobs.complete(job.ID, result, err)
 		if err != nil {
 			s.logger.Error("rewrite-manifests job failed", "job_id", job.ID, "table", tableName, "err", err)
@@ -779,6 +808,11 @@ func (s *server) handleRewriteManifestsAsync(w http.ResponseWriter, r *http.Requ
 //	?target_file_size=1MB        — Pattern B threshold
 //	?keep_last=N                 — snapshots to retain
 //	?keep_within=DUR             — minimum age before expire
+//	?dry_run=true                — plan every sub-op but skip all writes
+//	                                and commits. Each sub-op's result
+//	                                carries dry_run + contention_detected
+//	                                so the client can decide whether to
+//	                                re-run with dry_run=false.
 func (s *server) handleMaintainAsync(w http.ResponseWriter, r *http.Request) {
 	ident, ok := identFromRequest(w, r)
 	if !ok {
@@ -807,6 +841,7 @@ func (s *server) handleMaintainAsync(w http.ResponseWriter, r *http.Request) {
 	if v := r.URL.Query().Get("mode"); v != "" {
 		plan.Mode = classify.MaintainMode(v)
 	}
+	dryRun := parseBoolQuery(r, "dry_run")
 
 	job, isNew := s.jobs.create(tableName, "maintain")
 	if !isNew {
@@ -831,9 +866,10 @@ func (s *server) handleMaintainAsync(w http.ResponseWriter, r *http.Request) {
 		"keep_last", plan.KeepLastSnapshots,
 		"keep_within", plan.KeepWithin,
 		"target_file_size", plan.TargetFileSizeBytes,
+		"dry_run", dryRun,
 	)
 
-	go s.runMaintainJob(job.ID, ident, plan)
+	go s.runMaintainJob(job.ID, ident, plan, dryRun)
 
 	writeJSON(w, http.StatusAccepted, job)
 }
@@ -841,32 +877,34 @@ func (s *server) handleMaintainAsync(w http.ResponseWriter, r *http.Request) {
 // maintainResult aggregates the outcomes of the three maintenance
 // steps so the caller can see exactly what happened in each phase.
 type maintainResult struct {
-	Class               string                              `json:"class"`
-	Mode                string                              `json:"mode"`
-	Expire              *maintenance.ExpireResult           `json:"expire,omitempty"`
-	RewriteManifests    *maintenance.RewriteManifestsResult `json:"rewrite_manifests,omitempty"`
-	CompactFull         *janitor.CompactTableResult         `json:"compact_full,omitempty"`
-	CompactHot          *janitor.CompactHotResult           `json:"compact_hot,omitempty"`
-	CompactCold         *janitor.CompactColdResult          `json:"compact_cold,omitempty"`
-	PostCompactRewrite  *maintenance.RewriteManifestsResult `json:"post_compact_rewrite,omitempty"`
-	Steps               []string                            `json:"steps_completed"`
-	TotalDurationMs     int64                               `json:"total_duration_ms"`
+	Class              string                              `json:"class"`
+	Mode               string                              `json:"mode"`
+	DryRun             bool                                `json:"dry_run,omitempty"`
+	Expire             *maintenance.ExpireResult           `json:"expire,omitempty"`
+	RewriteManifests   *maintenance.RewriteManifestsResult `json:"rewrite_manifests,omitempty"`
+	CompactFull        *janitor.CompactTableResult         `json:"compact_full,omitempty"`
+	CompactHot         *janitor.CompactHotResult           `json:"compact_hot,omitempty"`
+	CompactCold        *janitor.CompactColdResult          `json:"compact_cold,omitempty"`
+	PostCompactRewrite *maintenance.RewriteManifestsResult `json:"post_compact_rewrite,omitempty"`
+	Steps              []string                            `json:"steps_completed"`
+	TotalDurationMs    int64                               `json:"total_duration_ms"`
 }
 
-func (s *server) runMaintainJob(jobID string, ident icebergtable.Identifier, plan classify.MaintainOptions) {
+func (s *server) runMaintainJob(jobID string, ident icebergtable.Identifier, plan classify.MaintainOptions, dryRun bool) {
 	s.jobs.setRunning(jobID)
 	started := time.Now()
 	tableName := fmt.Sprintf("%s.%s", ident[0], ident[1])
-	s.logger.Info("maintain job started", "job_id", jobID, "table", tableName, "mode", plan.Mode)
+	s.logger.Info("maintain job started", "job_id", jobID, "table", tableName, "mode", plan.Mode, "dry_run", dryRun)
 
 	ctx := context.Background()
-	mr := &maintainResult{Mode: string(plan.Mode)}
+	mr := &maintainResult{Mode: string(plan.Mode), DryRun: dryRun}
 
 	// Step 1: expire — drop old snapshots so the manifest list
 	// we're about to consolidate doesn't include dead references.
 	expireOpts := maintenance.ExpireOptions{
 		KeepLast:   plan.KeepLastSnapshots,
 		KeepWithin: plan.KeepWithin,
+		DryRun:     dryRun,
 	}
 	expireResult, err := maintenance.Expire(ctx, s.cat, ident, expireOpts)
 	mr.Expire = expireResult
@@ -883,7 +921,7 @@ func (s *server) runMaintainJob(jobID string, ident icebergtable.Identifier, pla
 	// Step 2: rewrite-manifests (pre-compact) — consolidate the
 	// surviving snapshot's micro-manifests so compact walks a small
 	// manifest list and wins the CAS race against the writer.
-	preRewrite, err := maintenance.RewriteManifests(ctx, s.cat, ident, maintenance.RewriteManifestsOptions{})
+	preRewrite, err := maintenance.RewriteManifests(ctx, s.cat, ident, maintenance.RewriteManifestsOptions{DryRun: dryRun})
 	mr.RewriteManifests = preRewrite
 	if err != nil {
 		mr.TotalDurationMs = time.Since(started).Milliseconds()
@@ -912,6 +950,7 @@ func (s *server) runMaintainJob(jobID string, ident icebergtable.Identifier, pla
 			SmallFileThresholdBytes: plan.TargetFileSizeBytes,
 			HotWindowSnapshots:      5,
 			MinSmallFiles:           2,
+			DryRun:                  dryRun,
 		})
 		mr.CompactHot = hotResult
 		compactErr = err
@@ -930,6 +969,7 @@ func (s *server) runMaintainJob(jobID string, ident icebergtable.Identifier, pla
 			StaleRewriteAge:         plan.StaleRewriteAge,
 			HotWindowSnapshots:      5,
 			TargetFileSizeBytes:     plan.TargetFileSizeBytes,
+			DryRun:                  dryRun,
 		})
 		mr.CompactCold = coldResult
 		compactErr = err
@@ -944,6 +984,7 @@ func (s *server) runMaintainJob(jobID string, ident icebergtable.Identifier, pla
 	default: // ModeFull or unknown
 		compactResult, err := janitor.CompactTable(ctx, s.cat, ident, janitor.CompactOptions{
 			TargetFileSizeBytes: plan.TargetFileSizeBytes,
+			DryRun:              dryRun,
 		})
 		mr.CompactFull = compactResult
 		compactErr = err
@@ -966,7 +1007,7 @@ func (s *server) runMaintainJob(jobID string, ident icebergtable.Identifier, pla
 	// Step 4: rewrite-manifests (post-compact) — fold compact's new
 	// micro-manifest back into the partition-organized layout so the
 	// NEXT maintenance cycle starts with a clean manifest list.
-	postRewrite, err := maintenance.RewriteManifests(ctx, s.cat, ident, maintenance.RewriteManifestsOptions{})
+	postRewrite, err := maintenance.RewriteManifests(ctx, s.cat, ident, maintenance.RewriteManifestsOptions{DryRun: dryRun})
 	mr.PostCompactRewrite = postRewrite
 	if err != nil {
 		mr.TotalDurationMs = time.Since(started).Milliseconds()
