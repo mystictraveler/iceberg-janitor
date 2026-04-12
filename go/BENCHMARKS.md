@@ -1088,3 +1088,23 @@ This session shipped:
 - CloudWatch dashboard rework (always-visible ECS health)
 - Test coverage: safety 17→49%, analyzer 26→63%, catalog 39→68%, classify 40→94%
 - Branch restructure: Go is main
+
+### Spark root cause: ConnectionPoolTimeoutException (same bug as janitor Run 18.5)
+
+The final Spark run (6.52 vCPU-hours, 26.09 memGB-hours) FAILED after
+12 min with `ConnectionPoolTimeoutException: Timeout waiting for
+connection from pool`. This is the EXACT same HTTP connection pool
+exhaustion that hung the janitor in Run 18.5 (512 concurrent S3
+GetObjects saturating the Go net/http transport).
+
+Spark's `SparkBinPackDataRewriter` opens all partition file groups
+in parallel, each reading dozens of small files, saturating the
+EMRFS HTTP connection pool on the 2-DPU EMR Serverless executors.
+The janitor solved this with bounded `PartitionConcurrency` +
+`openG.SetLimit(8)`. Spark has no equivalent out-of-the-box tuning
+for the rewriteDataFiles action.
+
+This validates the janitor's architectural approach: bounded
+parallelism is load-bearing for small-file-heavy workloads on S3.
+Unbounded fan-out (Spark default, janitor pre-fix) exhausts the
+HTTP pool regardless of the tool.
