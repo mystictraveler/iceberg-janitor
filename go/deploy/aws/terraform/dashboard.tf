@@ -327,11 +327,81 @@ resource "aws_cloudwatch_dashboard" "main" {
         }
       },
 
-      # === Row 10: Errors ===
+      # === Row 10: Cross-replica dedup + dry-run activity ===
+      #
+      # With desired_count=3, concurrent maintain requests for the same
+      # table should hit the in-flight dedup guard. These panels show
+      # dedup events (which confirm the lease + jobrecord path is working)
+      # and dry-run requests (which confirm operators are using the
+      # planning-only mode before committing to real runs).
       {
         type   = "log"
         x      = 0
         y      = 54
+        width  = 12
+        height = 6
+        properties = {
+          title  = "In-flight dedup events (cross-replica guard)"
+          region = var.region
+          query  = <<-EOQ
+            SOURCE '${aws_cloudwatch_log_group.janitor.name}'
+            | filter msg like /dedup/
+            | stats count() as dedup_hits by table, bin(2m)
+          EOQ
+          view    = "timeSeries"
+          stacked = true
+        }
+      },
+      {
+        type   = "log"
+        x      = 12
+        y      = 54
+        width  = 12
+        height = 6
+        properties = {
+          title  = "Dry-run requests"
+          region = var.region
+          query  = <<-EOQ
+            SOURCE '${aws_cloudwatch_log_group.janitor.name}'
+            | filter msg = "maintain job created" and dry_run = 1
+            | stats count() as dry_runs by table, bin(5m)
+          EOQ
+          view    = "timeSeries"
+          stacked = true
+        }
+      },
+
+      # === Row 11: Batched commit partition count (CompactHot) ===
+      #
+      # The parallel-batched CompactHot stitches N partitions in parallel
+      # then commits ALL replacements in one CAS write. This panel shows
+      # the per-call partition count — higher is better (more work per
+      # snapshot, fewer total snapshots). A high partitions_failed count
+      # would indicate stitch I/O problems or the nested parallelism
+      # issue resurfacing.
+      {
+        type   = "log"
+        x      = 0
+        y      = 60
+        width  = 24
+        height = 6
+        properties = {
+          title  = "CompactHot batched commit — partitions per call"
+          region = var.region
+          query  = <<-EOQ
+            SOURCE '${aws_cloudwatch_log_group.janitor.name}'
+            | filter msg = "maintain: compact_hot done"
+            | stats avg(partitions_stitched) as avg_stitched, max(partitions_stitched) as max_stitched, avg(partitions_failed) as avg_failed, avg(elapsed_ms) as avg_ms by table, bin(5m)
+          EOQ
+          view = "timeSeries"
+        }
+      },
+
+      # === Row 12: Errors ===
+      {
+        type   = "log"
+        x      = 0
+        y      = 66
         width  = 24
         height = 6
         properties = {
