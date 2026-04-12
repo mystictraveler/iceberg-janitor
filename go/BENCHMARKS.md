@@ -1135,3 +1135,45 @@ per request, not a shared pool.
 iteration than this session allows. The janitor's results stand
 independently: 23-27% faster on Athena, 192× file reduction,
 5m47s maintain, $539/mo at 1 PB.
+
+### DEFINITIVE 3-way comparison: Uncompacted vs Janitor vs Spark
+
+Spark succeeded with `maxExecutors=8` + `fs.s3.maxConnections=500` +
+`fs.s3a.connection.maximum=500`. Wall time: **256s (4m16s)**, 0.636
+vCPU-hours. Files: 2,899 → 50.
+
+| Metric | iceberg-janitor | Spark EMR Serverless |
+|---|---|---|
+| Wall time (3 tables) | 353s (5m53s) | 256s (4m16s) |
+| Executors / parallelism | 1 vCPU, P=16 goroutines | 8 executors × 2 cores |
+| vCPU-hours | ~0.10 | 0.636 |
+| Files after | 50 | 50 |
+
+#### Athena query performance (same queries, same Athena workgroup)
+
+| Query | Uncompacted | Janitor | Spark | J vs raw | S vs raw |
+|---|---:|---:|---:|---:|---:|
+| q1 | 3,266 ms | 2,515 ms | 2,276 ms | -23% | -30% |
+| q3 | 2,618 ms | 1,908 ms | 1,893 ms | -27% | -28% |
+| q7 | 2,356 ms | 2,285 ms | 2,455 ms | -3% | +4% |
+
+**Janitor and Spark produce equivalent query performance.** Both
+reduce Athena latency 23-30% on q1/q3 vs uncompacted. q7 is noise
+(±4%). The output quality (file count, row group structure,
+column statistics) is comparable.
+
+#### Cost comparison (empirical, this workload)
+
+| | Janitor | Spark |
+|---|---|---|
+| Compute burned | 0.10 vCPU-hrs | 0.636 vCPU-hrs (6.3×) |
+| Per-run cost | ~$0.004 (Fargate) | ~$0.28 (DPU) |
+| Always-on cost | $89/mo (3 replicas) | $0/mo (ephemeral) |
+| Tuning required | None (safe defaults) | maxExecutors + maxConnections |
+| Cold start | 0s | ~90s |
+| Pre-commit check | I1-I9 master check | None |
+
+Spark uses 6.3× more compute for 27% less wall time. The janitor
+trades wall time for compute efficiency and safety (mandatory master
+check, safe defaults, zero cold start). At scale (>10 tables, 12
+cycles/hr), the janitor's always-on model is cheaper.
