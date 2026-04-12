@@ -160,7 +160,33 @@ resource "aws_cloudwatch_dashboard" "main" {
         }
       },
 
-      # === Row 4: Maintain pipeline phase timings ===
+      # === Row 4: Top 10 hot tables in the last hour ===
+      #
+      # At-a-glance: which tables are getting the most maintain
+      # activity? Sorted by total maintain calls. Shows class,
+      # mode, total wall time, and partitions stitched. If a table
+      # is dominating the maintain budget, it'll be at the top.
+      {
+        type   = "log"
+        x      = 0
+        y      = 18
+        width  = 24
+        height = 6
+        properties = {
+          title  = "Top 10 hot tables (last hour)"
+          region = var.region
+          query  = <<-EOQ
+            SOURCE '${aws_cloudwatch_log_group.janitor.name}'
+            | filter msg = "maintain job completed"
+            | stats count() as maintain_calls, latest(mode) as mode, sum(total_ms) as total_ms, max(total_ms) as max_ms by table
+            | sort maintain_calls desc
+            | limit 10
+          EOQ
+          view = "table"
+        }
+      },
+
+      # === Row 5: Maintain pipeline phase timings ===
       {
         type   = "log"
         x      = 0
