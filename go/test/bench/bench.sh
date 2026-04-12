@@ -270,6 +270,24 @@ CATALOG_DB_WITH="${CATALOG_DB_WITH:-/tmp/janitor-bench-catalog-with.db}"
 CATALOG_DB_WITHOUT="${CATALOG_DB_WITHOUT:-/tmp/janitor-bench-catalog-without.db}"
 rm -f "$CATALOG_DB_WITH" "$CATALOG_DB_WITHOUT"
 
+# Pre-register Glue tables BEFORE streaming starts. At this point the
+# tables either don't exist yet or are empty — Glue registration is
+# instant because there's only one metadata.json to discover per table.
+# The streamer's first commit creates the tables if they don't exist,
+# so on a fresh bench the pre-register may find nothing and that's OK
+# (it'll log a warning and continue). On subsequent runs the tables
+# exist from the prior run's metadata and registration is a fast
+# metadata_location update.
+#
+# The post-stream refresh (Phase B below) then only needs to update
+# the metadata_location pointer to the latest version, not discover
+# tables from scratch — dropping from 12+ minutes to seconds.
+if [[ "$MODE" == "aws" ]]; then
+  log "pre-registering Glue tables (empty tables — instant)"
+  glue_refresh "with (pre-stream)"    "$WH_WITH_URL"    "${GLUE_DB_WITH:-}"
+  glue_refresh "without (pre-stream)" "$WH_WITHOUT_URL" "${GLUE_DB_WITHOUT:-}"
+fi
+
 PID_WITH=$(start_streamer "with-janitor" "$WH_WITH_URL" "$CATALOG_DB_WITH" "$STREAMER_WITH_LOG")
 PID_WITHOUT=$(start_streamer "without-janitor" "$WH_WITHOUT_URL" "$CATALOG_DB_WITHOUT" "$STREAMER_WITHOUT_LOG")
 for pid_var in PID_WITH PID_WITHOUT; do
