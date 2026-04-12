@@ -78,7 +78,7 @@ curl -X POST http://localhost:8080/v1/tables/tpcds.db/store_sales/maintain
 
 ```bash
 ./go/test/bench/bench.sh minio
-# streams TPC-DS data for 5 min, runs 2 maintain rounds, queries via Trino
+# streams TPC-DS data for 5 min, runs 2 maintain rounds, queries via DuckDB
 # output: bench-results/bench-summary-<ts>.txt
 ```
 
