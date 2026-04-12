@@ -242,7 +242,31 @@ if [[ "$MODE" != "aws" ]]; then
   done
 fi
 
-# === Phase 2: start streamers ===
+# === Phase 2: Glue pre-registration + start streamers ===
+
+# glue_refresh must be defined here (before first call) so the
+# pre-stream registration can use it. The function is also called
+# in the post-stream and post-maintain phases below.
+glue_refresh() {
+  [[ "$MODE" != "aws" ]] && return 0
+  local label="$1" warehouse_url="$2" glue_db="$3"
+  log "glue-register $label → $glue_db"
+  JANITOR_WAREHOUSE_URL="$warehouse_url" \
+  AWS_REGION="$AWS_REGION" \
+    janitor-cli glue-register --database "$glue_db" "${NAMESPACE}.db" >> "$JANITOR_LOG" 2>&1 \
+    || log "  warning: glue-register $label returned non-zero"
+}
+
+# Pre-register Glue tables BEFORE streamers start. Tables are empty
+# (or don't exist yet on a fresh warehouse) so registration is
+# instant — just creating a Glue table pointer to the initial
+# metadata.json. The post-stream refresh then only updates the
+# metadata_location pointer, not discovers from scratch.
+if [[ "$MODE" == "aws" ]]; then
+  log "pre-registering Glue tables (empty tables — instant)"
+  glue_refresh "with (pre-stream)"    "$WH_WITH_URL"    "${GLUE_DB_WITH:-}"
+  glue_refresh "without (pre-stream)" "$WH_WITHOUT_URL" "${GLUE_DB_WITHOUT:-}"
+fi
 
 start_streamer() {
   local label="$1" url="$2" catalog_db="$3" out_log="$4"
@@ -370,16 +394,7 @@ call_maintain() {
 # bucket). Passing just `<ns>` finds nothing — this was the bug
 # in Run 18 that made the A/B signal zero.
 #
-# Only called in aws mode (local/minio don't use Glue).
-glue_refresh() {
-  [[ "$MODE" != "aws" ]] && return 0
-  local label="$1" warehouse_url="$2" glue_db="$3"
-  log "glue-register $label → $glue_db"
-  JANITOR_WAREHOUSE_URL="$warehouse_url" \
-  AWS_REGION="$AWS_REGION" \
-    janitor-cli glue-register --database "$glue_db" "${NAMESPACE}.db" >> "$JANITOR_LOG" 2>&1 \
-    || log "  warning: glue-register $label returned non-zero"
-}
+# glue_refresh is defined in Phase 2 above (before first call).
 
 MAINTAIN_ROUND=0
 run_maintain() {
@@ -556,17 +571,6 @@ run_queries() {
       ;;
   esac
 }
-
-# Pre-register Glue tables BEFORE streaming starts. At this point the
-# tables either don't exist yet or are empty — Glue registration is
-# instant because there's only one metadata.json to discover per table.
-# The post-stream refresh then only updates the metadata_location
-# pointer to the latest version, not discovers from scratch.
-if [[ "$MODE" == "aws" ]]; then
-  log "pre-registering Glue tables (empty tables — instant)"
-  glue_refresh "with (pre-stream)"    "$WH_WITH_URL"    "${GLUE_DB_WITH:-}"
-  glue_refresh "without (pre-stream)" "$WH_WITHOUT_URL" "${GLUE_DB_WITHOUT:-}"
-fi
 
 # === Phase A: stream (wait for self-termination) ===
 
