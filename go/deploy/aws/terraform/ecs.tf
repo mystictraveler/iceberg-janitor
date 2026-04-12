@@ -41,7 +41,7 @@ resource "aws_ecs_task_definition" "janitor_server" {
       },
       {
         name  = "JANITOR_PARTITION_CONCURRENCY"
-        value = "8"
+        value = "16"
       },
     ]
 
