@@ -321,11 +321,17 @@ json_field() {
   sed -n "s/.*\"$1\"[[:space:]]*:[[:space:]]*\"\([^\"]*\)\".*/\1/p" | head -1
 }
 
+# LAST_METADATA_LOCATION is set by call_maintain on success. The
+# orchestration layer reads it to update external catalogs (Glue)
+# with a direct pointer — no S3 prefix discovery needed.
+LAST_METADATA_LOCATION=""
+
 call_maintain() {
   local ns_name="$1"     # e.g. "tpcds.db/store_sales"
   local ns table
   ns="${ns_name%%/*}"    # tpcds.db
   table="${ns_name#*/}"  # store_sales
+  LAST_METADATA_LOCATION=""
 
   local url="${SERVER_URL}/v1/tables/${ns}/${table}/maintain"
   if [[ -n "$TARGET_FILE_SIZE" ]]; then
@@ -345,18 +351,18 @@ call_maintain() {
     return 1
   fi
 
-  # Poll up to 2400 seconds (40 min). compact_hot on real S3 runs
-  # SEQUENTIALLY over ~50 partitions and each partition does its own
-  # LoadTable + master check + CAS commit, so 20-30 min wall time
-  # per maintain is normal until parallel partition compaction lands.
-  # See BENCHMARKS.md Run 18 and the compact_hot.go investigation.
   local poll_url="${SERVER_URL}/v1/jobs/${job_id}"
   for _ in $(seq 1 2400); do
     local status_resp status
     status_resp=$(curl -sf "$poll_url" 2>/dev/null || echo "")
     status=$(echo "$status_resp" | json_field status)
     case "$status" in
-      completed) return 0 ;;
+      completed)
+        # Extract metadata_location from the job result so the
+        # orchestration layer can update Glue directly without
+        # running the expensive S3 prefix discovery.
+        LAST_METADATA_LOCATION=$(echo "$status_resp" | json_field metadata_location)
+        return 0 ;;
       failed)
         echo "maintain job $job_id failed: $status_resp" >> "$JANITOR_LOG"
         return 1 ;;
@@ -396,18 +402,35 @@ call_maintain() {
 #
 # glue_refresh is defined in Phase 2 above (before first call).
 
+# glue_update_metadata_location does a DIRECT Glue UpdateTable with
+# the exact metadata_location from the job result. Milliseconds vs
+# the 12+ minutes that glue_refresh takes (which does S3 prefix
+# discovery). Only called in aws mode.
+glue_update_metadata_location() {
+  [[ "$MODE" != "aws" ]] && return 0
+  local table="$1" glue_db="$2" metadata_loc="$3"
+  if [[ -z "$metadata_loc" ]]; then
+    log "  warning: no metadata_location for $table — falling back to glue_refresh"
+    glue_refresh "with (fallback ${table})" "$WH_WITH_URL" "$glue_db"
+    return
+  fi
+  log "  glue-update $table → $metadata_loc"
+  aws glue update-table \
+    --database-name "$glue_db" \
+    --table-input "{\"Name\":\"${table}\",\"TableType\":\"EXTERNAL_TABLE\",\"Parameters\":{\"table_type\":\"ICEBERG\",\"metadata_location\":\"${metadata_loc}\"}}" \
+    --region "$AWS_REGION" >> "$JANITOR_LOG" 2>&1 \
+    || log "  warning: glue update-table $table failed"
+}
+
 MAINTAIN_ROUND=0
 run_maintain() {
   MAINTAIN_ROUND=$((MAINTAIN_ROUND + 1))
   log "maintain round ${MAINTAIN_ROUND}: server auto-classifies + picks mode"
-  # After each successful maintain, refresh Glue so downstream
-  # query engines (Athena) see the new metadata_location. The
-  # janitor is catalog-less — bench.sh is the orchestration layer
-  # that propagates "snapshot changed" to Glue. Without this,
-  # every A/B measurement queries the pre-maintain snapshot.
   for table in store_sales store_returns catalog_sales; do
     if call_maintain "${NAMESPACE}.db/${table}"; then
-      glue_refresh "with (post-maintain ${table})" "$WH_WITH_URL" "${GLUE_DB_WITH:-}"
+      # Use the metadata_location from the job result to update
+      # Glue directly — no S3 prefix discovery needed.
+      glue_update_metadata_location "$table" "${GLUE_DB_WITH:-}" "$LAST_METADATA_LOCATION"
     else
       log "  warning: maintain ${table} returned non-zero — skipping glue refresh"
     fi
@@ -612,13 +635,15 @@ done
 log "pause phase — sleeping ${PAUSE_SECONDS}s for S3 writes to settle"
 sleep "$PAUSE_SECONDS"
 
-# Re-register Glue tables for BOTH warehouses right after the stream
-# phase. This is the moment the streamer's final commits have landed
-# on S3 and we need Athena to see them. Without this refresh, Athena
-# would read the metadata_location that was registered before
-# streaming started — which means both with and without would query
-# the SAME stale data layout and the A/B signal would be zero.
-glue_refresh "with"    "$WH_WITH_URL"    "${GLUE_DB_WITH:-}"
+# Re-register Glue for the WITHOUT warehouse only. The WITHOUT
+# warehouse is never maintained, so this is its only Glue update
+# (one-time cost via the slow discovery path — ~12 min on a
+# warehouse with ~200 committed metadata versions).
+#
+# The WITH warehouse does NOT need a post-stream Glue refresh
+# because the maintain step updates Glue directly per table via
+# the metadata_location field from the job result. Athena queries
+# only happen AFTER maintain, so the WITH pointer will be fresh.
 glue_refresh "without" "$WH_WITHOUT_URL" "${GLUE_DB_WITHOUT:-}"
 
 # === Phase C: maintain (WITH warehouse only, N rounds) ===
@@ -632,12 +657,10 @@ done
 MAINTAIN_ELAPSED=$(( $(date +%s) - MAINTAIN_START ))
 log "maintain phase done in ${MAINTAIN_ELAPSED}s"
 
-# Re-register Glue for the WITH warehouse ONLY — the maintain pipeline
-# wrote new metadata.json files that reseat the current snapshot.
-# The WITHOUT warehouse hasn't changed since the pre-maintain refresh,
-# so we don't need to touch it. This is the step that makes the
-# query phase actually measure post-maintain state on the with side.
-glue_refresh "with (post-maintain)" "$WH_WITH_URL" "${GLUE_DB_WITH:-}"
+# Post-maintain Glue refresh for WITH is handled inside run_maintain
+# via glue_update_metadata_location (direct UpdateTable with the
+# metadata_location from the job result). No separate glue_refresh
+# call needed — saves 12 min of S3 prefix discovery.
 
 # === Phase D: query (both warehouses, back-to-back iterations) ===
 #

@@ -889,6 +889,7 @@ type maintainResult struct {
 	PostCompactRewrite *maintenance.RewriteManifestsResult `json:"post_compact_rewrite,omitempty"`
 	Steps              []string                            `json:"steps_completed"`
 	TotalDurationMs    int64                               `json:"total_duration_ms"`
+	MetadataLocation   string                              `json:"metadata_location,omitempty"`
 }
 
 func (s *server) runMaintainJob(jobID string, ident icebergtable.Identifier, plan classify.MaintainOptions, dryRun bool) {
@@ -1022,10 +1023,19 @@ func (s *server) runMaintainJob(jobID string, ident icebergtable.Identifier, pla
 		"before_manifests", postRewrite.BeforeManifests, "after_manifests", postRewrite.AfterManifests,
 		"elapsed_ms", postRewrite.DurationMs)
 
+	// Capture the final metadata_location so the orchestration layer
+	// (bench.sh, event dispatcher) can update external catalogs
+	// (Glue, Unity, Polaris) with a direct pointer instead of
+	// running expensive S3 prefix discovery.
+	if finalTbl, lerr := s.cat.LoadTable(ctx, ident); lerr == nil {
+		mr.MetadataLocation = finalTbl.MetadataLocation()
+	}
+
 	mr.TotalDurationMs = time.Since(started).Milliseconds()
 	s.jobs.complete(jobID, mr, nil)
 	s.logger.Info("maintain job completed", "job_id", jobID, "table", tableName,
-		"mode", plan.Mode, "steps", mr.Steps, "total_ms", mr.TotalDurationMs)
+		"mode", plan.Mode, "steps", mr.Steps, "total_ms", mr.TotalDurationMs,
+		"metadata_location", mr.MetadataLocation)
 }
 
 // partitionConcurrencyFromEnv reads JANITOR_PARTITION_CONCURRENCY from
