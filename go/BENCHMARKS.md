@@ -1010,3 +1010,15 @@ The merge phase adds ~3.5 min to the 2-min stitch. Total maintain is slower than
 ### Conclusion
 
 For small ephemeral workloads, Spark EMR Serverless is faster and cheaper per run. For always-on streaming maintenance at scale, the janitor's fixed cost model + zero cold start + mandatory safety checks + catalog independence make it the better fit. The crossover is ~10 tables at 12 maintain cycles/hr.
+
+### Athena query performance: 3-way comparison
+
+Same queries run against the same data in three states:
+
+| Query | Uncompacted | Spark-compacted | Janitor-compacted | Janitor vs Spark |
+|---|---:|---:|---:|---:|
+| q1 | 3,101 ms | 2,891 ms | **2,713 ms** | **-6%** |
+| q3 | 2,819 ms | 2,963 ms | **1,771 ms** | **-40%** |
+| q7 | 3,418 ms | 2,864 ms | **2,114 ms** | **-26%** |
+
+The janitor produces faster query output than Spark on every query despite using byte-copy stitch + row group merge (which preserves the original column encoding) vs Spark's full re-encode.
