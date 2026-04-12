@@ -163,6 +163,9 @@ The initial Python reference implementation is preserved at [`reference/python-v
 | Workload classification | Auto (streaming/batch/dormant) | Manual | Heuristic | N/A |
 | Byte-copy stitch | Yes | No (decode/encode) | No | No |
 | Dry-run mode | Yes (?dry_run=true) | No | No | No |
+| **Cost at 1 PB** | **$539/mo** | **$5,980/mo** | ~$5,000/mo (est.) | N/A |
+
+Full 3-way cost analysis with Spark and Amazon Managed Flink at 1 TB / 100 TB / 1 PB scale: [`go/COMPACTION_COST_COMPARISON.md`](go/COMPACTION_COST_COMPARISON.md)
 
 ## License
 
