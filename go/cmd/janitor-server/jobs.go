@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"os"
 	"strconv"
 	"strings"
 	"sync"
@@ -950,6 +951,7 @@ func (s *server) runMaintainJob(jobID string, ident icebergtable.Identifier, pla
 			SmallFileThresholdBytes: plan.TargetFileSizeBytes,
 			HotWindowSnapshots:      5,
 			MinSmallFiles:           2,
+			PartitionConcurrency:    partitionConcurrencyFromEnv(),
 			DryRun:                  dryRun,
 		})
 		mr.CompactHot = hotResult
@@ -1024,6 +1026,21 @@ func (s *server) runMaintainJob(jobID string, ident icebergtable.Identifier, pla
 	s.jobs.complete(jobID, mr, nil)
 	s.logger.Info("maintain job completed", "job_id", jobID, "table", tableName,
 		"mode", plan.Mode, "steps", mr.Steps, "total_ms", mr.TotalDurationMs)
+}
+
+// partitionConcurrencyFromEnv reads JANITOR_PARTITION_CONCURRENCY from
+// the environment so operators can tune CompactHot parallelism without
+// rebuilding the image. Returns 0 (= use default) if unset or invalid.
+func partitionConcurrencyFromEnv() int {
+	v := os.Getenv("JANITOR_PARTITION_CONCURRENCY")
+	if v == "" {
+		return 0
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil || n < 1 {
+		return 0
+	}
+	return n
 }
 
 // handleJobStatus returns the current status of a job.

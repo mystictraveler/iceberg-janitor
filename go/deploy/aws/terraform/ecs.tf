@@ -39,6 +39,10 @@ resource "aws_ecs_task_definition" "janitor_server" {
         name  = "AWS_REGION"
         value = var.region
       },
+      {
+        name  = "JANITOR_PARTITION_CONCURRENCY"
+        value = "8"
+      },
     ]
 
     logConfiguration = {
