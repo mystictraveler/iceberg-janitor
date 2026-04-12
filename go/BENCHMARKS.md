@@ -926,3 +926,45 @@ When adding new rows to this file as new build phases land:
 4. **Always include a DuckDB round-trip query result** when the change touches data. This is the independent-engine sanity check.
 5. **Hardware and software versions** at the top of each major entry. Reproducibility across machines depends on these.
 6. If a number REGRESSES from a prior phase, mark it ⚠️ and explain why in the same row. Don't silently delete the prior number — replace it but keep the old in a "history" column.
+
+---
+
+## Run 20 — row group merge + PartitionConcurrency=16 fixes Athena regression
+
+**Date:** 2026-04-12
+**Build:** `main` at `c6ad236` — Glue StorageDescriptor fix, row group merge (>4 RGs → decode/encode to 1 RG), PartitionConcurrency=16.
+
+### The finding that prompted this run
+
+Run 19 Athena A/B showed compacted warehouse was **46-111% SLOWER** because byte-copy stitch preserves row group boundaries (2,500 scan units vs 200). This run adds automatic row group merging: after stitch, if the output has >4 row groups, re-read via pqarrow and rewrite with 1 merged row group.
+
+### Athena A/B — regression FIXED
+
+| Query | Run 19 (no merge) | Run 20 (with merge) |
+|---|---|---|
+| q1 | +80% slower | **-10% faster** |
+| q3 | +46-111% slower | **-42% faster** |
+| q7 | flat to +28% | **-42% faster** |
+
+Row group merge turned a regression into a **10-42% query improvement** on real S3 via Athena.
+
+### Maintain timing
+
+| Phase | store_sales | Notes |
+|---|---:|---|
+| Expire | 219 ms | removed 0 |
+| Rewrite-manifests (pre) | 5.5 s | 63 → 50 |
+| CompactHot stitch (P=16) | ~2 min | byte-copy, 50 stitched, 0 failed |
+| Row group merge | ~3.5 min | pqarrow decode/encode per partition |
+| Rewrite-manifests (post) | 303 ms | 2 → 2 |
+| **Total** | **336 s (5m36s)** | |
+
+The merge phase adds ~3.5 min to the 2-min stitch. Total maintain is slower than Run 19's 3m16s (stitch-only), but the query improvement justifies the cost: the merge is paid once per maintain cycle, every query benefits for the lifetime of the file.
+
+### Performance progression
+
+| Run | PartitionConcurrency | Row Group Merge | CompactHot wall | Athena vs uncompacted |
+|---|---:|---|---:|---|
+| Run 18 (seq) | 1 | No | 22 min | not measured |
+| Run 19 | 8 | No | 3 min 16 s | **46-111% slower** |
+| **Run 20** | **16** | **Yes** | **5 min 36 s** | **10-42% faster** |
