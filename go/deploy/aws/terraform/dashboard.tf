@@ -90,7 +90,7 @@ resource "aws_cloudwatch_dashboard" "main" {
           view    = "timeSeries"
           region  = var.region
           metrics = [
-            ["AWS/NetworkELB", "HealthyHostCount", "TargetGroup", aws_lb_target_group.janitor.arn_suffix, "LoadBalancer", aws_lb.internal.arn_suffix, { stat = "Average" }],
+            ["AWS/NetworkELB", "HealthyHostCount", "TargetGroup", aws_lb_target_group.fargate.arn_suffix, "LoadBalancer", aws_lb.internal.arn_suffix, { stat = "Average" }],
           ]
           period = 60
           yAxis  = { left = { min = 0 } }
