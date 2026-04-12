@@ -52,15 +52,15 @@ resource "aws_ecs_task_definition" "bench" {
         value = aws_s3_bucket.athena_results.id
       },
       # Phased bench: STREAM -> GLUE -> PAUSE -> MAINTAIN -> GLUE -> QUERY.
-      # Stream for 20 min to give the classifier's 15-min short window
-      # enough activity to pick streaming (which triggers the hot path),
-      # and to produce enough manifests for rewrite-manifests and
-      # compact_cold to have real work. The streamer is S3-PUT-bound at
-      # ~40 commits/min, so CPM=1000 is aspirational — actual output is
-      # ~800 commits per streamer over 20 min.
+      # 5 min stream is enough to produce ~200 commits per table at
+      # ~40 commits/min on S3. That gives the classifier's 15-min
+      # short-window fast path enough activity to pick streaming
+      # (≥2 commits in 15m AND 15m-rate > 6/h), and produces enough
+      # manifests for rewrite + compact to have real work. 20 min
+      # was excessive — the signal doesn't improve past 5 min.
       {
         name  = "STREAM_DURATION_SECONDS"
-        value = "1200"
+        value = "300"
       },
       {
         name  = "PAUSE_SECONDS"
