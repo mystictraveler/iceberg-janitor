@@ -37,6 +37,25 @@ func (g *GlueRegistrar) DeleteTable(ctx context.Context, database, table string)
 	})
 }
 
+// UpdateMetadataLocation updates an existing Glue table's
+// metadata_location parameter. This is the fast path for
+// propagating a janitor commit to Athena — one API call,
+// milliseconds, no S3 discovery. The table must already exist in
+// Glue (created by RegisterTable or a prior glue-register run).
+func (g *GlueRegistrar) UpdateMetadataLocation(ctx context.Context, database, tableName, metadataLocation string) error {
+	return CallAWSJSON(ctx, g.creds, g.endpoint, "glue", g.region, "AWSGlue.UpdateTable", map[string]any{
+		"DatabaseName": database,
+		"TableInput": map[string]any{
+			"Name":      tableName,
+			"TableType": "EXTERNAL_TABLE",
+			"Parameters": map[string]string{
+				"table_type":        "ICEBERG",
+				"metadata_location": metadataLocation,
+			},
+		},
+	})
+}
+
 // RegisterTable creates a Glue table pointing at an Iceberg table on S3.
 // The schema columns are extracted from the Iceberg metadata so that
 // Athena can resolve column references in queries.

@@ -184,9 +184,12 @@ COMMANDS:
                          investigating an auto-pause.
   status <table_path>    Print the per-table janitor state: pause file
                          (if any), consecutive failures, last errors.
-  glue-register          Register all discovered Iceberg tables in a Glue
-    --database <db>      database with column definitions extracted from
-    [prefix]             the Iceberg metadata. Enables Athena queries.
+  glue-register          Register Iceberg tables in a Glue database.
+    --database <db>      Two modes:
+    [prefix]               Discovery (slow): walks S3 prefix, finds all tables
+                           Direct (fast): --table <name> --metadata-location <s3://...>
+                             Updates one table's metadata_location pointer.
+                             Milliseconds vs 12+ min for discovery.
 
 ENVIRONMENT:
   JANITOR_API_URL         URL of a running janitor-server (e.g. the private

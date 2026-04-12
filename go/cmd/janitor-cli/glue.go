@@ -21,6 +21,8 @@ import (
 func runGlueRegister(args []string) error {
 	var database string
 	var prefix string
+	var metadataLocation string
+	var tableName string
 	for i := 0; i < len(args); i++ {
 		a := args[i]
 		switch {
@@ -29,6 +31,16 @@ func runGlueRegister(args []string) error {
 			i++
 		case strings.HasPrefix(a, "--database="):
 			database = strings.TrimPrefix(a, "--database=")
+		case a == "--metadata-location" && i+1 < len(args):
+			metadataLocation = args[i+1]
+			i++
+		case strings.HasPrefix(a, "--metadata-location="):
+			metadataLocation = strings.TrimPrefix(a, "--metadata-location=")
+		case a == "--table" && i+1 < len(args):
+			tableName = args[i+1]
+			i++
+		case strings.HasPrefix(a, "--table="):
+			tableName = strings.TrimPrefix(a, "--table=")
 		case strings.HasPrefix(a, "--"):
 			return fmt.Errorf("unknown flag %q", a)
 		default:
@@ -36,7 +48,16 @@ func runGlueRegister(args []string) error {
 		}
 	}
 	if database == "" {
-		return fmt.Errorf("usage: janitor-cli glue-register --database <glue_db> [prefix]")
+		return fmt.Errorf("usage: janitor-cli glue-register --database <glue_db> [--table <name> --metadata-location <s3://...>] [prefix]")
+	}
+
+	// Fast path: direct metadata_location update — no S3 discovery.
+	// Milliseconds instead of 12+ minutes on large warehouses.
+	if metadataLocation != "" {
+		if tableName == "" {
+			return fmt.Errorf("--table is required when using --metadata-location")
+		}
+		return runGlueDirectUpdate(database, tableName, metadataLocation)
 	}
 
 	warehouseURL := os.Getenv("JANITOR_WAREHOUSE_URL")
@@ -123,6 +144,33 @@ func runGlueRegister(args []string) error {
 	}
 
 	fmt.Printf("glue-register complete: %d/%d tables in database %q\n", registered, len(tables), database)
+	return nil
+}
+
+// runGlueDirectUpdate updates a single Glue table's metadata_location
+// without walking S3. This is the fast path — one Glue API call,
+// milliseconds instead of the 12+ min discovery path.
+func runGlueDirectUpdate(database, tableName, metadataLocation string) error {
+	region := os.Getenv("AWS_REGION")
+	if region == "" {
+		region = os.Getenv("AWS_DEFAULT_REGION")
+	}
+	if region == "" {
+		region = "us-east-1"
+	}
+
+	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer cancel()
+
+	glue, err := janitoraws.NewGlueRegistrar(ctx, region)
+	if err != nil {
+		return err
+	}
+
+	if err := glue.UpdateMetadataLocation(ctx, database, tableName, metadataLocation); err != nil {
+		return fmt.Errorf("updating %s.%s: %w", database, tableName, err)
+	}
+	fmt.Printf("  updated %s.%s → %s\n", database, tableName, metadataLocation)
 	return nil
 }
 
