@@ -136,6 +136,31 @@ func stitchPartitionToFile(ctx context.Context, tbl *icebergtable.Table, fs iceb
 		_ = wfs.Remove(newFilePath)
 		return "", 0, fmt.Errorf("read/manifest row mismatch: read %d rows but expected %d", rowsWritten, expectedRows)
 	}
+
+	// Post-stitch row group merge check. Byte-copy stitch preserves
+	// row group boundaries: N source files → N row groups in one
+	// output file. Query engines like Athena/Trino process each row
+	// group as a separate scan unit, so many tiny row groups are
+	// WORSE than fewer files with many row groups. Run 19 proved
+	// this: 2,500 row groups (50 files × 50 RGs) was 46-111% slower
+	// on Athena than 200 uncompacted files with 1 RG each.
+	//
+	// If the stitched output has > maxRowGroupsPerFile row groups,
+	// re-read it via pqarrow and rewrite with merged row groups.
+	// This is the decode/encode path (slower, ~3-10× more CPU) but
+	// produces query-optimal output. The cost is paid once per
+	// compaction; every query benefits for the lifetime of the file.
+	if usedStitch {
+		mergedPath, mergedRows, merr := maybeMergeRowGroups(ctx, fs, wfs, newFilePath, rowsWritten, writeSchema, locProv)
+		if merr == nil && mergedPath != "" {
+			// Merge succeeded — swap the output path.
+			_ = wfs.Remove(newFilePath)
+			newFilePath = mergedPath
+			rowsWritten = mergedRows
+		}
+		// If merge failed or wasn't needed, keep the stitched output.
+	}
+
 	return newFilePath, rowsWritten, nil
 }
 
