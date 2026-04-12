@@ -39,20 +39,54 @@ func (g *GlueRegistrar) DeleteTable(ctx context.Context, database, table string)
 
 // UpdateMetadataLocation updates an existing Glue table's
 // metadata_location parameter. This is the fast path for
-// propagating a janitor commit to Athena — one API call,
-// milliseconds, no S3 discovery. The table must already exist in
-// Glue (created by RegisterTable or a prior glue-register run).
+// propagating a janitor commit to Athena — two API calls
+// (GetTable + UpdateTable), milliseconds, no S3 discovery.
+//
+// The Glue UpdateTable API REPLACES the entire TableInput, not
+// merges it. If we send only Parameters, the StorageDescriptor
+// (columns, location, serde) gets wiped and Athena returns
+// "StorageDescriptor.getColumns() is null". The fix: GetTable
+// first, patch the metadata_location in the existing Parameters,
+// and send the full TableInput back.
 func (g *GlueRegistrar) UpdateMetadataLocation(ctx context.Context, database, tableName, metadataLocation string) error {
+	// GetTable to read the existing table definition.
+	existing, err := CallAWSJSONResult(ctx, g.creds, g.endpoint, "glue", g.region, "AWSGlue.GetTable", map[string]any{
+		"DatabaseName": database,
+		"Name":         tableName,
+	})
+	if err != nil {
+		return fmt.Errorf("GetTable %s.%s: %w", database, tableName, err)
+	}
+
+	// Extract the Table object and patch metadata_location.
+	table, ok := existing["Table"].(map[string]any)
+	if !ok {
+		return fmt.Errorf("GetTable %s.%s: unexpected response shape", database, tableName)
+	}
+
+	// Build TableInput from the existing table, preserving
+	// StorageDescriptor, columns, and all other fields.
+	params, _ := table["Parameters"].(map[string]any)
+	if params == nil {
+		params = map[string]any{}
+	}
+	params["table_type"] = "ICEBERG"
+	params["metadata_location"] = metadataLocation
+
+	tableInput := map[string]any{
+		"Name":       tableName,
+		"Parameters": params,
+	}
+	if sd := table["StorageDescriptor"]; sd != nil {
+		tableInput["StorageDescriptor"] = sd
+	}
+	if tt := table["TableType"]; tt != nil {
+		tableInput["TableType"] = tt
+	}
+
 	return CallAWSJSON(ctx, g.creds, g.endpoint, "glue", g.region, "AWSGlue.UpdateTable", map[string]any{
 		"DatabaseName": database,
-		"TableInput": map[string]any{
-			"Name":      tableName,
-			"TableType": "EXTERNAL_TABLE",
-			"Parameters": map[string]string{
-				"table_type":        "ICEBERG",
-				"metadata_location": metadataLocation,
-			},
-		},
+		"TableInput":   tableInput,
 	})
 }
 

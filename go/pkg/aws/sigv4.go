@@ -92,6 +92,28 @@ func CallAWSJSON(ctx context.Context, creds awspkg.CredentialsProvider, endpoint
 	return err
 }
 
+// CallAWSJSONResult is like CallAWSJSON but returns the parsed
+// response body as a map. Used by Glue's GetTable to read the
+// existing table definition before patching metadata_location.
+func CallAWSJSONResult(ctx context.Context, creds awspkg.CredentialsProvider, endpoint, service, region, target string, payload any) (map[string]any, error) {
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := DoJSON(ctx, creds, "POST", endpoint, service, region, map[string]string{
+		"Content-Type": "application/x-amz-json-1.1",
+		"X-Amz-Target": target,
+	}, body)
+	if err != nil {
+		return nil, err
+	}
+	var result map[string]any
+	if err := json.Unmarshal(resp, &result); err != nil {
+		return nil, fmt.Errorf("parsing response: %w", err)
+	}
+	return result, nil
+}
+
 func sha256Hash(data []byte) string {
 	if data == nil {
 		data = []byte{}
