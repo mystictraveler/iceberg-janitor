@@ -629,6 +629,18 @@ components:
             when the server runs in legacy in-process-only mode
             (no warehouse-backed lease).
           example: janitor-server-7c9d8f6b9d-x4w2k:1:8f3e2c4a-...
+        metadata_location:
+          type: string
+          description: |
+            The S3/GCS/Azure path to the committed metadata.json
+            after the maintenance operation completes. Present on
+            `maintain` jobs when status is `completed`. The
+            orchestration layer uses this to update external catalogs
+            (Glue, Unity Catalog, Polaris) with a direct pointer —
+            no S3 prefix discovery needed. The server is catalog-less
+            by design; propagating "metadata changed" is the
+            orchestrator's job.
+          example: s3://warehouse/tpcds.db/store_sales/metadata/00071-abc123.metadata.json
 
     TableLocation:
       type: object

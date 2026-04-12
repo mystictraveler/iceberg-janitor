@@ -54,8 +54,8 @@ No catalog service required. No managed control plane. No per-GB pricing.
 ### Key design choices
 
 - **No catalog service.** The directory catalog reads `metadata/` directly from object storage and commits atomically via conditional write (`If-None-Match: *` on S3, `IfNotExist` on GCS/Azure). Works with any Iceberg table regardless of how it was created.
-- **Byte-copy stitching.** Compaction copies parquet column chunks byte-for-byte between files. No Arrow materialization, no schema conversion. ~20% faster than decode/encode on 500-file inputs.
-- **Single-snapshot batched commit.** CompactHot stitches N partitions in parallel, then commits ALL replacements in one transaction with one CAS write. The table gains exactly one snapshot per CompactHot call, not N.
+- **Two-phase compaction: byte-copy stitch + automatic row group merge.** Phase 1 copies parquet column chunks byte-for-byte between files (zero decode, zero CPU per row). Phase 2 automatically merges row groups when the stitched output has >4 per file — re-reads via pqarrow and rewrites with 1 merged row group, fresh column statistics. Result: query-optimal output (42% faster on Athena) without always paying the decode/encode cost. No other tool does this.
+- **Single-snapshot batched commit.** CompactHot stitches N partitions in parallel (PartitionConcurrency=16), then commits ALL replacements in one transaction with one CAS write. The table gains exactly one snapshot per CompactHot call, not N.
 - **Cross-replica safety.** The lease primitive + persistent job records let multiple server replicas coexist without duplicate work. Concurrent maintain requests for the same table return the existing job's ID (HTTP 202) instead of spawning a duplicate.
 - **Mandatory master check.** Every CAS commit goes through `safety.VerifyCompactionConsistency` (compact) or `safety.VerifyExpireConsistency` (expire). Non-bypassable. Failures are recorded in the job result.
 - **Dry-run mode.** Every maintenance endpoint accepts `?dry_run=true`. The server runs the full planning phase (manifest walk, staging, master check), then stops before any side effects. The result reports projected counts plus a `contention_detected` flag computed by reloading the table and comparing snapshot IDs.
@@ -166,6 +166,22 @@ The initial Python reference implementation is preserved at [`reference/python-v
 | **Cost at 1 PB** | **$539/mo** | **$5,980/mo** | ~$5,000/mo (est.) | N/A |
 
 Full 3-way cost analysis with Spark and Amazon Managed Flink at 1 TB / 100 TB / 1 PB scale: [`go/COMPACTION_COST_COMPARISON.md`](go/COMPACTION_COST_COMPARISON.md)
+
+## What makes this different
+
+Six capabilities no other open source Iceberg compaction tool provides:
+
+1. **Two-phase compaction** — byte-copy stitch (fast, zero decode) + automatic row group merge (only when needed). Spark/Flink always decode/encode every row. The janitor only pays that cost when the output has >4 row groups.
+
+2. **Mandatory pre-commit master check** — every commit verifies 9 invariants (row count, schema, per-column stats, manifest refs). Non-bypassable. No `--force` flag. No other tool does this.
+
+3. **Catalog-less** — reads metadata.json directly from object storage. No REST catalog, no Glue, no Hive metastore. Drop it onto any bucket with Iceberg tables.
+
+4. **Automatic workload classification** — classifies each table as streaming/batch/slow_changing/dormant from its commit history. Per-class thresholds. Zero operator configuration.
+
+5. **Cross-replica dedup** — S3 conditional-write leases prevent duplicate jobs across multiple server instances. Concurrent maintain requests for the same table return the existing job.
+
+6. **Dry-run with contention detection** — `?dry_run=true` runs the full manifest walk, reports what would happen, and detects if a foreign writer is actively committing (snapshot ID drift).
 
 ## License
 
