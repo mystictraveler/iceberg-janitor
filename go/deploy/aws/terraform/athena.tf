@@ -37,6 +37,19 @@ resource "aws_vpc_endpoint" "athena" {
   tags = { Name = "${var.project}-athena-endpoint" }
 }
 
+# NOTE: Glue VPC endpoint NOT created here. A shared VPC-wide Glue
+# endpoint already exists (vpce-0dcc706470f7bc060) with private DNS
+# enabled. However, the sandbox NACL blocks traffic between our
+# private subnet (subnet-045dd14e688b740b1) and the endpoint's ENI
+# subnet in the same AZ (subnet-0c1c7ce611a4e1714) — cross-subnet
+# port 443 is silently dropped. This is the same NACL pathology that
+# killed the Private API Gateway and cross-AZ server access.
+#
+# Workaround: Glue UpdateTable calls are made from the LOCAL machine
+# (outside the VPC) or from the bench's post-run artifact upload
+# phase. The server stays catalog-less and reports metadata_location
+# in the job result; the orchestration layer calls Glue externally.
+
 resource "aws_glue_catalog_database" "with_janitor" {
   name = "${replace(var.project, "-", "_")}_with"
 }
