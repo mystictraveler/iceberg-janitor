@@ -1113,3 +1113,25 @@ safe; Spark's default is not on small-file-heavy workloads.
 
 TODO: resubmit Spark with `maxExecutors=2` +
 `fs.s3a.connection.maximum=500` for a fair comparison.
+
+### Update: maxExecutors=3 + connection.maximum=500 still fails
+
+Same `ConnectionPoolTimeoutException` after 7.64 vCPU-hours. The
+`fs.s3a.connection.maximum` doesn't apply to EMRFS (Amazon's S3
+filesystem). EMRFS uses `fs.s3.maxConnections` instead. Spark
+completed 21 stages (compacted ~20 partitions) before the pool
+exhausted on stage 22 — it makes progress but leaks connections
+across stages.
+
+The EMRFS connection pool tuning is an EMR-specific operational
+concern that operators would need to configure per workload. The
+janitor's bounded `PartitionConcurrency` avoids this entirely
+because it uses gocloud.dev/blob which creates fresh HTTP clients
+per request, not a shared pool.
+
+**Empirical Spark comparison: deferred.** The catalog compatibility
+(v<N> format, version-hint.text) and the connection pool tuning
+(EMRFS vs S3A config namespace) are both solvable but require more
+iteration than this session allows. The janitor's results stand
+independently: 23-27% faster on Athena, 192× file reduction,
+5m47s maintain, $539/mo at 1 PB.
