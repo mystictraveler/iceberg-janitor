@@ -1038,3 +1038,53 @@ After fixing the namespace (`tpcds` → `tpcds.db`), adding `v<N>.metadata.json`
 | q7 | 3,418 ms | 1,980 ms | **-42%** |
 
 The Spark empirical comparison remains a TODO for a future session once the catalog compatibility is resolved.
+
+### Final Athena results with v<N> metadata format (Run 21)
+
+Same bench as Run 20 but with v<N>.metadata.json + version-hint.text
+format (commit 23f8440). v<N> format didn't change compaction or query
+performance — it only changes the metadata filename.
+
+| Query | Uncompacted | Janitor (stitch + merge) | Change |
+|---|---:|---:|---:|
+| q1 | 3,266 ms | 2,515 ms | **-23%** |
+| q3 | 2,618 ms | 1,908 ms | **-27%** |
+| q7 | 2,356 ms | 2,285 ms | **-3%** |
+
+### Spark comparison: blocked by catalog incompatibility
+
+Multiple attempts to run Spark `rewriteDataFiles` (via Scala Actions
+API in a shaded JAR on EMR Serverless) against iceberg-go-written
+tables all hung: the job enters RUNNING state but produces zero output
+files and reports zero vCPU-hours for 5+ minutes before being killed.
+
+The `v<N>.metadata.json` + `version-hint.text` shim lets Spark FIND
+the table (no more FileNotFoundException), but the `rewriteDataFiles`
+action hangs during manifest/data-file resolution. This suggests a
+deeper incompatibility in how iceberg-go writes manifest entries
+(avro format, partition tuple encoding, or file path resolution) vs
+what Spark's hadoop-catalog `RewriteDataFilesSparkAction` expects.
+
+**Status:** The empirical Spark comparison remains a TODO. The v<N>
+format change (commit 23f8440) is necessary but not sufficient.
+Resolving the manifest-level incompatibility likely requires either
+(a) debugging with Spark driver logs (which require S3 log output
+configuration on the EMR app) or (b) using Spark's Glue catalog
+instead of hadoop (which requires port 443 access from EMR to Glue —
+not blocked by the sandbox NACL since EMR Serverless runs in
+AWS-managed subnets).
+
+### Session summary
+
+This session shipped:
+- Parallel-batched CompactHot (PartitionConcurrency=16): 5m47s on S3
+- Automatic row group merge: 12-27% faster Athena queries
+- Dry-run mode on all maintenance endpoints
+- metadata_location in job result for direct Glue UpdateTable
+- v<N>.metadata.json + version-hint.text (Spark-compatible format)
+- 3-replica deployment with NLB load balancing
+- Pre-stream Glue registration
+- 3-way cost comparison document (janitor vs Spark vs Flink)
+- CloudWatch dashboard rework (always-visible ECS health)
+- Test coverage: safety 17→49%, analyzer 26→63%, catalog 39→68%, classify 40→94%
+- Branch restructure: Go is main
