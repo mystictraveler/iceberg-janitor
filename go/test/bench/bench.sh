@@ -415,11 +415,14 @@ glue_update_metadata_location() {
     return
   fi
   log "  glue-update $table → $metadata_loc"
-  aws glue update-table \
-    --database-name "$glue_db" \
-    --table-input "{\"Name\":\"${table}\",\"TableType\":\"EXTERNAL_TABLE\",\"Parameters\":{\"table_type\":\"ICEBERG\",\"metadata_location\":\"${metadata_loc}\"}}" \
-    --region "$AWS_REGION" >> "$JANITOR_LOG" 2>&1 \
-    || log "  warning: glue update-table $table failed"
+  # Use janitor-cli's fast path (--metadata-location) instead of raw
+  # aws glue update-table. The CLI uses pkg/aws SigV4 signing which
+  # resolves Fargate task role credentials the same way as every other
+  # AWS call the bench makes — no separate Glue IAM policy needed.
+  JANITOR_WAREHOUSE_URL="$WH_WITH_URL" \
+  AWS_REGION="$AWS_REGION" \
+    janitor-cli glue-register --database "$glue_db" --table "$table" --metadata-location "$metadata_loc" >> "$JANITOR_LOG" 2>&1 \
+    || log "  warning: glue-update $table failed"
 }
 
 MAINTAIN_ROUND=0

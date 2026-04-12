@@ -62,6 +62,30 @@ resource "aws_iam_role_policy" "ecs_task_s3" {
   })
 }
 
+# Glue access for the ECS task role — needed by janitor-cli
+# glue-register (both discovery and direct --metadata-location path)
+# and by the bench's glue_update_metadata_location helper.
+resource "aws_iam_role_policy" "ecs_task_glue" {
+  name = "${var.project}-ecs-task-glue"
+  role = aws_iam_role.ecs_task.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect = "Allow"
+      Action = [
+        "glue:GetTable",
+        "glue:CreateTable",
+        "glue:UpdateTable",
+        "glue:DeleteTable",
+        "glue:GetDatabase",
+        "glue:GetTables",
+      ]
+      Resource = ["*"]
+    }]
+  })
+}
+
 # --- EC2 bench instance profile ---
 
 resource "aws_iam_role" "bench" {
