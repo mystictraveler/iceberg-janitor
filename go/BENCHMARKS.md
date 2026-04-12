@@ -1104,7 +1104,12 @@ The janitor solved this with bounded `PartitionConcurrency` +
 `openG.SetLimit(8)`. Spark has no equivalent out-of-the-box tuning
 for the rewriteDataFiles action.
 
-This validates the janitor's architectural approach: bounded
-parallelism is load-bearing for small-file-heavy workloads on S3.
-Unbounded fan-out (Spark default, janitor pre-fix) exhausts the
-HTTP pool regardless of the tool.
+Both tools hit the same pool exhaustion with default settings. Both
+have a fix: the janitor's `PartitionConcurrency` is built-in and
+safe by default; Spark requires operator tuning
+(`spark.dynamicAllocation.maxExecutors` or
+`spark.hadoop.fs.s3a.connection.maximum`). The janitor's default is
+safe; Spark's default is not on small-file-heavy workloads.
+
+TODO: resubmit Spark with `maxExecutors=2` +
+`fs.s3a.connection.maximum=500` for a fair comparison.
