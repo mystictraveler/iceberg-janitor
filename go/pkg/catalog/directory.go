@@ -159,17 +159,17 @@ func (c *DirectoryCatalog) CommitTable(ctx context.Context, ident icebergtable.I
 	}
 
 	// Compute the next metadata location: v(N+1).metadata.json under the
-	// table's metadata/ prefix. We use iceberg-go's location provider so
-	// the path matches what other Iceberg readers expect.
+	// table's metadata/ prefix. We write the Spark-compatible v<N> format
+	// (not iceberg-go's default <padded>-<uuid> format) so Spark's hadoop
+	// catalog, DuckDB, and other readers can find the metadata without a
+	// catalog service. The v<N> convention is the most prevalent across
+	// the Iceberg ecosystem.
 	provider, err := icebergtable.LoadLocationProvider(updated.Location(), updated.Properties())
 	if err != nil {
 		return nil, "", fmt.Errorf("loading location provider: %w", err)
 	}
 	nextVersion := nextMetadataVersion(metadataLoc) + 1
-	newLoc, err := provider.NewTableMetadataFileLocation(nextVersion)
-	if err != nil {
-		return nil, "", fmt.Errorf("computing next metadata location: %w", err)
-	}
+	newLoc := provider.NewMetadataLocation(fmt.Sprintf("v%d.metadata.json", nextVersion))
 
 	// Atomic conditional-write commit. This is the load-bearing primitive
 	// that makes the no-catalog-service design correct under multi-writer
@@ -182,6 +182,12 @@ func (c *DirectoryCatalog) CommitTable(ctx context.Context, ident icebergtable.I
 	if err := c.atomicWriteMetadataJSON(ctx, updated, newLoc); err != nil {
 		return nil, "", fmt.Errorf("atomic commit at %s: %w", newLoc, err)
 	}
+
+	// Write version-hint.text so Spark's hadoop catalog can find the
+	// current version without listing the metadata/ prefix. Best-effort
+	// — a missing hint just means Spark does a directory scan.
+	c.writeVersionHint(ctx, provider, nextVersion)
+
 	return updated, newLoc, nil
 }
 
@@ -348,6 +354,25 @@ func bucketRelativeKey(warehouseURL, absLoc string) (string, error) {
 	}
 }
 
+// writeVersionHint writes a version-hint.text file next to the metadata.
+// This is a best-effort hint for Spark's hadoop catalog to find the
+// current version without listing the metadata/ prefix. A missing or
+// stale hint just means Spark falls back to a directory scan — it's
+// never a correctness issue.
+func (c *DirectoryCatalog) writeVersionHint(ctx context.Context, provider icebergtable.LocationProvider, version int) {
+	hintLoc := provider.NewMetadataLocation("version-hint.text")
+	key, kerr := bucketRelativeKey(c.warehouseURL, hintLoc)
+	if kerr != nil || key == "" {
+		return
+	}
+	w, err := c.bucket.NewWriter(ctx, key, nil)
+	if err != nil {
+		return // best-effort
+	}
+	fmt.Fprintf(w, "%d", version)
+	_ = w.Close()
+}
+
 // nextMetadataVersion parses the current metadata path and returns the
 // version number it carries. The caller adds 1 to compute the next.
 func nextMetadataVersion(currentLoc string) int {
@@ -493,19 +518,16 @@ func (c *DirectoryCatalog) CreateTable(ctx context.Context, identifier icebergta
 		return nil, fmt.Errorf("building initial metadata: %w", err)
 	}
 
-	// Write v1.metadata.json. Use atomicWriteMetadataJSON so the
-	// same CAS contract holds even for the initial create.
+	// Write v1.metadata.json in the Spark-compatible v<N> format.
 	provider, err := icebergtable.LoadLocationProvider(tableLoc, meta.Properties())
 	if err != nil {
 		return nil, fmt.Errorf("loading location provider: %w", err)
 	}
-	metaLoc, err := provider.NewTableMetadataFileLocation(1)
-	if err != nil {
-		return nil, fmt.Errorf("computing metadata location: %w", err)
-	}
+	metaLoc := provider.NewMetadataLocation("v1.metadata.json")
 	if err := c.atomicWriteMetadataJSON(ctx, meta, metaLoc); err != nil {
 		return nil, fmt.Errorf("writing initial metadata: %w", err)
 	}
+	c.writeVersionHint(ctx, provider, 1)
 
 	// Load and return the table through the normal path so the
 	// caller gets a fully-wired *Table with FS, catalog reference,
