@@ -1022,3 +1022,19 @@ Same queries run against the same data in three states:
 | q7 | 3,418 ms | 2,864 ms | **2,114 ms** | **-26%** |
 
 The janitor produces faster query output than Spark on every query despite using byte-copy stitch + row group merge (which preserves the original column encoding) vs Spark's full re-encode.
+
+### Correction: Spark "118s SUCCESS" was a no-op
+
+The earlier Spark runs that reported SUCCESS in 118s were silently failing — the `rewrite_data_files` CALL errored, the PySpark `try/except` swallowed the exception, and the script exited 0. Post-run file count was unchanged at 2,899.
+
+After fixing the namespace (`tpcds` → `tpcds.db`), adding `v<N>.metadata.json` + `version-hint.text` shims (Spark's hadoop catalog uses a different naming convention than iceberg-go), the real compaction attempt ran for 11+ minutes with zero output files and zero reported resource utilization before being cancelled. The `rewrite_data_files` CALL likely hung on manifest resolution or S3 I/O.
+
+**Honest status:** We do not have a working Spark compaction of iceberg-go-written tables. The catalog naming incompatibility (`v<N>` vs `<padded>-<uuid>`) and the PySpark CALL semantics need more debugging. The 3-way Athena comparison reported earlier compared janitor-compacted vs *uncompacted* data mislabeled as "Spark-compacted". The corrected 2-way comparison (janitor vs uncompacted) stands:
+
+| Query | Uncompacted | Janitor (stitch + merge) | Change |
+|---|---:|---:|---:|
+| q1 | 3,101 ms | 2,713 ms | **-12%** |
+| q3 | 2,819 ms | 1,628 ms | **-42%** |
+| q7 | 3,418 ms | 1,980 ms | **-42%** |
+
+The Spark empirical comparison remains a TODO for a future session once the catalog compatibility is resolved.
