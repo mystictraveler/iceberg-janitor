@@ -807,6 +807,115 @@ Noise band across all queries is ±10 %. q1, q3, q19, q46, q55, q96 are flat or 
 
 ---
 
+## Run 19 — first 3-replica AWS bench with parallel-batched CompactHot
+
+**Date:** 2026-04-12
+**Build:** `main` at `41ddf02` — metadata_location in job result, direct Glue UpdateTable, PartitionConcurrency=8, pre-stream Glue, 300s stream.
+**Hardware:** AWS ECS Fargate, 3× server replicas (1 vCPU, 4 GB each), bench as separate Fargate task, all in us-east-1a.
+
+### Why this run matters
+
+First end-to-end AWS bench with:
+- 3 server replicas behind an internal NLB
+- Parallel-batched CompactHot (PartitionConcurrency=8)
+- metadata_location in the maintain job result for direct Glue UpdateTable
+- Pre-stream Glue registration on empty tables (~1s vs 12 min)
+
+### Bench config
+
+```
+STREAM_DURATION_SECONDS   300    # 5 min
+MAINTAIN_ROUNDS           2
+QUERY_ITERATIONS          5
+PARTITION_CONCURRENCY     8      # via JANITOR_PARTITION_CONCURRENCY env var
+COMMITS_PER_MINUTE        1000   # aspirational; actual ~40/min on S3
+```
+
+### Stream
+
+| Warehouse | Commits | Per-table | Throughput |
+|---|---:|---|---:|
+| with | 202 | ss=68, sr=67, cs=67 | ~40/min |
+| without | 206 | ss=69, sr=69, cs=68 | ~41/min |
+
+### Maintain Round 1 — store_sales (streaming → hot)
+
+| Phase | Result | Elapsed |
+|---|---|---:|
+| Expire | removed 0 | 219 ms |
+| Rewrite-manifests (pre) | **69 → 50** | 5.5 s |
+| **CompactHot (PartitionConcurrency=8)** | **50 hot, 50 stitched, 0 failed** | **195.6 s (3 min 16 s)** |
+| Rewrite-manifests (post) | 2 → 2 | 303 ms |
+| **Total** | | **201.7 s (3 min 22 s)** |
+
+### Maintain Round 1 — store_returns + catalog_sales (batch → cold)
+
+| Table | Rewrite (pre) | CompactCold | Total |
+|---|---|---|---:|
+| store_returns | 69 → 50 | 0 triggered | 11.5 s |
+| catalog_sales | 68 → 10 (6.8×) | 0 triggered | 6.0 s |
+
+Cold tables had no partitions above the small-file trigger threshold — the streamers produced ~67 commits per table over 5 min, spread across 50 partitions = ~1 file per partition = below the SmallFileTrigger=2.
+
+### Maintain Round 2
+
+store_sales: **nothing to do** (round 1 already compacted) — 1.4 s. Store_returns and catalog_sales reclassified as streaming (the round 1 maintain commits pushed the recent-commit count into the short-window threshold) and ran CompactHot on the partition data from round 1.
+
+### CompactHot performance progression
+
+| Run | PartitionConcurrency | store_sales wall | Speedup vs sequential |
+|---|---:|---:|---:|
+| Run 18 (sequential) | 1 | 22 min | 1× |
+| Run 19 attempt (killed) | 4 | 20 min | 1.1× |
+| Run 19 prior attempt | 8 | 5 min 10 s | 4.3× |
+| **Run 19 (this run)** | **8** | **3 min 16 s** | **6.7×** |
+
+### 3-replica observations
+
+- 3 server replicas: `9f488ab6`, `93d442a3`, `b53ee726`
+- NLB distributed jobs across all 3 replicas (confirmed in log request IDs)
+- Cross-replica job poll reads worked (GET /v1/jobs/{id} answered by replicas that don't own the job)
+- No in-flight dedup events (bench sends sequential requests per table — dedup would fire on concurrent POSTs)
+- metadata_location reported in every maintain job completion
+
+### Glue update
+
+- **Pre-stream:** 1.3s + 0.9s (instant, empty tables) ✓
+- **Post-maintain (direct UpdateTable):** Failed — bench image had stale CLI binary without `--metadata-location` flag. Fixed manually from local machine. **Bug to fix:** rebuild bench image with latest CLI.
+- **Post-stream WITHOUT (discovery):** 12 min (still the slow path — future fix: streamer reports metadata_location)
+
+### Query A/B — ⚠️ compacted is SLOWER (row group overhead)
+
+Athena queries were re-run manually from the local machine after fixing Glue registration. Two rounds (reversed order to control for Athena warmup):
+
+| Query | WITHOUT (uncompacted) | WITH (compacted) | Change |
+|---|---:|---:|---:|
+| q1 (round 1 / round 2) | 3,000 / 3,705 ms | 5,411 / 6,788 ms | **+80% slower** |
+| q3 (round 1 / round 2) | 3,271 / 2,455 ms | 6,889 / 4,778 ms | **+46-111% slower** |
+| q7 (round 1 / round 2) | 3,440 / 3,394 ms | 3,188 / 4,346 ms | **flat to +28%** |
+
+**Root cause: row group proliferation.** The byte-copy stitch preserves row group boundaries — N source files produce N row groups in the stitched output. With 50 partitions × ~50 small files per partition stitched into 50 output files, each output file carries ~50 tiny row groups. Athena processes each row group as a separate scan unit, so the compacted table has **more scan units** (50 files × 50 row groups = 2,500) than the uncompacted table (~200 files × 1 row group = ~200).
+
+**File count went down 4×, but row group count went up 12×.** Athena cares about row group count, not file count.
+
+**The fix:** `MergeRowGroups` option on the compaction path — merge all source row groups into one large row group per output file. This requires the pqarrow decode/encode path (3-10× slower than byte-copy stitch) but produces output that Athena reads optimally: 50 files × 1 row group = 50 scan units. This is the row-group merging optimization discussed in the session and deferred as a future task.
+
+**Impact:** File-count reduction alone is the right approach for **manifest-walk cost** (fewer manifests to open) and **S3 API cost** (fewer ListObjects pages). But for **query execution time**, Athena needs fewer row groups, not fewer files. The hot path should stay as byte-copy stitch (fast, low-cost, good for maintenance cadence). A cold-path option with `MergeRowGroups: true` would produce query-optimal output at the cost of more CPU per compaction.
+
+### Code delta from Run 18.6
+
+| File | Change |
+|---|---|
+| `cmd/janitor-server/jobs.go` | `partitionConcurrencyFromEnv()` reads `JANITOR_PARTITION_CONCURRENCY` env var. `maintainResult` gains `MetadataLocation` field populated from the committed table's `MetadataLocation()`. |
+| `deploy/aws/terraform/ecs.tf` | `JANITOR_PARTITION_CONCURRENCY=8` (later 16). |
+| `deploy/aws/terraform/iam.tf` | Glue permissions added to ECS task role. |
+| `deploy/aws/terraform/bench-task.tf` | `STREAM_DURATION_SECONDS` 1200 → 300. |
+| `test/bench/bench.sh` | Pre-stream Glue registration before streamers. `glue_update_metadata_location()` uses `janitor-cli glue-register --metadata-location` for direct Glue UpdateTable after maintain. Removed post-maintain and post-stream WITH glue_refresh calls. |
+| `cmd/janitor-cli/glue.go` | New `--table` + `--metadata-location` fast path: skips S3 prefix discovery, calls `GlueRegistrar.UpdateMetadataLocation()` directly. |
+| `pkg/aws/glue.go` | New `UpdateMetadataLocation()` method: one `AWSGlue.UpdateTable` API call. |
+
+---
+
 ## Format conventions for future entries
 
 When adding new rows to this file as new build phases land:
