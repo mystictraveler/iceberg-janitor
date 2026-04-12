@@ -74,6 +74,15 @@ type ExpireOptions struct {
 	// runs and is updated with the outcome afterward. Same shape as
 	// CompactOptions.CircuitBreaker.
 	CircuitBreaker *safety.CircuitBreaker
+
+	// DryRun, when true, stages the expiration in-memory, runs the
+	// master check on the staged table, and then STOPS before
+	// tx.Commit. The result reports the snapshot ids that would be
+	// removed plus the usual Before/After counters. Because staging
+	// is pure in-memory work on the loaded Snapshots list, a dry run
+	// does not write or read any extra data files — it only reloads
+	// the table once at the end to probe for contention.
+	DryRun bool
 }
 
 func (o *ExpireOptions) defaults() {
@@ -114,6 +123,15 @@ type ExpireResult struct {
 
 	Verification *safety.Verification `json:"verification"`
 	DurationMs   int64                `json:"duration_ms"`
+
+	// DryRun is set when the caller passed ExpireOptions.DryRun. The
+	// RemovedSnapshotIDs and After* fields reflect the projected
+	// outcome computed from the staged snapshot list; nothing was
+	// committed. ContentionDetected reports whether a foreign writer
+	// advanced the table's current snapshot during the planning
+	// phase.
+	DryRun             bool `json:"dry_run,omitempty"`
+	ContentionDetected bool `json:"contention_detected,omitempty"`
 }
 
 // Expire removes old snapshots from `ident`'s metadata and commits the
@@ -268,6 +286,36 @@ func expireOnce(ctx context.Context, cat *catalog.DirectoryCatalog, ident iceber
 	result.Verification = verification
 	if err != nil {
 		return err
+	}
+
+	// Dry-run cut point. Master check passed on the staged snapshot
+	// set; the commit would go through next. Stop here, fill in the
+	// "after" counts from the staged metadata, and probe for
+	// contention by reloading the table. See CompactOptions.DryRun
+	// for the rationale.
+	if opts.DryRun {
+		result.DryRun = true
+		stagedMeta := staged.Metadata()
+		if cur := stagedMeta.CurrentSnapshot(); cur != nil {
+			result.AfterSnapshotID = cur.SnapshotID
+		} else {
+			result.AfterSnapshotID = result.BeforeSnapshotID
+		}
+		result.AfterSnapshots = len(stagedMeta.Snapshots())
+		// Expire removes snapshots from the parent chain but leaves
+		// the current snapshot's file set untouched, so the visible
+		// file + row counts are the same as before. Post-commit
+		// orphan deletion acts on files that were ONLY referenced by
+		// expired snapshots, which does not change the current
+		// snapshot's query-visible set.
+		result.AfterFiles = result.BeforeFiles
+		result.AfterRows = result.BeforeRows
+		if probe, perr := cat.LoadTable(ctx, ident); perr == nil {
+			if cur := probe.CurrentSnapshot(); cur != nil && cur.SnapshotID != result.BeforeSnapshotID {
+				result.ContentionDetected = true
+			}
+		}
+		return nil
 	}
 
 	// Commit. Routes through tbl.doCommit → directory catalog

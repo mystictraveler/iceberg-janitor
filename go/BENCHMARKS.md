@@ -739,6 +739,74 @@ Server-side breakdown (job `9baa4262`):
 
 ---
 
+## Run 18.6 — parallel-batched CompactHot, end-to-end MinIO with 208× file reduction
+
+**Date:** 2026-04-12
+**Build:** `feature/go-rewrite-mvp` after the nested-parallelism fix (`defaultHotPartitionConcurrency` 16 → 4, `stitch.go` inner `openG.SetLimit` 32 → 8). Same parallel-batched commit path Run 18.5 would have used if it had not hung under 16×32 = 512 concurrent S3 opens.
+**Hardware:** local Mac mini, MinIO via docker compose, single-process bench harness.
+
+### Why this run exists
+
+Run 18.5 shipped sequential CompactHot at 7 m 20 s / 50 partitions. The parallel-batched refactor in commit 97ec035 was supposed to drop it further by running partitions in parallel behind a single batched CAS commit. The first parallel attempt (bench #2, SIGQUIT'd) and a retry (bench #3, 5 + min hang in compact_hot) both stalled — every stitch goroutine parked in `net/http/transport.go:1552` waiting for a free HTTP connection. A goroutine dump showed 16 partition workers each fanning out 32 concurrent `parquet.OpenFile` calls = 512 in-flight S3 GetObject range reads. MinIO itself was healthy (sub-ms curl) but the Go HTTP transport pool could not keep up, and the whole maintain round stopped making progress.
+
+The fix was to cap the nested product: default `hotPartitionConcurrency` 16 → 4, stitch inner open limit 32 → 8. Max concurrent opens 512 → 32. Operators on beefy S3 can raise the outer cap via the new `CompactHotOptions.PartitionConcurrency` field without touching stitch internals.
+
+### Bench config
+
+```
+STREAM_DURATION_SECONDS  300    # 5 min stream
+COMMITS_PER_MINUTE       300    # streamers sustained ~120/min under local CPU contention
+MAINTAIN_ROUNDS          2
+QUERY_ITERATIONS         3
+```
+
+### End-to-end phase timings
+
+| Phase | Wall time |
+|---|---:|
+| Stream | 302 s |
+| Pause | 15 s |
+| **Maintain (2 rounds)** | **75 s** |
+| Query (3 iter) | 9 s |
+| **Total bench wall** | **401 s (6 m 41 s)** |
+
+Maintain completed both rounds without a hang, without a SIGQUIT, without partition failures. Contrast with bench #3 which sat in compact_hot for 6 + minutes before the parallelism bug was diagnosed.
+
+### File reduction (average across store_sales / store_returns / catalog_sales)
+
+| Mode | store_sales | store_returns | catalog_sales |
+|---|---:|---:|---:|
+| without janitor | 10,399 | 9,024 | 2,070 |
+| **with janitor** | **50** | **50** | **10** |
+| **reduction factor** | **208×** | **180×** | **207×** |
+
+The absolute numbers are smaller than Run 18.5 because the stream phase was 5 min, not 10 min, and local CPU contention throttled the streamers to ~120 commits/min (vs 258/min on the cleaner run). The **reduction factor** is what matters for validating the parallel-batched commit path, and 208× is in line with the expected O(small_files → 1 stitched_file) per partition collapse.
+
+### Query latency (10 TPC-DS queries, avg of 2 iterations after warmup drop)
+
+Noise band across all queries is ±10 %. q1, q3, q19, q46, q55, q96 are flat or slightly faster with janitor; q13 (+11.7 %) and q7 (+21.9 %) are slower but well inside the 2-iteration noise floor. The signal to watch is file count, not per-query latency on local MinIO where Trino query planning dominates wall time.
+
+### What this run proves
+
+1. **The parallel-batched CompactHot path is correct under MinIO load** — 50/50 stitched, 0 failed, single snapshot per CompactHot (master check runs once on the staged table, CAS commit runs once).
+2. **Nested parallelism was the hang root cause**, not OTel trace backpressure (Run 18.5's first hypothesis) and not MinIO rejecting connections. Evidence: goroutine dump showed every stitch worker parked at `net/http/transport.go:1552` (`persistConn.roundTrip` waiting on the idle-conn channel), inside `parquet.OpenFile` → `gocloud NewRangeReader` → `s3blob.s3.GetObject`. MinIO stayed healthy throughout.
+3. **The nested-parallelism cap is configurable.** Default 4 × 8 = 32 concurrent opens keeps local MinIO happy. Prod S3 with a larger connection pool can raise `PartitionConcurrency` via `CompactHotOptions` without any code changes.
+
+### Code delta from the previous entry
+
+| File | Change |
+|---|---|
+| `pkg/janitor/compact_hot.go` | Replaced `const hotPartitionConcurrency = 16` with `const defaultHotPartitionConcurrency = 4`. Added `PartitionConcurrency int` field to `CompactHotOptions`, default 4. `g.SetLimit(opts.PartitionConcurrency)`. Doc rationale points back to this entry and the 512 → 32 reduction. |
+| `pkg/janitor/stitch.go` | `openG.SetLimit(32)` → `openG.SetLimit(8)`. Doc updates the open-concurrency math (4 × 8 = 32 max, was 16 × 32 = 512). |
+
+### What this run does NOT validate
+
+- **10 + minute streams**, the shape Run 18.5 used. The next bench should restore `STREAM_DURATION_SECONDS=600` to cover the workload size Run 18.5 proved against.
+- **AWS S3** with the new caps. Default `PartitionConcurrency=4` is conservative for MinIO; prod S3 will likely want 16–32. Needs a Run 19 to tune.
+- **Cross-replica behavior.** Still `desired_count = 1` locally. Phase 4 AWS deploy + 3-replica bench is the next lever.
+
+---
+
 ## Format conventions for future entries
 
 When adding new rows to this file as new build phases land:

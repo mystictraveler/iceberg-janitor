@@ -139,18 +139,20 @@ func stitchPartitionToFile(ctx context.Context, tbl *icebergtable.Table, fs iceb
 	return newFilePath, rowsWritten, nil
 }
 
-// hotPartitionConcurrency caps the number of partitions stitched in
-// parallel within a single CompactHot call. Each worker calls
-// janitor.Compact() which has its own LoadTable + master check + CAS
-// commit + 15-retry-on-conflict loop, so workers will naturally
-// serialize at the CAS commit step. The concurrency limit caps the
-// in-flight stitch I/O (parquet reads + writes), not the commit rate.
+// defaultHotPartitionConcurrency is the default fan-out for the
+// per-partition stitch workers. It is intentionally modest because
+// each worker nests into the stitch file-open loop, which is itself
+// parallel (see pkg/janitor/stitch.go). The total concurrent parquet
+// opens is defaultHotPartitionConcurrency × stitch.openConcurrency,
+// and that product lands on the HTTP transport as simultaneous S3
+// GetObject range reads. Run MinIO-bench #3 saturated the client
+// connection pool at 16 × 32 = 512 in-flight opens and parked every
+// stitch goroutine in net/http/transport.go for 6+ minutes. With
+// 4 × 8 = 32 the same workload finishes cleanly.
 //
-// Run 18 sequential 50-partition compact_hot took 22 min on S3 and
-// 7 min on MinIO. The CAS retry loop is the floor; with 16-way
-// parallel stitch + serial CAS the same workload should be in the
-// 2-4 min range on S3 and 30-90 sec on MinIO.
-const hotPartitionConcurrency = 16
+// Operators on beefy S3 can raise this via CompactHotOptions.
+// PartitionConcurrency.
+const defaultHotPartitionConcurrency = 4
 
 // CompactHotOptions configures the hot-loop entry point.
 type CompactHotOptions struct {
@@ -178,6 +180,21 @@ type CompactHotOptions struct {
 	// MinSmallFiles — skip partitions with fewer small files than
 	// this. Default 2 (no point stitching one file).
 	MinSmallFiles int
+
+	// PartitionConcurrency — max number of partitions stitched in
+	// parallel. Each worker nests into stitch.go's parallel file-open
+	// loop, so the effective concurrent S3 GetObject count is
+	// PartitionConcurrency × stitch inner open limit. Default 4.
+	// Raise on beefy S3 backends with large connection pools.
+	PartitionConcurrency int
+
+	// DryRun, when true, runs the full partition analysis and builds
+	// the stitch work list, then STOPS before any stitch I/O or
+	// commit. The result reports per-partition projections and a
+	// top-level ContentionDetected flag computed by reloading the
+	// table after planning. See CompactOptions.DryRun for the
+	// rationale.
+	DryRun bool
 }
 
 func (o *CompactHotOptions) defaults() {
@@ -193,6 +210,9 @@ func (o *CompactHotOptions) defaults() {
 	if o.MinSmallFiles <= 0 {
 		o.MinSmallFiles = 2
 	}
+	if o.PartitionConcurrency <= 0 {
+		o.PartitionConcurrency = defaultHotPartitionConcurrency
+	}
 }
 
 // CompactHotResult is the per-partition outcome of a hot-loop round.
@@ -205,6 +225,17 @@ type CompactHotResult struct {
 	PartitionsFailed   int                     `json:"partitions_failed"`
 	TotalDurationMs    int64                   `json:"total_duration_ms"`
 	Partitions         []HotPartitionResult    `json:"partitions"`
+
+	// DryRun, ContentionDetected, PartitionsPlanned: set only when
+	// CompactHotOptions.DryRun is true. PartitionsPlanned counts the
+	// partitions that would have been stitched (same set the Partitions
+	// slice describes, with Stitched=false and DryRun=true on each
+	// entry). ContentionDetected reports whether the table's current
+	// snapshot id advanced during the planning phase.
+	DryRun             bool  `json:"dry_run,omitempty"`
+	ContentionDetected bool  `json:"contention_detected,omitempty"`
+	PartitionsPlanned  int   `json:"partitions_planned,omitempty"`
+	ObservedSnapshotID int64 `json:"observed_snapshot_id,omitempty"`
 }
 
 type HotPartitionResult struct {
@@ -219,6 +250,10 @@ type HotPartitionResult struct {
 	DurationMs    int64  `json:"duration_ms"`
 	BeforeFiles   int    `json:"before_files"`
 	AfterFiles    int    `json:"after_files"`
+	// DryRun: true when this partition was part of a dry-run plan —
+	// the stitch input files were selected but nothing was written
+	// or committed.
+	DryRun bool `json:"dry_run,omitempty"`
 }
 
 // CompactHot runs the hot-loop maintenance pass on the table:
@@ -360,15 +395,48 @@ func CompactHot(ctx context.Context, cat *catalog.DirectoryCatalog, ident iceber
 		})
 	}
 
+	// Dry-run cut point. All of the analysis work is done: we have the
+	// full partition health, the hot filter, and the per-partition
+	// stitch plan. Stop here before any file I/O. Emit one
+	// HotPartitionResult per planned partition with DryRun=true and
+	// Stitched=false, then probe for contention by reloading the
+	// table. See CompactOptions.DryRun for the rationale.
+	if opts.DryRun {
+		result.DryRun = true
+		result.PartitionsPlanned = len(work)
+		for _, w := range work {
+			result.Partitions = append(result.Partitions, HotPartitionResult{
+				PartitionKey: w.p.PartitionKey,
+				Anchor:       w.anchor.Path,
+				SmallCount:   w.p.SmallFileCount,
+				Bootstrap:    w.bootstrap,
+				BeforeFiles:  len(w.inputs),
+				AfterFiles:   1,
+				DryRun:       true,
+			})
+		}
+		if snap := tbl.CurrentSnapshot(); snap != nil {
+			result.ObservedSnapshotID = snap.SnapshotID
+		}
+		if probe, perr := cat.LoadTable(ctx, ident); perr == nil {
+			if cur := probe.CurrentSnapshot(); cur != nil && cur.SnapshotID != result.ObservedSnapshotID {
+				result.ContentionDetected = true
+			}
+		}
+		result.TotalDurationMs = time.Since(started).Milliseconds()
+		return result, nil
+	}
+
 	// === Parallel partition stitch (no commit) ===
 	//
 	// Each worker stitches ONE partition's source files into a new
 	// parquet file. No commit, no CAS, no master check yet. The
 	// parallel speedup comes from overlapping the stitch I/O
 	// (read sources, write new file) across partitions, which on
-	// S3 is the dominant cost. With hotPartitionConcurrency=16 and
-	// ~50 partitions, the wall time goes from 50 × stitch_time to
-	// roughly ceil(50/16) × stitch_time ≈ 3-4 × stitch_time.
+	// S3 is the dominant cost. With PartitionConcurrency=4 (default)
+	// and ~50 partitions, the wall time goes from 50 × stitch_time to
+	// roughly ceil(50/4) × stitch_time ≈ 12-13 × stitch_time.
+	// Operators on beefy S3 can raise PartitionConcurrency.
 	//
 	// Per-worker output is a stitchedPartition with the new file
 	// path, the old paths it consumed, and the row count. The
@@ -381,7 +449,7 @@ func CompactHot(ctx context.Context, cat *catalog.DirectoryCatalog, ident iceber
 	stitched := make([]stitchedPartition, len(work))
 	stitchErrs := make([]error, len(work))
 	g, gctx := errgroup.WithContext(ctx)
-	g.SetLimit(hotPartitionConcurrency)
+	g.SetLimit(opts.PartitionConcurrency)
 	for i, w := range work {
 		i, w := i, w
 		g.Go(func() error {

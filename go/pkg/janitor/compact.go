@@ -183,6 +183,18 @@ type CompactOptions struct {
 	// When set, PartitionTuple and TargetFileSizeBytes are ignored —
 	// the file list is taken at face value.
 	OldPathsOverride []string
+
+	// DryRun, when true, runs the manifest walk and input-file
+	// selection exactly as a real compact would, then STOPS before
+	// any side effects: no new parquet file is written, no
+	// transaction is staged, no commit happens. The result
+	// reports projected After* counts plus ContentionDetected,
+	// which compares the table's current snapshot id before vs
+	// after the manifest walk. If a foreign writer committed
+	// during the walk, ContentionDetected is true — the caller
+	// can infer that a real run would have retried through a CAS
+	// conflict.
+	DryRun bool
 }
 
 func (o *CompactOptions) defaults() {
@@ -221,6 +233,17 @@ type CompactResult struct {
 
 	Verification *safety.Verification `json:"verification"`
 	DurationMs   int64                `json:"duration_ms"`
+
+	// DryRun is true when the caller set CompactOptions.DryRun. In
+	// that case the Before* fields reflect the actual table state,
+	// the After* fields reflect the projected outcome of a real
+	// run (projected_after_files = before_files - len(oldPaths) + 1
+	// when a rewrite would occur), and ContentionDetected reports
+	// whether the snapshot id advanced during the manifest walk.
+	DryRun             bool `json:"dry_run,omitempty"`
+	ContentionDetected bool `json:"contention_detected,omitempty"`
+	PlannedOldFiles    int  `json:"planned_old_files,omitempty"`
+	PlannedNewFiles    int  `json:"planned_new_files,omitempty"`
 }
 
 // Compact rewrites the table's data files via the parquet-go-direct

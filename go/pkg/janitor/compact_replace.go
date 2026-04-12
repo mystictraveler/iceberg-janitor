@@ -350,6 +350,30 @@ func executeStitchAndCommit(
 	result *CompactResult,
 	cat *catalog.DirectoryCatalog,
 ) error {
+	// Dry-run cut point. The manifest walk that produced oldPaths +
+	// expectedRows already ran (either the full walk or the override
+	// fast path), so we have the full plan. Stop here before any side
+	// effects: no parquet file written, no transaction staged, no
+	// commit. Report projected After* counts and probe for contention
+	// by reloading the table — if the snapshot id advanced while we
+	// were walking manifests, a real run would have hit a CAS
+	// conflict and retried. That signal is exactly what an operator
+	// wants out of a dry run against a live table.
+	if opts.DryRun {
+		result.DryRun = true
+		result.PlannedOldFiles = len(oldPaths)
+		result.PlannedNewFiles = 1
+		result.AfterFiles = result.BeforeFiles - len(oldPaths) + 1
+		result.AfterRows = result.BeforeRows
+		result.AfterSnapshotID = result.BeforeSnapshotID
+		if probe, perr := cat.LoadTable(ctx, ident); perr == nil {
+			if cur := probe.CurrentSnapshot(); cur != nil && cur.SnapshotID != result.BeforeSnapshotID {
+				result.ContentionDetected = true
+			}
+		}
+		return nil
+	}
+
 	icebergSchema := tbl.Metadata().CurrentSchema()
 	// Step 2: open the destination Parquet file. The location
 	// provider gives us <table>/data/<filename>.

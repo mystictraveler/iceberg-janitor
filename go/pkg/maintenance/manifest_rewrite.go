@@ -83,6 +83,14 @@ type RewriteManifestsOptions struct {
 	// and is updated with the outcome afterward. Same shape as
 	// CompactOptions.CircuitBreaker.
 	CircuitBreaker *safety.CircuitBreaker
+
+	// DryRun, when true, runs the full manifest walk + entry grouping
+	// pass and reports the projected manifest count, then STOPS
+	// before writing any new manifest files, the manifest_list, or
+	// calling CommitTable. Reloads the table once at the end to
+	// probe for contention. See CompactOptions.DryRun for the
+	// rationale.
+	DryRun bool
 }
 
 func (o *RewriteManifestsOptions) defaults() {
@@ -119,6 +127,14 @@ type RewriteManifestsResult struct {
 
 	Verification *safety.Verification `json:"verification"`
 	DurationMs   int64                `json:"duration_ms"`
+
+	// DryRun, ContentionDetected: set when the caller passed
+	// RewriteManifestsOptions.DryRun. Before* reflects the table's
+	// actual state; After* reflects the projected consolidation
+	// outcome computed from the in-memory grouping. Nothing was
+	// written or committed.
+	DryRun             bool `json:"dry_run,omitempty"`
+	ContentionDetected bool `json:"contention_detected,omitempty"`
 }
 
 // RewriteManifests is the public entry point. Same retry/CB shape as
@@ -323,6 +339,27 @@ func rewriteManifestsOnce(ctx context.Context, cat *catalog.DirectoryCatalog, id
 		result.AfterManifests = result.BeforeManifests
 		result.AfterDataFiles = result.BeforeDataFiles
 		result.AfterRows = result.BeforeRows
+		return nil
+	}
+
+	// Dry-run cut point. Groups are computed — we now know the exact
+	// projected manifest count (one new data manifest per group plus
+	// the unchanged passthrough delete manifests). Stop before any
+	// writes. Populate the After* projection and probe for contention
+	// by reloading the table — if the snapshot advanced during the
+	// manifest walk we report it. See CompactOptions.DryRun for the
+	// rationale.
+	if opts.DryRun {
+		result.DryRun = true
+		result.AfterSnapshotID = parentID
+		result.AfterManifests = len(groups) + len(passthroughManifests)
+		result.AfterDataFiles = result.BeforeDataFiles
+		result.AfterRows = result.BeforeRows
+		if probe, perr := cat.LoadTable(ctx, ident); perr == nil {
+			if cur := probe.CurrentSnapshot(); cur != nil && cur.SnapshotID != parentID {
+				result.ContentionDetected = true
+			}
+		}
 		return nil
 	}
 

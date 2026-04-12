@@ -77,11 +77,15 @@ func stitchParquetFiles(ctx context.Context, fs icebergio.IO, srcPaths []string,
 	// embeds io.ReaderAt and fs.File, so we use the file directly as
 	// the ReaderAt — no intermediate io.ReadAll slurp.
 	//
-	// File opens and footer parses run in parallel (32-way) because
-	// on a 500-file stitch the serial version spent ~25 ms in file
-	// opens alone. The writes stay serialized in step 4 via the
-	// output io.Writer. Close every opened file on return regardless
-	// of success so partial results don't leak fds.
+	// File opens and footer parses run in parallel (8-way). A 500-file
+	// serial stitch spent ~25 ms in file opens alone; 8-way gives most
+	// of the win without blowing up the HTTP connection pool when this
+	// loop is itself nested under CompactHot's parallel partition
+	// stitch (PartitionConcurrency × 8 is the real concurrency bound
+	// on the transport, and 4 × 8 = 32 is what MinIO Run 18.6
+	// validated). The writes stay serialized in step 4 via the output
+	// io.Writer. Close every opened file on return regardless of
+	// success so partial results don't leak fds.
 	type srcEntry struct {
 		path     string
 		readerAt io.ReaderAt
@@ -98,7 +102,7 @@ func stitchParquetFiles(ctx context.Context, fs icebergio.IO, srcPaths []string,
 		}
 	}()
 	openG, openCtx := errgroup.WithContext(ctx)
-	openG.SetLimit(32)
+	openG.SetLimit(8)
 	for i, p := range srcPaths {
 		i, p := i, p
 		openG.Go(func() error {
