@@ -1207,36 +1207,42 @@ iceberg-janitor vs the Spark ecosystem standard.
    has no equivalent in Spark's `rewriteDataFiles`. A Spark
    compaction that silently drops rows will commit without warning.
 
-**Caveats and where Spark wins:**
+**Caveats and what's NOT yet tested:**
 
-1. **Wall time.** Spark is 27% faster on this workload (256s vs 353s)
-   because it scales to 8 executors × 2 cores = 16 cores. The
-   janitor runs on 1 vCPU with P=16 goroutines — same logical
-   parallelism but less raw compute. Increasing the janitor's
-   Fargate CPU would close this gap.
+1. **Small dataset only.** This evaluation used ~68 MB / 3,000 files
+   — a small streaming workload. Neither tool has been benchmarked
+   at TB+ scale, large-file compaction, or across all four workload
+   classifications (streaming, batch, slow_changing, dormant). The
+   janitor's design plan includes adaptive tier dispatch (Lambda for
+   warm, Fargate for long-running), but this is not yet benchmarked.
+   Spark's distributed compute model (hundreds of executors) may
+   perform differently at scale — but so may the janitor's bounded-
+   parallelism approach. **The jury is still out for both tools on
+   larger workloads and different table classifications.**
 
-2. **ZOrder / sort compaction.** Spark supports data layout
+2. **Wall time vs compute.** Spark is 27% faster on this workload
+   (256s vs 353s) using 6.3× more compute (8 executors × 2 cores
+   vs 1 vCPU). The janitor has not been tested with more Fargate
+   CPU — increasing to 2-4 vCPU would likely close the wall-time
+   gap while maintaining the compute efficiency advantage.
+
+3. **ZOrder / sort compaction.** Spark supports data layout
    optimization (ZOrder, sort by column) that the janitor does not.
    For workloads that benefit from spatial locality, Spark's
-   `rewriteDataFiles` with a sort strategy is the right tool.
+   `rewriteDataFiles` with a sort strategy is a different class of
+   operation.
 
-3. **Schema evolution during compaction.** Spark can evolve the schema
+4. **Schema evolution during compaction.** Spark can evolve the schema
    while rewriting. The janitor preserves the schema as-is.
 
-4. **Ecosystem maturity.** Spark's Iceberg integration is
+5. **Ecosystem maturity.** Spark's Iceberg integration is
    production-hardened across thousands of deployments. The janitor
-   is new.
+   is new. More sophisticated benchmarking with collaborators is
+   needed to validate across diverse real-world workloads.
 
-5. **Dataset scale.** This evaluation used ~68 MB / 3,000 files — a
-   small streaming workload. At TB+ scale, Spark's distributed
-   compute model (hundreds of executors) may outperform the
-   janitor's single-node architecture. The janitor's response is
-   the adaptive tier dispatch (Lambda for warm, Fargate for long-
-   running) per the design plan, but this is not yet benchmarked.
-
-**Bottom line:** For the most common Iceberg maintenance use case —
-reducing small-file sprawl on streaming tables — the janitor
-delivers equivalent query improvement at 6× less compute cost,
-with stronger safety guarantees and zero operator configuration.
-For data layout optimization (ZOrder, sort) or TB-scale single-
-table compaction, Spark remains the right tool.
+**Bottom line:** On the workload tested (streaming small-file
+reduction), the janitor delivers equivalent query improvement at
+6× less compute cost, with stronger safety guarantees and zero
+operator configuration. For larger scales, different workload
+shapes, and data layout optimization, more benchmarking is needed
+before declaring a winner — both tools have unexplored territory.
