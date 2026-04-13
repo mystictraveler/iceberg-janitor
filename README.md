@@ -183,6 +183,47 @@ Six capabilities no other open source Iceberg compaction tool provides:
 
 6. **Dry-run with contention detection** — `?dry_run=true` runs the full manifest walk, reports what would happen, and detects if a foreign writer is actively committing (snapshot ID drift).
 
+## Invariants and Circuit Breakers
+
+Every commit the janitor produces must be provably correct, and every table the janitor touches must be protected from runaway maintenance. These two guarantees are the core tenets of the project.
+
+### Master check invariants (I1–I9)
+
+The master check runs on every commit — compact and expire — before the CAS write to `metadata.json`. It is mandatory and non-bypassable. There is no `--force` flag. A failed invariant aborts the commit, releases the lease, and emits a structured `Verification` record.
+
+| Invariant | Name | What it checks |
+|---|---|---|
+| **I1** | Row count | Total rows in = total rows out. Byte-copy stitch and pqarrow fallback must both conserve every row. |
+| **I2** | Schema identity | Current schema ID must not change. Maintenance ops are forbidden from silently evolving the schema. |
+| **I3** | Per-column value counts | Sum of value counts for every column across all data files must match before and after. |
+| **I4** | Per-column null counts | Sum of null counts for every column must match before and after. |
+| **I5** | Column bounds presence | The set of column IDs with bounds in the input must equal the set in the staged output. No missing, no spurious. |
+| **I6** | V3 row lineage | *(Planned)* Row-level lineage tracking for Iceberg V3 tables. |
+| **I7** | Manifest reference existence | Every data file added by this transaction must exist in object storage (HEAD check). Scoped to new files only — not the entire table. |
+| **I8** | Manifest set equality | *(Planned)* Full manifest-level set comparison between input and staged. |
+| **I9** | Content hash | *(Planned)* Byte-level content hash verification for compacted output. |
+
+For expire operations, additional checks enforce that the current snapshot ID is unchanged (expire cannot reseat the main branch) and that the staged snapshot set is a strict subset of the input set (an expire that adds snapshots is a programming bug).
+
+### Circuit breakers (CB2–CB11)
+
+Circuit breakers protect tables from the janitor itself. They evaluate after every maintenance attempt and either **pause** the table (fatal — requires operator `resume`) or **skip** the current run (soft — next run retries).
+
+| CB | Name | Type | What it does |
+|---|---|---|---|
+| **CB2** | Loop detection | Fatal | Pauses when the same file set is compacted N consecutive times (default 3). Detects feedback loops with external writers. |
+| **CB3** | Metadata-to-data ratio | Warn / Fatal | Warns at 5%, critical at 10%, pauses at 50%. Enforces the H1 axiom: metadata should be a small fraction of data. |
+| **CB4** | Effectiveness floor | Soft | Skips when compaction produces no file reduction. More files may accumulate to make the next run worthwhile. |
+| **CB5** | Expire-before-orphan | Guard | Enforces ordering: expire snapshots before orphan removal, so orphan removal never deletes files still referenced by a live snapshot. |
+| **CB6** | Rewrite-before-compact | Guard | Enforces ordering: rewrite manifests before compaction, so compaction reads a clean manifest layout. |
+| **CB7** | Daily byte budget | Soft | Caps total bytes read + written per table per day. Resets at midnight. Prevents runaway I/O on hot tables. |
+| **CB8** | Consecutive failure pause | Fatal | Pauses after 3 consecutive failed runs (default). Catches structural problems: writer faster than compactor, broken table, missing IAM permissions. |
+| **CB9** | Lifetime rewrite ratio | Fatal | Pauses when cumulative bytes rewritten exceed a multiple of total table data. Catches misconfigured aggressive compaction. |
+| **CB10** | Recursion guard | Guard | Refuses to operate on `_janitor/` internal paths. Prevents the janitor from compacting its own state files. |
+| **CB11** | ROI estimate | Soft | Skips compaction whose estimated cost exceeds its benefit. Files reduced × query overhead must justify the bytes read. |
+
+**Fatal** breakers write a pause file to `_janitor/state/<uuid>/pause.json`. The table stays paused until an operator explicitly resumes it. **Soft** breakers return a `SkippedError` — the table is not paused, and the next scheduled run retries normally. All breaker state is persisted to the warehouse bucket, so it survives server restarts and replica failovers.
+
 ## License
 
 Apache-2.0
