@@ -509,6 +509,23 @@ func executeStitchAndCommit(
 		return fmt.Errorf("read/manifest row mismatch: read %d rows but manifest entries sum to %d", rowsWritten, expectedRows)
 	}
 
+	// Step 4b: post-stitch row group merge + sort. Same logic as
+	// CompactHot's merge phase: if the stitched output has >4 row
+	// groups, re-read via pqarrow and rewrite as a single sorted row
+	// group (sorted by the table's default sort order if defined).
+	// This ensures Compact, CompactTable, and CompactCold all produce
+	// query-optimal output with tight min/max column stats — not just
+	// CompactHot.
+	if usedStitch {
+		mergedPath, mergedRows, merr := maybeMergeRowGroups(ctx, tbl, fs, wfs, newFilePath, rowsWritten, writeSchema, locProv)
+		if merr == nil && mergedPath != "" {
+			_ = wfs.Remove(newFilePath)
+			newFilePath = mergedPath
+			rowsWritten = mergedRows
+		}
+		// If merge failed or wasn't needed, keep the stitched output.
+	}
+
 	// Step 5: stage the replace. ReplaceDataFiles takes explicit
 	// path lists, walks the transaction's pinned snapshot to convert
 	// oldPaths to DataFile records, and calls filesToDataFiles on the

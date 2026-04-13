@@ -504,12 +504,23 @@ func (c *DirectoryCatalog) CreateTable(ctx context.Context, identifier icebergta
 			return nil, err
 		}
 	}
-	// v2 requires a default sort order. Add the unsorted order.
-	if err := builder.AddSortOrder(&icebergtable.UnsortedSortOrder); err != nil {
-		return nil, err
-	}
-	if err := builder.SetDefaultSortOrderID(icebergtable.UnsortedSortOrder.OrderID()); err != nil {
-		return nil, err
+	// v2 requires a default sort order. Use the caller's sort order
+	// if provided, otherwise default to unsorted.
+	if !cfg.SortOrder.Equals(icebergtable.UnsortedSortOrder) && !cfg.SortOrder.IsUnsorted() {
+		so := cfg.SortOrder
+		if err := builder.AddSortOrder(&so); err != nil {
+			return nil, err
+		}
+		if err := builder.SetDefaultSortOrderID(-1); err != nil {
+			return nil, err
+		}
+	} else {
+		if err := builder.AddSortOrder(&icebergtable.UnsortedSortOrder); err != nil {
+			return nil, err
+		}
+		if err := builder.SetDefaultSortOrderID(icebergtable.UnsortedSortOrder.OrderID()); err != nil {
+			return nil, err
+		}
 	}
 	builder.SetLastUpdatedMS()
 

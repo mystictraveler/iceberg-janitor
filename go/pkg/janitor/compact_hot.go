@@ -151,7 +151,7 @@ func stitchPartitionToFile(ctx context.Context, tbl *icebergtable.Table, fs iceb
 	// produces query-optimal output. The cost is paid once per
 	// compaction; every query benefits for the lifetime of the file.
 	if usedStitch {
-		mergedPath, mergedRows, merr := maybeMergeRowGroups(ctx, fs, wfs, newFilePath, rowsWritten, writeSchema, locProv)
+		mergedPath, mergedRows, merr := maybeMergeRowGroups(ctx, tbl, fs, wfs, newFilePath, rowsWritten, writeSchema, locProv)
 		if merr == nil && mergedPath != "" {
 			// Merge succeeded — swap the output path.
 			_ = wfs.Remove(newFilePath)
