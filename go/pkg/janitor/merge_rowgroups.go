@@ -34,6 +34,18 @@ const maxRowGroupsPerFile = 4
 // query engines. The sort order is read from the Iceberg metadata
 // (set by whoever created the table), not from user config.
 //
+// Future enhancement: for the unsorted case, replace the pqarrow
+// decode/encode round-trip with parquet-go's native row-level
+// GenericReader/GenericWriter. This skips the parquet→Arrow→parquet
+// bridge (~30-40% CPU savings) while still re-encoding pages under
+// a unified dictionary and recomputing per-row-group statistics.
+// Pure byte-copy is NOT possible for row group merging because
+// dictionary pages differ across row groups and statistics must be
+// recomputed. The sorted case must stay on Arrow (or equivalent)
+// since rows need materialization to reorder. Profile CompactCold
+// on large partitions (100+ files) to determine if the merge phase
+// is the bottleneck before investing in this path.
+//
 // Returns ("", 0, nil) if no merge was needed.
 // Returns (newPath, rows, nil) on successful merge.
 // Returns ("", 0, err) on failure (caller keeps the original).
