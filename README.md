@@ -60,6 +60,74 @@ No catalog service required. No managed control plane. No per-GB pricing.
 - **Mandatory master check.** Every CAS commit goes through `safety.VerifyCompactionConsistency` (compact) or `safety.VerifyExpireConsistency` (expire). Non-bypassable. Failures are recorded in the job result.
 - **Dry-run mode.** Every maintenance endpoint accepts `?dry_run=true`. The server runs the full planning phase (manifest walk, staging, master check), then stops before any side effects. The result reports projected counts plus a `contention_detected` flag computed by reloading the table and comparing snapshot IDs.
 
+## Workload classification and compaction behavior
+
+Every `POST /v1/tables/{ns}/{name}/maintain` call reads the table's
+snapshot history, classifies the workload, and dispatches the right
+maintenance pipeline — no operator configuration needed. The
+classifier is in [`pkg/strategy/classify`](go/pkg/strategy/classify).
+
+### The four classes
+
+Class is a function of commit rate, computed from the table's snapshot
+history (`foreign_commits_last_15m`, `foreign_commits_last_24h`,
+`foreign_commits_last_7d`). Janitor-authored commits are excluded so
+compaction itself doesn't influence classification.
+
+| Class | When | Intuition |
+|---|---|---|
+| **streaming** | 15-min rate > 6/h OR 24h rate > 6/h | Kafka → Flink/Spark streaming job; micro-batches every few seconds to minutes |
+| **batch** | 0.04/h < 24h rate ≤ 6/h | Scheduled ETL; hourly / daily batch loads |
+| **slow_changing** | 0 < 24h rate ≤ 0.04/h | Dimension-like tables; updates occasional |
+| **dormant** | no commits in last 7d | Historical data; rarely touched |
+
+The 15-minute short-window fast path means a fresh streaming table
+classifies correctly within minutes of its first burst — no waiting
+hours for a rolling 24h average to catch up.
+
+### Per-class compaction plan
+
+| Class | Mode | Target file size | Keep snapshots | Keep within | Stale-rewrite age |
+|---|---|---:|---:|---|---|
+| streaming | **hot** | 64 MiB | 5 | 1 hour | 30 min |
+| batch | **cold** | 128 MiB | 10 | 24 hours | 6 hours |
+| slow_changing | **cold** | 256 MiB | 20 | 7 days | 7 days |
+| dormant | **cold** | 512 MiB | 50 | 30 days | 30 days |
+
+Target file sizes scale up with coldness — dormant data benefits more
+from fewer, larger files because each scan amortizes over more rows.
+Snapshot retention widens with coldness because infrequent writes
+mean fewer legitimately-removable snapshots anyway.
+
+### Hot vs Cold compaction
+
+**hot (streaming tables):** `pkg/janitor.CompactHot` — parallel
+delta-stitch across actively-written partitions. Up to
+`PartitionConcurrency` (default 16) partitions stitched in parallel;
+all replacements committed in a single-snapshot batched transaction.
+Optimized to minimize the writer-fight CAS window — streaming
+writers are committing at sub-second intervals and the janitor must
+finish its commit before the next writer's snapshot races in.
+
+**cold (batch / slow_changing / dormant):** `pkg/janitor.CompactCold`
+— per-partition trigger-based full compaction. Each partition is
+tested against three triggers before being compacted:
+
+- **Small files trigger** — partition has > N small files (class-dependent)
+- **Metadata ratio trigger** — partition's metadata bytes / data bytes exceeds a threshold (the H1 axiom, CB3)
+- **Stale rewrite trigger** — partition hasn't been rewritten in longer than the class's stale age
+
+Only triggered partitions are compacted. Runs sequentially — no CAS
+urgency because foreign writers aren't actively competing.
+
+### Explicit override
+
+The classifier always runs and picks a mode, but operators can force
+a specific mode via `?mode=hot|cold|full` on the maintain endpoint.
+`full` is a legacy single-pass compaction over every partition (no
+trigger filtering); it exists for tests and operator one-offs and is
+never chosen by the classifier.
+
 ## Quick start
 
 ### Local (MinIO via Docker)
