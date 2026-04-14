@@ -60,6 +60,131 @@ No catalog service required. No managed control plane. No per-GB pricing.
 - **Mandatory master check.** Every CAS commit goes through `safety.VerifyCompactionConsistency` (compact) or `safety.VerifyExpireConsistency` (expire). Non-bypassable. Failures are recorded in the job result.
 - **Dry-run mode.** Every maintenance endpoint accepts `?dry_run=true`. The server runs the full planning phase (manifest walk, staging, master check), then stops before any side effects. The result reports projected counts plus a `contention_detected` flag computed by reloading the table and comparing snapshot IDs.
 
+## Maintenance operations
+
+The janitor performs four maintenance operations on Iceberg tables.
+Each is exposed as an async endpoint on `janitor-server` and as a
+subcommand on `janitor-cli`. Every op supports `?dry_run=true` which
+runs the full planning phase (manifest walk, staging, master check
+where applicable) and reports projected outcomes without committing.
+
+### compact
+
+Replaces small data files with larger target-sized files. Two phases:
+
+1. **Byte-copy stitch.** Parquet column chunks are copied
+   byte-for-byte from source files into a new output file — no Arrow
+   decode, no CPU per row. Preserves row order and original column
+   statistics.
+2. **Row group merge (conditional).** If the stitched output has more
+   than 4 row groups, re-reads it via pqarrow and rewrites with a
+   single merged row group. Produces tighter per-column stats and
+   query-optimal layout. Also honors the table's default sort order
+   if one is defined: rows are sorted by the sort-order columns
+   during the decode/encode pass.
+
+Every commit goes through `safety.VerifyCompactionConsistency` (the
+master check) which validates row count, schema, per-column value
+and null counts, column bounds presence, and manifest reference
+existence. Non-bypassable. Failures are recorded on the job record
+and no commit happens.
+
+Dispatched automatically by the `maintain` pipeline based on
+workload class (see below): hot mode uses parallel delta-stitch
+with single-snapshot batched commit; cold mode uses per-partition
+trigger-based full compaction.
+
+### expire
+
+Drops snapshots from the metadata snapshot chain beyond `keep_last` /
+`keep_within` limits. The current snapshot is always retained. No
+data files are rewritten — expire only edits metadata.
+
+The master check for expire has different invariants from compact:
+
+- Current snapshot ID must not change
+- Current snapshot's row count must not change
+- Schema must not change
+- Snapshot set must shrink (staged ⊆ before; no new snapshot IDs)
+
+When expired snapshots reference data files that are not referenced
+by any retained snapshot, those data files become orphaned. Orphan
+cleanup is a separate op not yet shipped — today, operators can run
+a manual scan + delete or wait for it to land.
+
+### rewrite-manifests
+
+Consolidates per-commit micro-manifests into a partition-organized
+layout. Streaming tables accumulate one manifest per commit — a
+table with thousands of commits has thousands of micro-manifests,
+each scanned on every read. rewrite-manifests reads the current
+snapshot's manifest list, groups entries by partition tuple, and
+writes new larger manifests each containing entries from a small
+number of partitions.
+
+Master check invariants:
+
+- Total data file count is preserved exactly (I8: file set equality)
+- Row count is preserved
+- Schema is preserved
+- No data files are touched — only manifests are rewritten
+
+After this op, subsequent compactions' manifest walks open
+dramatically fewer manifests because each manifest's partition
+bounds are tighter and readers can skip non-matching manifests via
+partition filter pushdown.
+
+Run automatically as pre-compact and post-compact steps inside the
+`maintain` pipeline. Can also be invoked standalone for tables that
+need manifest consolidation without compaction.
+
+### maintain
+
+The zero-knob load-bearing entry point. Runs the full maintenance
+pipeline in sequence:
+
+1. **expire** — drop snapshots beyond `keep_last` / `keep_within`
+2. **rewrite-manifests (pre-compact)** — fold micro-manifests so the
+   next compaction reads a clean manifest layout
+3. **compact** — dispatched per the workload classifier:
+   streaming → `CompactHot` (parallel delta-stitch),
+   batch / slow_changing / dormant → `CompactCold`
+   (per-partition trigger-based)
+4. **rewrite-manifests (post-compact)** — fold the compaction's
+   micro-manifest back into the partition layout
+
+Each step's result is surfaced in the job record, including which
+steps ran, the wall time per step, and the final
+`metadata_location` path so the orchestration layer can update
+external catalogs (Glue, Unity, Polaris) with a direct pointer.
+
+### Cross-cutting behavior
+
+All mutating maintenance ops share:
+
+- **Async execution.** HTTP POST returns `202 Accepted` with a job
+  envelope immediately; work runs in a background goroutine. Poll
+  `GET /v1/jobs/{id}` for completion.
+- **Per-table in-flight dedup.** If a maintain/compact/expire job is
+  already running for a given table when a second client POSTs the
+  same endpoint, the server returns the EXISTING job's ID (still
+  `202`) instead of spawning a duplicate. Works both in-process
+  (within a replica) and cross-replica (via S3-backed lease files).
+- **Persistent job records.** Every job has a warehouse-backed record
+  at `_janitor/state/jobs/<job_id>.json` so any replica can answer
+  poll requests for any job.
+- **Atomic commits via CAS.** The directory catalog writes new
+  metadata.json with conditional-create semantics (`If-None-Match: *`
+  on S3, equivalent on GCS/Azure). If a foreign writer committed
+  concurrently, the CAS fails and the janitor retries from the new
+  current state.
+- **Dry-run mode.** `?dry_run=true` runs the full planning phase
+  and reports projected outcomes plus a `contention_detected` flag
+  (computed by reloading the table at end of planning and comparing
+  snapshot IDs). Use cases: operator sanity check before a risky
+  maintain, CI gating, continuous "compactable-small-file tail"
+  estimation.
+
 ## Workload classification and compaction behavior
 
 Every `POST /v1/tables/{ns}/{name}/maintain` call reads the table's
