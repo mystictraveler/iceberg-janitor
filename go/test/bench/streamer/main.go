@@ -122,6 +122,43 @@ import (
 // SourceID values match the field IDs in pkg/tpcds/schemas.go:
 // ss_store_sk is field 8 of store_sales, sr_store_sk is field 8 of
 // store_returns, cs_call_center_sk is field 12 of catalog_sales.
+// factSortOrder returns the default sort order applied to each fact
+// table when WITH_SORT=true. The sort keys are the canonical TPC-DS
+// date surrogate keys (field id 1 in every fact schema) — the column
+// most TPC-DS queries filter on. Sorting by date_sk gives the janitor
+// merge phase tight min/max column stats for that column, enabling
+// predicate pushdown for downstream readers (Athena/Trino/DuckDB).
+//
+// We do NOT sort on the partition column (ss_store_sk / sr_store_sk /
+// cs_call_center_sk) because within a single partition every file
+// has the same value for that column — a sort on it is a no-op.
+func factSortOrder(table string) icebergtable.SortOrder {
+	var sourceID int
+	switch table {
+	case "store_sales":
+		sourceID = 1 // ss_sold_date_sk
+	case "store_returns":
+		sourceID = 1 // sr_returned_date_sk
+	case "catalog_sales":
+		sourceID = 1 // cs_sold_date_sk
+	default:
+		return icebergtable.UnsortedSortOrder
+	}
+	so, err := icebergtable.NewSortOrder(
+		1,
+		[]icebergtable.SortField{{
+			SourceID:  sourceID,
+			Transform: icebergpkg.IdentityTransform{},
+			Direction: icebergtable.SortASC,
+			NullOrder: icebergtable.NullsFirst,
+		}},
+	)
+	if err != nil {
+		return icebergtable.UnsortedSortOrder
+	}
+	return so
+}
+
 func factPartitionSpec(table string) icebergpkg.PartitionSpec {
 	switch table {
 	case "store_sales":
@@ -164,6 +201,11 @@ type config struct {
 	Bursty               bool
 	BurstMax             int
 	Seed                 uint64
+
+	// WithSort applies a default sort order (by date_sk) to each fact
+	// table at CREATE time. Used to A/B the sort-on-merge overhead via
+	// two bench.sh runs against parallel warehouses.
+	WithSort bool
 
 	S3Endpoint  string
 	S3AccessKey string
@@ -234,6 +276,7 @@ func loadConfig() config {
 		DurationSeconds:      getint("DURATION_SECONDS", 600),
 		NumStreamBatches:     getint("NUM_STREAM_BATCHES", 0),
 		TruncateTables:       getbool("TRUNCATE_TABLES", true),
+		WithSort:             getbool("WITH_SORT", false),
 		SkipDimensions:       getbool("SKIP_DIMENSIONS", false),
 		Bursty:               getbool("BURSTY", false),
 		BurstMax:             getint("BURST_MAX", 10),
@@ -362,7 +405,12 @@ func run(ctx context.Context, cfg config) error {
 		tbl, err := cat.LoadTable(ctx, ident)
 		if err != nil {
 			spec := factPartitionSpec(name)
-			tbl, err = cat.CreateTable(ctx, ident, schema, icebergcat.WithPartitionSpec(&spec))
+			opts := []icebergcat.CreateTableOpt{icebergcat.WithPartitionSpec(&spec)}
+			if cfg.WithSort {
+				so := factSortOrder(name)
+				opts = append(opts, icebergcat.WithSortOrder(so))
+			}
+			tbl, err = cat.CreateTable(ctx, ident, schema, opts...)
 			if err != nil {
 				return fmt.Errorf("creating %s: %w", name, err)
 			}
