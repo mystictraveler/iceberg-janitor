@@ -286,16 +286,53 @@ aws ecs run-task \
   --network-configuration '{"awsvpcConfiguration":{"subnets":["<private-subnet-1a>"],...}}'
 ```
 
-## Bench results (Run 18.6 -- MinIO, 2026-04-12)
+## Bench results
 
-| Metric | Without janitor | With janitor |
+### Run 20 — AWS S3 with row group merge (2026-04-12)
+
+End-to-end bench on AWS: 3-replica janitor-server on ECS Fargate,
+bench task streams TPC-DS data for 5 min to two warehouses, then
+compacts one with the janitor while leaving the other untouched.
+Athena queries both.
+
+**File reduction: 192× on 3 fact tables.** store_sales: 9,599 → 50
+files. store_returns: 8,335 → 50. catalog_sales: 1,910 → 10.
+
+**Athena query performance** (same queries, both warehouses):
+
+| Query | Uncompacted | Janitor (stitch + merge) | Change |
+|---|---:|---:|---:|
+| q1 | 3,266 ms | 2,515 ms | **-23%** |
+| q3 | 2,618 ms | 1,908 ms | **-27%** |
+| q7 | 2,356 ms | 2,285 ms | -3% |
+
+**Maintain wall time:** 5m47s for store_sales CompactHot (50
+partitions, 2 rounds, PartitionConcurrency=16). Zero partition
+failures.
+
+### Head-to-head: janitor vs Spark EMR Serverless (same data, 2026-04-12)
+
+Tuned Spark (`maxExecutors=8`, `fs.s3.maxConnections=500`) compacts
+the same data with identical output (50 files per table). Comparable
+query performance (±4%). But the compute profile differs:
+
+| Metric | iceberg-janitor | Spark EMR Serverless |
 |---|---:|---:|
-| store_sales files | 10,399 | 50 |
-| store_returns files | 9,024 | 50 |
-| catalog_sales files | 2,070 | 10 |
-| **File reduction** | | **208x** |
+| Wall time (3 tables) | 353s | 256s |
+| Compute | 0.10 vCPU-hrs | 0.636 vCPU-hrs (**6.3× more**) |
+| Tuning required | None | `maxExecutors` + `maxConnections` |
+| Cold start | 0s | ~90s |
+| Safety | I1–I9 master check | None |
 
-Maintain wall time: 75s for 2 full rounds (expire + rewrite-manifests + CompactHot + post-rewrite). Zero partition failures. See [`go/BENCHMARKS.md`](go/BENCHMARKS.md) for the full history from Run 1 through Run 18.6.
+Spark wins 27% on wall time by throwing 6.3× more compute at it.
+The janitor trades wall time for compute efficiency and safety.
+
+**Caveat:** This comparison used a small streaming workload
+(~68 MB / 3,000 files across 3 tables). Neither tool has been
+benchmarked at TB+ scale or across all four workload classes. The
+jury is still out on larger scales.
+
+See [`go/BENCHMARKS.md`](go/BENCHMARKS.md) for the full history from Run 1 through Run 20 plus the empirical Spark comparison.
 
 ## Server API
 
