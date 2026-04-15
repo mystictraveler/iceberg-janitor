@@ -52,9 +52,9 @@ on the feature's main file gives the full history.
 | 17 | [Sort-on-merge from Iceberg metadata](#sort-on-merge) | Shipped | `f3918f3` | — |
 | 18 | [Dry-run mode (all 4 endpoints)](#dry-run-mode) | Shipped | `a7b6110` cut points; `a029370` wired through handlers + CompactCold + OpenAPI + tests | — |
 | 19 | [Glue registration](#glue-registration) | Shipped | `896048b` janitor-cli fast path; `ca96c63` server: metadata_location in job result + direct Glue UpdateTable | — |
-| 20 | [V3 deletion vectors](#refused) | Refused (safety gate) | refusal in `feature/v2-deletes` (`d54e4bf`) | — |
-| 21 | [V3 row lineage](#refused) | Refused (safety gate) | — | — |
-| 22 | [V3 Puffin stats](#refused) | Refused (safety gate) | — | — |
+| 20 | [V3 deletion vectors](#refused) | Refused (safety gate) — backlog [#10](https://github.com/mystictraveler/iceberg-janitor/issues/10) | refusal in `feature/v2-deletes` (`d54e4bf`) | [#10](https://github.com/mystictraveler/iceberg-janitor/issues/10) |
+| 21 | [V3 row lineage](#refused) | Refused (safety gate) — backlog [#11](https://github.com/mystictraveler/iceberg-janitor/issues/11) | — | [#11](https://github.com/mystictraveler/iceberg-janitor/issues/11) |
+| 22 | [V3 Puffin stats](#refused) | Refused (safety gate) — backlog [#12](https://github.com/mystictraveler/iceberg-janitor/issues/12) | — | [#12](https://github.com/mystictraveler/iceberg-janitor/issues/12) |
 | 23 | [Mixed partition-spec compaction](#refused) | Refused (safety gate) | refusal in `feature/v2-deletes` (`d54e4bf`) | — |
 | 24 | [Equality deletes on complex column types](#refused) | Refused (safety gate) | refusal in `feature/v2-deletes` (`d54e4bf`) | — |
 | 25 | [Pattern C (on-commit dispatcher)](#planned) | Planned | — | [#3](https://github.com/mystictraveler/iceberg-janitor/issues/3) |
@@ -407,9 +407,9 @@ degradation.
 
 | Capability | Why refused |
 |---|---|
-| **V3 deletion vectors** (PUFFIN-format pos deletes) | Compacting these would silently resurrect deleted rows because the byte-copy stitch can't read the Puffin payload to filter. Detected via `EntryContentPosDeletes` + `FileFormat == PUFFIN`. |
-| **V3 row lineage columns** | Not propagated by the byte-copy stitch; output would lose lineage IDs silently. |
-| **V3 Puffin stats** | Not yet read; statistics in output would diverge from input. |
+| **V3 deletion vectors** (PUFFIN-format pos deletes) | Compacting these would silently resurrect deleted rows because the byte-copy stitch can't read the Puffin payload to filter. Detected via `EntryContentPosDeletes` + `FileFormat == PUFFIN`. Backlog: [#10](https://github.com/mystictraveler/iceberg-janitor/issues/10). |
+| **V3 row lineage columns** | Not propagated by the byte-copy stitch; output would lose lineage IDs silently. Backlog: [#11](https://github.com/mystictraveler/iceberg-janitor/issues/11). |
+| **V3 Puffin stats** | Not yet read; statistics in output would diverge from input. Backlog: [#12](https://github.com/mystictraveler/iceberg-janitor/issues/12). |
 | **Mixed partition spec ids across source files** | Per-partition grouping becomes ambiguous; output partition assignment would be wrong. |
 | **Equality deletes on complex column types** (timestamp / decimal / uuid / binary / struct / list / map) | Comparator semantics are non-trivial for these types; matching them approximately would either over- or under-delete. Refused in `LoadEqualityDelete` after schema inspection. |
 
