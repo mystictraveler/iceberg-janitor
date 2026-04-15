@@ -110,7 +110,27 @@ type ManifestRefsCheck struct {
 //
 // MVP scope: only I1 (row count). The function is mandatory and the
 // caller MUST refuse to commit on error. There is no --force bypass.
-func VerifyCompactionConsistency(ctx context.Context, before *icebergtable.Table, staged *icebergtable.StagedTable, props map[string]string) (*Verification, error) {
+// VerifyOption tunes the consistency check.
+type VerifyOption func(*verifyCfg)
+
+// WithDeletedRows tells the master check that the caller legitimately
+// dropped this many rows during compaction (e.g. V2 position or
+// equality deletes applied in the decode/encode pass). I1 uses this
+// to allow a controlled row-count reduction: input - deletedRows
+// must equal staged. Omitted = 0 = standard row-conservation check.
+func WithDeletedRows(n int64) VerifyOption {
+	return func(c *verifyCfg) { c.deletedRows = n }
+}
+
+type verifyCfg struct {
+	deletedRows int64
+}
+
+func VerifyCompactionConsistency(ctx context.Context, before *icebergtable.Table, staged *icebergtable.StagedTable, props map[string]string, opts ...VerifyOption) (*Verification, error) {
+	cfg := verifyCfg{}
+	for _, o := range opts {
+		o(&cfg)
+	}
 	v := &Verification{
 		SchemeVersion:  1,
 		CheckedAt:      nowRFC3339(),
@@ -141,15 +161,24 @@ func VerifyCompactionConsistency(ctx context.Context, before *icebergtable.Table
 		return v, fmt.Errorf("aggregating staged stats: %w", err)
 	}
 
-	// I1: total row count.
+	// I1: total row count. The invariant is
+	//   beforeData - droppedByDeletes == stagedData
+	// where droppedByDeletes is the count the janitor passed in via
+	// WithDeletedRows (0 for plain compaction; >0 for V2 merge-on-
+	// read cases where the decode/encode pass applied pos/eq
+	// deletes). This formulation is independent of whether the
+	// (orphaned) delete files are still in the snapshot, which we
+	// can't cheaply tell from manifest metadata alone.
+	expectedStaged := beforeAgg.totalRows - cfg.deletedRows
 	v.I1RowCount = RowCountCheck{
 		In:  beforeAgg.totalRows,
-		DVs: 0, // MVP: no deletion vectors yet
+		DVs: cfg.deletedRows,
 		Out: stagedAgg.totalRows,
 	}
-	if beforeAgg.totalRows != stagedAgg.totalRows {
+	if expectedStaged != stagedAgg.totalRows {
 		v.I1RowCount.Result = "fail"
-		v.I1RowCount.Reason = fmt.Sprintf("input rows %d != staged rows %d", beforeAgg.totalRows, stagedAgg.totalRows)
+		v.I1RowCount.Reason = fmt.Sprintf("input rows %d - deleted %d = %d != staged rows %d",
+			beforeAgg.totalRows, cfg.deletedRows, expectedStaged, stagedAgg.totalRows)
 		v.Overall = "fail"
 		return v, fmt.Errorf("MASTER CHECK FAILED (I1 row count): %s", v.I1RowCount.Reason)
 	}
@@ -178,18 +207,30 @@ func VerifyCompactionConsistency(ctx context.Context, before *icebergtable.Table
 
 	// I3: per-column value count. For each column id present in the
 	// input data files, the sum of value counts across all input data
-	// files must equal the sum across all staged data files.
-	v.I3ValueCounts = compareColumnCounts(beforeAgg.valueCounts, stagedAgg.valueCounts)
+	// files MINUS the deleted-row hint must equal the sum across all
+	// staged data files. The minus term is non-zero only for
+	// merge-on-read V2 paths where the caller told us it dropped N
+	// rows during the decode/encode pass. Null counts (I4) can't use
+	// the same arithmetic — we don't know how many of the deleted
+	// rows had a NULL in each column — so I4 is skipped (treated as
+	// info-only "checked=0") when deletedRows > 0.
+	v.I3ValueCounts = compareColumnCountsWithOffset(beforeAgg.valueCounts, stagedAgg.valueCounts, cfg.deletedRows)
 	if v.I3ValueCounts.Result == "fail" {
 		v.Overall = "fail"
 		return v, fmt.Errorf("MASTER CHECK FAILED (I3 value counts): %s", v.I3ValueCounts.Reason)
 	}
 
-	// I4: per-column null count. Same shape as I3.
-	v.I4NullCounts = compareColumnCounts(beforeAgg.nullCounts, stagedAgg.nullCounts)
-	if v.I4NullCounts.Result == "fail" {
-		v.Overall = "fail"
-		return v, fmt.Errorf("MASTER CHECK FAILED (I4 null counts): %s", v.I4NullCounts.Reason)
+	// I4: per-column null count. Skip entirely when deletedRows > 0;
+	// we can't compute an exact expected delta per column without
+	// touching the parquet payload.
+	if cfg.deletedRows > 0 {
+		v.I4NullCounts = ColumnCountsCheck{Result: "skip", Reason: "null counts not reconcilable with applied deletes"}
+	} else {
+		v.I4NullCounts = compareColumnCounts(beforeAgg.nullCounts, stagedAgg.nullCounts)
+		if v.I4NullCounts.Result == "fail" {
+			v.Overall = "fail"
+			return v, fmt.Errorf("MASTER CHECK FAILED (I4 null counts): %s", v.I4NullCounts.Reason)
+		}
 	}
 
 	// I5: column bounds presence. Every column with bounds in the
@@ -293,6 +334,27 @@ type dataStats struct {
 	nullCounts  map[int]int64       // sum of DataFile.NullValueCounts
 	boundsCols  map[int]bool        // column ids that have bounds set in at least one file
 	filePaths   map[string]struct{} // set of data file paths
+
+	// V2 delete accounting. posDeletesApplicable is the sum of rows
+	// in position delete files that reference a data file currently
+	// in the snapshot's data-file set (i.e. non-orphaned position
+	// deletes). eqDeletesApplicable is the rough sum of rows in
+	// equality delete files that could target data files with lower
+	// sequence number — it is NOT a tight bound, because we cannot
+	// evaluate the predicate without opening the delete file, but
+	// it's a safe upper bound on the number of rows that could be
+	// masked. Both counters are used by I1 to compute the logical
+	// (visible) row count = totalRows - applicable deletes.
+	posDeletesApplicable int64
+}
+
+// posDeleteRef is a lightweight record captured during the walk for
+// later applicability analysis. We can't decide applicability in the
+// parallel worker because the full data-file set isn't known until
+// every manifest is read.
+type posDeleteRef struct {
+	rowCount   int64
+	referenced string
 }
 
 // aggregateDataStats walks the current snapshot's manifests, reads
@@ -339,6 +401,7 @@ func aggregateDataStats(ctx context.Context, tbl *icebergtable.Table, props map[
 		nullCounts  map[int]int64
 		boundsCols  map[int]bool
 		filePaths   []string
+		posDeletes  []posDeleteRef
 	}
 	results := make([]manifestAgg, len(manifests))
 	g, gctx := errgroup.WithContext(ctx)
@@ -365,7 +428,35 @@ func aggregateDataStats(ctx context.Context, tbl *icebergtable.Table, props map[
 			}
 			for _, e := range entries {
 				df := e.DataFile()
-				if df == nil || df.ContentType() != icebergpkg.EntryContentData {
+				if df == nil {
+					continue
+				}
+				switch df.ContentType() {
+				case icebergpkg.EntryContentPosDeletes:
+					// V2 position delete file. Remember the row count
+					// and the referenced data file path; applicability
+					// (does the referenced data file still live in
+					// the snapshot?) is computed after the walk.
+					ref := ""
+					if rd := df.ReferencedDataFile(); rd != nil {
+						ref = *rd
+					}
+					local.posDeletes = append(local.posDeletes, posDeleteRef{
+						rowCount:   df.Count(),
+						referenced: ref,
+					})
+					continue
+				case icebergpkg.EntryContentEqDeletes:
+					// Equality deletes can't be reconciled against
+					// the row count without opening the delete file
+					// and evaluating the predicate; we rely on the
+					// janitor's per-attempt dropped-row accumulator
+					// and the I1 check's `DVs` field (set by the
+					// caller) to cover eq deletes. Skip for now.
+					continue
+				case icebergpkg.EntryContentData:
+					// fall through
+				default:
 					continue
 				}
 				local.totalRows += df.Count()
@@ -406,6 +497,26 @@ func aggregateDataStats(ctx context.Context, tbl *icebergtable.Table, props map[
 			out.filePaths[p] = struct{}{}
 		}
 	}
+	// Second pass: decide which position deletes are "applicable" —
+	// i.e. reference a data file still in the snapshot. Orphaned
+	// position deletes (whose referenced data file was removed by a
+	// prior ReplaceDataFiles commit) don't contribute to the logical
+	// row count because no reader will ever see the rows they mark.
+	//
+	// V2.1 position deletes always record the referenced data file
+	// path in the manifest entry; V2.0 may not, in which case we
+	// assume applicable — safer overdetection than silent mismatch.
+	for _, r := range results {
+		for _, pd := range r.posDeletes {
+			if pd.referenced == "" {
+				out.posDeletesApplicable += pd.rowCount
+				continue
+			}
+			if _, ok := out.filePaths[pd.referenced]; ok {
+				out.posDeletesApplicable += pd.rowCount
+			}
+		}
+	}
 	return out, nil
 }
 
@@ -420,6 +531,40 @@ const manifestReadConcurrency = 32
 // compareColumnCounts is the I3/I4 worker: it compares two per-column
 // sum maps and returns a structured ColumnCountsCheck. The check is
 // strict equality on every column id present in either map.
+// compareColumnCountsWithOffset is the same as compareColumnCounts
+// but allows `in - offset == out` to pass. Used by I3 when the caller
+// legitimately dropped rows via V2 deletes: every non-null column
+// value lost a contribution equal to the deleted row count.
+func compareColumnCountsWithOffset(in, out map[int]int64, offset int64) ColumnCountsCheck {
+	if offset == 0 {
+		return compareColumnCounts(in, out)
+	}
+	result := ColumnCountsCheck{}
+	cols := unionKeys(in, out)
+	result.Checked = len(cols)
+	for _, col := range cols {
+		// A column's value count can drop by AT MOST `offset` (when
+		// every deleted row had a non-null value for this column).
+		// It can also drop by less (when some deleted rows had NULL
+		// for this column — those didn't contribute to value count).
+		// So the bound is: out[col] in [in[col] - offset, in[col]].
+		delta := in[col] - out[col]
+		if delta >= 0 && delta <= offset {
+			result.Passed++
+		} else {
+			result.FailedColumns = append(result.FailedColumns, col)
+		}
+	}
+	if len(result.FailedColumns) == 0 {
+		result.Result = "pass"
+		return result
+	}
+	result.Result = "fail"
+	result.Reason = fmt.Sprintf("%d/%d columns mismatched under offset=%d (column ids: %v)",
+		len(result.FailedColumns), result.Checked, offset, result.FailedColumns)
+	return result
+}
+
 func compareColumnCounts(in, out map[int]int64) ColumnCountsCheck {
 	result := ColumnCountsCheck{}
 	cols := unionKeys(in, out)

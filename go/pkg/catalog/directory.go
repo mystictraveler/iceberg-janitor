@@ -522,6 +522,27 @@ func (c *DirectoryCatalog) CreateTable(ctx context.Context, identifier icebergta
 			return nil, err
 		}
 	}
+	// Apply user-supplied table properties if any. WithProperties is
+	// a public iceberg-go catalog option and callers reasonably
+	// expect it to round-trip onto the created table metadata.
+	// Strip format-version if present — our builder is hardcoded to
+	// V2 above and iceberg-go's NewMetadataWithUUID treats that key
+	// as builder config, not a persisted property.
+	if len(cfg.Properties) > 0 {
+		props := make(icebergpkg.Properties, len(cfg.Properties))
+		for k, v := range cfg.Properties {
+			if k == icebergtable.PropertyFormatVersion {
+				continue
+			}
+			props[k] = v
+		}
+		if len(props) > 0 {
+			if err := builder.SetProperties(props); err != nil {
+				return nil, fmt.Errorf("applying table properties: %w", err)
+			}
+		}
+	}
+
 	builder.SetLastUpdatedMS()
 
 	meta, err := builder.Build()
