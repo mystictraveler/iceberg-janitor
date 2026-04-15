@@ -1,14 +1,66 @@
-# iceberg-janitor — Features and Correctness Evidence
+# iceberg-janitor — Features and Current State
 
-A complete inventory of what the janitor does today and the test/bench
-evidence that proves each feature works. Companion to:
+The canonical state ledger for every iceberg-janitor capability. One
+row per feature with **STATE**, mechanism, and the test/bench evidence
+that proves it works (or notes the gap). Companion to:
 
 - `EXECUTIVE_SUMMARY.md` — what it is and why
 - `BENCHMARKS.md` — full evidence trail of every measured bench run
 - `README.md` — operator-facing usage
 
-This doc is the matrix view: one row per capability, one column per
-correctness signal.
+When a feature ships, partial-ships, gets planned, or gets refused,
+update its row here. This doc is reviewed when scoping releases or
+answering "is X supported?".
+
+---
+
+## State legend
+
+- **Shipped** — on `main`, fully tested, supported in production
+- **Shipped (branch)** — fully implemented + tested on a feature branch, awaiting merge
+- **Partial** — runtime works, named gap remains (link the GitHub issue)
+- **Planned** — designed but not started
+- **Refused** — deliberate not-supported (silently-incorrect or out-of-scope)
+
+---
+
+## Summary
+
+Commits below are the load-bearing change(s) where the feature took its
+current shape — earlier scaffolding may exist, and follow-up fixes are
+elided unless they materially changed correctness. `git log -- <path>`
+on the feature's main file gives the full history.
+
+| # | Feature | State | Shipped in | Tracker |
+|---|---|---|---|---|
+| 1 | [Compaction (byte-copy stitch + row group merge)](#compaction) | Shipped | `6e573f6` parquet-go-direct path, `7ff9ee8` byte-copy stitch + Pattern B, `da598f7` auto-merge row groups when >4 RGs | — |
+| 2 | [V2 merge-on-read position deletes](#v2-merge-on-read-deletes) | Shipped (branch `feature/v2-deletes`) | `d54e4bf` | PR pending |
+| 3 | [V2 merge-on-read equality deletes — runtime](#v2-merge-on-read-deletes) | Shipped (branch `feature/v2-deletes`) | `d54e4bf` | PR pending |
+| 4 | [V2 equality-delete end-to-end fixture](#v2-merge-on-read-deletes) | Partial — runtime shipped, real-table integration test missing | — | [#8](https://github.com/mystictraveler/iceberg-janitor/issues/8) |
+| 5 | [Snapshot-side cleanup of consumed delete files](#v2-merge-on-read-deletes) | Partial — orphaned delete files survive compact, cleaned up by Expire + OrphanFiles eventually | — | — |
+| 6 | [Snapshot expiration](#snapshot-expiration) | Shipped | `ee9f450` | — |
+| 7 | [Manifest rewrite](#manifest-rewrite) | Shipped | `ee9f450` | — |
+| 8 | [Maintain pipeline (async)](#maintain-pipeline) | Shipped | `8971543` async job API, `11d916e` hot/cold maintain pipeline | — |
+| 9 | [Master check I1–I8 (mandatory pre-commit)](#master-check) | Shipped | `3e2308c` I3/I4/I5 added; `d54e4bf` I1 deletedRows hint + I3 offset + I4 skip | — |
+| 10 | [Master check I9](#master-check) | Planned (reserved slot) | — | — |
+| 11 | [Circuit breakers CB2–CB11](#circuit-breakers) | Shipped (CB1 removed by design in `7ff9ee8`) | `e8f94d1` (all CB2–CB11) | — |
+| 12 | [Workload classification (4-class)](#workload-classification) | Shipped | `1ff841c` | — |
+| 13 | [Async job API + persistent records](#async-job-api) | Shipped | `8971543` async job API; `70df322` persistent records (Phase 2); `e2ce521` wired into jobStore (Phase 3) | — |
+| 14 | [Per-table in-flight dedup (lease)](#per-table-in-flight-dedup) | Shipped | `09de93d` lease primitive (Phase 1); `e2ce521` wired (Phase 3); `642fcf1` in-flight guard fix | — |
+| 15 | [Three runtime tiers (server / lambda / cli)](#three-runtime-tiers) | Shipped | `f5f16e3` server + dual-mode CLI; `8971543` Lambda (AWS deployment) | — |
+| 16 | [Catalog-less directory catalog](#catalog-less-directory-catalog) | Shipped | `23f8440` Spark-compatible v\<N\>.metadata.json + version-hint.text; `d54e4bf` WithProperties round-trip fix | — |
+| 17 | [Sort-on-merge from Iceberg metadata](#sort-on-merge) | Shipped | `f3918f3` | — |
+| 18 | [Dry-run mode (all 4 endpoints)](#dry-run-mode) | Shipped | `a7b6110` cut points; `a029370` wired through handlers + CompactCold + OpenAPI + tests | — |
+| 19 | [Glue registration](#glue-registration) | Shipped | `896048b` janitor-cli fast path; `ca96c63` server: metadata_location in job result + direct Glue UpdateTable | — |
+| 20 | [V3 deletion vectors](#refused) | Refused (safety gate) | refusal in `feature/v2-deletes` (`d54e4bf`) | — |
+| 21 | [V3 row lineage](#refused) | Refused (safety gate) | — | — |
+| 22 | [V3 Puffin stats](#refused) | Refused (safety gate) | — | — |
+| 23 | [Mixed partition-spec compaction](#refused) | Refused (safety gate) | refusal in `feature/v2-deletes` (`d54e4bf`) | — |
+| 24 | [Equality deletes on complex column types](#refused) | Refused (safety gate) | refusal in `feature/v2-deletes` (`d54e4bf`) | — |
+| 25 | [Pattern C (on-commit dispatcher)](#planned) | Planned | — | [#3](https://github.com/mystictraveler/iceberg-janitor/issues/3) |
+| 26 | [Adaptive feedback loop](#planned) | Planned (design plan #12) | — | — |
+| 27 | [pprof endpoint on janitor-server](#planned) | Planned | — | — |
+| 28 | [q1 query latency outlier diagnosis](#planned) | Planned (open since Run 8) | — | — |
 
 ---
 
@@ -29,10 +81,14 @@ correctness signal.
 - [Sort-on-merge](#sort-on-merge)
 - [Dry-run mode](#dry-run-mode)
 - [Glue registration](#glue-registration)
+- [Refused (safety gates)](#refused)
+- [Planned](#planned)
 
 ---
 
 ## Compaction
+
+**STATE: Shipped** in `6e573f6` (parquet-go-direct path that closed the row-loss bug under streaming load), `7ff9ee8` (byte-copy stitch + Pattern B + remove CB1), `da598f7` (auto-merge row groups when stitch produces > 4 RGs).
 
 **Mechanism.** Two-phase: byte-copy stitch (parquet-go `WriteRowGroup`
 fast path, no decode) for the common case, then a post-stitch row group
@@ -56,6 +112,14 @@ order is defined. Replaces `oldPaths` → `newPath` via
 ---
 
 ## V2 merge-on-read deletes
+
+**STATE:**
+- Position deletes (read-through during compaction): **Shipped (branch `feature/v2-deletes`, pending merge to `main`)** in `d54e4bf`.
+- Equality deletes (runtime in `BuildRowMask`): **Shipped (same branch)** in `d54e4bf`.
+- Bench harness `WORKLOAD=deletes` mode: shipped in `7e174ea`.
+- Equality deletes (end-to-end real-table fixture): **Partial — tracked at [#8](https://github.com/mystictraveler/iceberg-janitor/issues/8).**
+- Snapshot-side cleanup of consumed delete files at commit: **Partial — orphans cleaned up by Expire + OrphanFiles eventually.**
+- V3 deletion vectors / equality deletes on complex column types: **Refused via safety gate** (refusal added in `d54e4bf`; see [Refused](#refused)).
 
 **Mechanism.** When the manifest walk encounters position-delete or
 equality-delete entries on the source partitions, `executeStitchAndCommit`
@@ -96,6 +160,8 @@ uuid/binary/struct/list/map) are refused via `*UnsupportedFeatureError`
 
 ## Snapshot expiration
 
+**STATE: Shipped** in `ee9f450`.
+
 **Mechanism.** `pkg/maintenance/expire.go` walks the snapshot chain,
 identifies snapshots older than the retention threshold, and drops them
 from `metadata.snapshots` + `metadata.refs.main.history`. Master check
@@ -110,6 +176,8 @@ internally consistent before commit.
 ---
 
 ## Manifest rewrite
+
+**STATE: Shipped** in `ee9f450` (same commit as expire).
 
 **Mechanism.** `pkg/maintenance/manifest_rewrite.go` consolidates
 per-commit micro-manifests into a partition-organized layout. Reduces
@@ -126,6 +194,8 @@ O(partitions).
 
 ## Maintain pipeline
 
+**STATE: Shipped** in `8971543` (async job API), `11d916e` (hot/cold maintain pipeline), `f9f6d40` (wired into bench).
+
 **Mechanism.** Single endpoint `POST /v1/tables/{ns}/{name}/maintain`
 that runs `expire → rewrite-manifests → compact → rewrite-manifests`
 in load-bearing order. Each phase is async and tracked by job_id.
@@ -138,6 +208,10 @@ in load-bearing order. Each phase is async and tracked by job_id.
 ---
 
 ## Master check
+
+**STATE: Shipped (I1–I8). I9 reserved/Planned.**
+
+I1 dates back to the initial Phase 3 compactor; I3/I4/I5 added in `3e2308c`; I7 narrowing fix is `b6e7ac2`-era; I1 `WithDeletedRows` hint + I3 bounded offset + I4 skip on deletes added in `d54e4bf`.
 
 Mandatory, non-bypassable pre-commit verification. Cannot be disabled
 with `--force`. Runs against the staged transaction's `StagedTable`
@@ -163,7 +237,9 @@ before `tx.Commit()`.
 
 ## Circuit breakers
 
-11 fatal/soft severity gates implemented in `pkg/safety/circuitbreaker.go`:
+**STATE: Shipped (CB2–CB11)** in `e8f94d1`. CB1 was added in `5adece5` and deliberately removed in `7ff9ee8` (see project memory `cb1_deleted.md`).
+
+10 fatal/soft severity gates implemented in `pkg/safety/circuitbreaker.go`:
 
 | ID | Trigger | Action |
 |---|---|---|
@@ -185,6 +261,8 @@ before `tx.Commit()`.
 
 ## Workload classification
 
+**STATE: Shipped** in `1ff841c` (4-class classifier), wired into the maintain endpoint shortly after; doc section in `0f59007`.
+
 **Mechanism.** `pkg/strategy/classify` reads commit-rate windows
 (15-min fast path, 24h, 7d) and classifies each table as one of:
 streaming, batch, slow_changing, dormant. Feeds per-class compaction
@@ -199,6 +277,8 @@ plans (hot vs cold cadence, target file size, parallelism).
 
 ## Async job API
 
+**STATE: Shipped** in `8971543` (initial async + AWS deployment), `70df322` (Phase 2 persistent records), `e2ce521` (Phase 3 wired into jobStore).
+
 **Mechanism.** Every maintenance op (`compact`, `expire`,
 `rewrite-manifests`, `maintain`) returns 202 + `job_id`. Job state
 persists at `_janitor/state/jobs/<job_id>.json` (`pkg/jobrecord`).
@@ -212,6 +292,8 @@ persists at `_janitor/state/jobs/<job_id>.json` (`pkg/jobrecord`).
 ---
 
 ## Per-table in-flight dedup
+
+**STATE: Shipped** in `09de93d` (Phase 1 lease primitive), `e2ce521` (Phase 3 wired into jobStore), `642fcf1` (in-flight guard race fix).
 
 **Mechanism.** `pkg/lease` writes a TTL'd lease at
 `_janitor/state/leases/<ns>.<table>/<op>.lease` via S3 conditional create
@@ -228,6 +310,8 @@ takeover via TTL.
 
 ## Three runtime tiers
 
+**STATE: Shipped** in `f5f16e3` (HTTP server + dual-mode CLI + OpenAPI) and `8971543` (Lambda + AWS Fargate deployment).
+
 Same `pkg/janitor` core runs as:
 
 - Long-lived HTTP server (`cmd/janitor-server`) — Knative / Fargate
@@ -242,6 +326,8 @@ Same `pkg/janitor` core runs as:
 ---
 
 ## Catalog-less directory catalog
+
+**STATE: Shipped.** Initial `pkg/catalog/directory.go` predates the Phase 1 cut; Spark-compatible `v<N>.metadata.json` + `version-hint.text` naming added in `23f8440`. `WithProperties` round-trip fix (latent bug) added in `d54e4bf`.
 
 **Mechanism.** `pkg/catalog/directory.go` reads + writes Iceberg
 metadata directly to/from object storage, with no external catalog
@@ -264,6 +350,8 @@ naming with `version-hint.text` pointer.
 
 ## Sort-on-merge
 
+**STATE: Shipped** in `f3918f3` (sort-on-merge for all compact variants + CreateTable sort order fix). Bench A/B in `c488ee5` (Run 20).
+
 **Mechanism.** When `maybeMergeRowGroups` fires (row groups > 4 OR
 sort order defined OR V2 deletes apply), if the table has a
 non-trivial default sort order set in Iceberg metadata, rows are sorted
@@ -279,6 +367,8 @@ by those columns before writing. Produces tighter min/max column stats
 
 ## Dry-run mode
 
+**STATE: Shipped** in `a7b6110` (cut points started) and `a029370` (wired through handlers + CompactCold + OpenAPI + tests).
+
 **Mechanism.** `?dry_run=true` on all four maintenance endpoints. Cut
 points run real manifest walks (so contention is detected) but stop
 before any side effects. Reload-and-compare-snapshot-id at the end
@@ -293,6 +383,8 @@ probes for CAS contention an actual run would have hit.
 
 ## Glue registration
 
+**STATE: Shipped** in `896048b` (`janitor-cli glue-register --metadata-location` fast path) and `ca96c63` (server: `metadata_location` in job result + direct Glue UpdateTable).
+
 **Mechanism.** `janitor-cli glue-register` registers the warehouse's
 Iceberg tables with AWS Glue using `metadata_location` so Athena can
 query them. Returns `metadata_location` in job result for external
@@ -305,17 +397,43 @@ callers.
 
 ---
 
-## Honest gaps
+## Refused
 
-This list is the inverse of the table above — features that are
-designed but not yet shipped, or shipped with caveats:
+Capabilities the janitor deliberately does not support, refused at the
+safety gate (`checkTableForUnsupportedFeatures` in `pkg/janitor/safety_guards.go`,
+or `LoadEqualityDelete` in `pkg/janitor/deletes.go`). All refusals
+return `*UnsupportedFeatureError` to the caller — never a silent
+degradation.
 
-- **V3 features** (deletion vectors, row lineage, Puffin stats): refused by safety gate; not implemented. Awaiting real V3-using tables.
-- **Equality-delete end-to-end fixture**: see V2 deletes section above; runtime code is shipped + unit-tested, real-table integration test is GitHub issue #8.
-- **Snapshot-side cleanup of consumed delete files**: orphan delete files survive compaction commit and rely on Expire + OrphanFiles for eventual cleanup.
-- **q1 query latency outlier**: +32% on q1 since Run 8, never diagnosed. Tracked in future-tasks memory.
-- **Pattern C (on-commit dispatcher)**: external SQS-driven dispatcher with dequeue-time dedup. GitHub issue #3 — not yet started.
-- **Adaptive feedback loop**: per-table convergence on the right compute tier from history. Design plan #12, not implemented.
+| Capability | Why refused |
+|---|---|
+| **V3 deletion vectors** (PUFFIN-format pos deletes) | Compacting these would silently resurrect deleted rows because the byte-copy stitch can't read the Puffin payload to filter. Detected via `EntryContentPosDeletes` + `FileFormat == PUFFIN`. |
+| **V3 row lineage columns** | Not propagated by the byte-copy stitch; output would lose lineage IDs silently. |
+| **V3 Puffin stats** | Not yet read; statistics in output would diverge from input. |
+| **Mixed partition spec ids across source files** | Per-partition grouping becomes ambiguous; output partition assignment would be wrong. |
+| **Equality deletes on complex column types** (timestamp / decimal / uuid / binary / struct / list / map) | Comparator semantics are non-trivial for these types; matching them approximately would either over- or under-delete. Refused in `LoadEqualityDelete` after schema inspection. |
+
+Lifting any of these from Refused → Shipped requires a real V3-using
+or complex-eq-delete-using table to test against, plus the
+correctness-equivalence proof against an existing engine (Spark or
+Trino).
+
+---
+
+## Planned
+
+Designed but not implemented. Each row links to its tracker.
+
+| Capability | Status | Tracker |
+|---|---|---|
+| **End-to-end equality-delete fixture** | Runtime shipped (branch); fixture path is the gap. Three options documented in the issue. | [#8](https://github.com/mystictraveler/iceberg-janitor/issues/8) |
+| **Snapshot-side removal of consumed delete files at commit** | iceberg-go's public `ReplaceDataFiles` takes only data file paths; no exposed primitive drops a delete file. Workaround today: orphans cleaned up by Expire + OrphanFiles. Closed by either tapping iceberg-go's internal `snapshotProducer` or upstreaming `RemoveDeleteFiles`. | — |
+| **Master check I9** | Reserved invariant slot. Shape TBD. | — |
+| **Pattern C (on-commit dispatcher)** | External SQS-driven dispatcher with dequeue-time dedup; reacts to writer commits via S3 EventBridge. | [#3](https://github.com/mystictraveler/iceberg-janitor/issues/3) |
+| **Adaptive feedback loop** | Per-table convergence on the right compute tier based on history. Design plan #12. | — |
+| **pprof endpoint on `janitor-server`** | `net/http/pprof` behind a `--debug-addr` flag (default off). The parallelism-hang diagnosis required SIGQUIT because there was no other way to get Go stacks. | — |
+| **q1 query latency outlier diagnosis** | +32% on q1 since Run 8, never diagnosed. EXPLAIN ANALYZE pass needed. | — |
+| **Per-table maintain config override** | Earlier scoped, then cancelled by user ("classification logic is very advanced already"). Re-listed if a real workload demands it. | — |
 
 ---
 
@@ -333,7 +451,8 @@ Every correctness signal in this doc is reproducible:
 | Specific V2 delete tests | `cd go && go test ./pkg/janitor/ -run TestCompact_V2 -v` |
 | Specific delete primitives | `cd go && go test ./pkg/janitor/ -run 'TestPosition\|TestBuildRowMask\|TestLoadEqualityDelete' -v` |
 
-Numbers in this doc were captured on commit `7e174ea`
-(`feature/v2-deletes`) on 2026-04-15. Newer runs append to
-BENCHMARKS.md; correctness signals here update when the feature shape
-changes.
+Numbers in this doc were captured on `feature/v2-deletes` on 2026-04-15.
+Newer runs append to BENCHMARKS.md; the per-feature `Shipped in` commit
+column above updates whenever a feature's shape changes (new commit
+appended). When merging a branch back to `main`, drop the
+`(branch ...)` qualifier on the relevant rows.
