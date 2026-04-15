@@ -148,6 +148,15 @@ func compactOnce(ctx context.Context, cat *catalog.DirectoryCatalog, ident icebe
 		return fmt.Errorf("getting fs: %w", err)
 	}
 
+	// Mandatory safety gate: refuse to compact tables using features
+	// the janitor doesn't handle correctly (V3 deletion vectors,
+	// mixed partition spec ids across source files). Compacting such
+	// tables would silently produce wrong data. Check runs before any
+	// side effects.
+	if err := checkTableForUnsupportedFeatures(ctx, tbl, fs); err != nil {
+		return err
+	}
+
 	// Hot-loop fast path: if the caller provided OldPathsOverride,
 	// short-circuit the full manifest walk. We still need per-file row
 	// counts for the master check, so we walk manifests sequentially
@@ -159,9 +168,11 @@ func compactOnce(ctx context.Context, cat *catalog.DirectoryCatalog, ident icebe
 	if len(opts.OldPathsOverride) > 0 {
 		_, fastSpan := tr.Start(ctx, "manifest_walk_override")
 		want := make(map[string]int64, len(opts.OldPathsOverride))
+		wantSeq := make(map[string]int64, len(opts.OldPathsOverride))
 		for _, p := range opts.OldPathsOverride {
 			want[p] = -1 // sentinel: not yet found
 		}
+		var overrideDeleteRefs []deleteFileRef
 		manifests, err := snap.Manifests(fs)
 		if err != nil {
 			fastSpan.End()
@@ -183,11 +194,27 @@ func compactOnce(ctx context.Context, cat *catalog.DirectoryCatalog, ident icebe
 			}
 			for _, e := range entries {
 				df := e.DataFile()
-				if df == nil || df.ContentType() != icebergpkg.EntryContentData {
+				if df == nil {
 					continue
 				}
-				if rows, ok := want[df.FilePath()]; ok && rows < 0 {
-					want[df.FilePath()] = df.Count()
+				switch df.ContentType() {
+				case icebergpkg.EntryContentPosDeletes,
+					icebergpkg.EntryContentEqDeletes:
+					overrideDeleteRefs = append(overrideDeleteRefs, deleteFileRef{
+						path:       df.FilePath(),
+						content:    df.ContentType(),
+						seqNum:     e.SequenceNum(),
+						fieldIDs:   append([]int(nil), df.EqualityFieldIDs()...),
+						fileFormat: string(df.FileFormat()),
+						rowCount:   df.Count(),
+						referenced: derefString(df.ReferencedDataFile()),
+					})
+					continue
+				case icebergpkg.EntryContentData:
+					if rows, ok := want[df.FilePath()]; ok && rows < 0 {
+						want[df.FilePath()] = df.Count()
+						wantSeq[df.FilePath()] = e.SequenceNum()
+					}
 				}
 			}
 			// Early exit: all override paths accounted for.
@@ -203,6 +230,7 @@ func compactOnce(ctx context.Context, cat *catalog.DirectoryCatalog, ident icebe
 			}
 		}
 		var oldPaths []string
+		var oldSeqNums []int64
 		var expectedRows int64
 		for _, p := range opts.OldPathsOverride {
 			rows := want[p]
@@ -211,6 +239,7 @@ func compactOnce(ctx context.Context, cat *catalog.DirectoryCatalog, ident icebe
 				return fmt.Errorf("override path not found in current snapshot: %s", p)
 			}
 			oldPaths = append(oldPaths, p)
+			oldSeqNums = append(oldSeqNums, wantSeq[p])
 			expectedRows += rows
 		}
 		fastSpan.SetAttributes(
@@ -219,7 +248,7 @@ func compactOnce(ctx context.Context, cat *catalog.DirectoryCatalog, ident icebe
 			observe.Rows(expectedRows),
 		)
 		fastSpan.End()
-		return executeStitchAndCommit(ctx, tr, tbl, fs, ident, oldPaths, expectedRows, opts, result, cat)
+		return executeStitchAndCommit(ctx, tr, tbl, fs, ident, oldPaths, oldSeqNums, expectedRows, overrideDeleteRefs, opts, result, cat)
 	}
 
 	// Slow path: walk the full manifest list with per-partition
@@ -250,8 +279,10 @@ func compactOnce(ctx context.Context, cat *catalog.DirectoryCatalog, ident icebe
 	// the bench (store_sales at 60 cpm). See issue #6 for the full
 	// analysis and bench numbers.
 	type manifestResult struct {
-		paths []string
-		rows  int64
+		paths      []string
+		seqNums    []int64
+		rows       int64
+		deleteRefs []deleteFileRef
 	}
 	results := make([]manifestResult, len(manifests))
 	g, gctx := errgroup.WithContext(ctx)
@@ -284,7 +315,38 @@ func compactOnce(ctx context.Context, cat *catalog.DirectoryCatalog, ident icebe
 			var local manifestResult
 			for _, e := range entries {
 				df := e.DataFile()
-				if df == nil || df.ContentType() != icebergpkg.EntryContentData {
+				if df == nil {
+					continue
+				}
+				// V2 delete files live in the same manifest tree as
+				// data files (V2.x) or in content=Deletes manifests
+				// (V2.2+). Collect them here — the loader phase will
+				// open them and build the DeleteBundle. Partition
+				// matching applies: a delete file stored in
+				// partition X only affects data files in partition X.
+				// Pattern B (skip-large-files) does NOT apply to
+				// delete files — they are always small and always
+				// required if they target any data file we're about
+				// to rewrite.
+				switch df.ContentType() {
+				case icebergpkg.EntryContentPosDeletes,
+					icebergpkg.EntryContentEqDeletes:
+					if matchPart != nil && !matchPart(df) {
+						continue
+					}
+					local.deleteRefs = append(local.deleteRefs, deleteFileRef{
+						path:        df.FilePath(),
+						content:     df.ContentType(),
+						seqNum:      e.SequenceNum(),
+						fieldIDs:    append([]int(nil), df.EqualityFieldIDs()...),
+						fileFormat:  string(df.FileFormat()),
+						rowCount:    df.Count(),
+						referenced:  derefString(df.ReferencedDataFile()),
+					})
+					continue
+				case icebergpkg.EntryContentData:
+					// fall through
+				default:
 					continue
 				}
 				if matchPart != nil && !matchPart(df) {
@@ -302,6 +364,7 @@ func compactOnce(ctx context.Context, cat *catalog.DirectoryCatalog, ident icebe
 					continue
 				}
 				local.paths = append(local.paths, df.FilePath())
+				local.seqNums = append(local.seqNums, e.SequenceNum())
 				local.rows += df.Count()
 			}
 			results[i] = local
@@ -318,10 +381,14 @@ func compactOnce(ctx context.Context, cat *catalog.DirectoryCatalog, ident icebe
 	// when the input order is deterministic and matches the snapshot's
 	// own manifest ordering.
 	var oldPaths []string
+	var oldSeqNums []int64
 	var expectedRows int64
+	var deleteRefs []deleteFileRef
 	for _, r := range results {
 		oldPaths = append(oldPaths, r.paths...)
+		oldSeqNums = append(oldSeqNums, r.seqNums...)
 		expectedRows += r.rows
+		deleteRefs = append(deleteRefs, r.deleteRefs...)
 	}
 	walkSpan.SetAttributes(observe.Files(len(oldPaths)), observe.Rows(expectedRows))
 	walkSpan.End()
@@ -330,7 +397,7 @@ func compactOnce(ctx context.Context, cat *catalog.DirectoryCatalog, ident icebe
 		return nil // nothing to compact
 	}
 
-	return executeStitchAndCommit(ctx, tr, tbl, fs, ident, oldPaths, expectedRows, opts, result, cat)
+	return executeStitchAndCommit(ctx, tr, tbl, fs, ident, oldPaths, oldSeqNums, expectedRows, deleteRefs, opts, result, cat)
 }
 
 // executeStitchAndCommit takes a resolved file selection (oldPaths +
@@ -345,11 +412,33 @@ func executeStitchAndCommit(
 	fs icebergio.IO,
 	ident icebergtable.Identifier,
 	oldPaths []string,
+	oldSeqNums []int64,
 	expectedRows int64,
+	deleteRefs []deleteFileRef,
 	opts CompactOptions,
 	result *CompactResult,
 	cat *catalog.DirectoryCatalog,
 ) error {
+	// V2 delete handling: load every delete-file payload that the
+	// manifest walk collected. If any eq delete references a column
+	// type we can't safely compare, BuildDeleteBundle returns an
+	// UnsupportedFeatureError and we refuse the compaction — silent
+	// row resurrection is worse than a loud failure.
+	var deleteBundle *DeleteBundle
+	if len(deleteRefs) > 0 {
+		icebergSchema := tbl.Metadata().CurrentSchema()
+		var derr error
+		deleteBundle, derr = BuildDeleteBundle(ctx, fs, deleteRefs, icebergSchema)
+		if derr != nil {
+			return derr
+		}
+	}
+	// Compute how many rows the deletes will drop from the input, so
+	// the final rowsWritten check (and I1 master check) can account
+	// for them. For eq deletes we don't know the match count until the
+	// decode-time scan, so this accumulator is updated by the per-
+	// source-file workers below.
+	var deletedRows int64
 	// Dry-run cut point. The manifest walk that produced oldPaths +
 	// expectedRows already ran (either the full walk or the override
 	// fast path), so we have the full plan. Stop here before any side
@@ -416,8 +505,17 @@ func executeStitchAndCommit(
 	// (which shouldn't happen on uniform inputs but could for
 	// real-world workloads with mixed writers), we fall through to
 	// the legacy pqarrow decode/encode read path below.
-	rowsWritten, stitchErr := stitchParquetFiles(ctx, fs, oldPaths, out)
-	usedStitch := stitchErr == nil && rowsWritten == expectedRows
+	// When deletes apply, the byte-copy stitch path cannot be used —
+	// it has no opportunity to filter rows. Skip it and go straight to
+	// the pqarrow decode/encode fallback, which reads row batches per
+	// source file and can apply BuildRowMask before writing.
+	deletesApply := deleteBundle != nil && !deleteBundle.IsEmpty()
+	var rowsWritten int64
+	var stitchErr error
+	if !deletesApply {
+		rowsWritten, stitchErr = stitchParquetFiles(ctx, fs, oldPaths, out)
+	}
+	usedStitch := !deletesApply && stitchErr == nil && rowsWritten == expectedRows
 	if !usedStitch {
 		// Stitching failed or row count mismatched. Close + delete
 		// the partial output and fall through to the pqarrow path
@@ -451,10 +549,23 @@ func executeStitchAndCommit(
 		// shape as the path that issue #6 parallelized — workers
 		// read in parallel, writes are serialized.
 		var pqWriterMu sync.Mutex
+		// Precompute Arrow column-name → index map once per compaction;
+		// shared across all workers since the write schema is fixed.
+		arrowColIdxByName := make(map[string]int, len(writeSchema.Fields()))
+		for i, f := range writeSchema.Fields() {
+			arrowColIdxByName[f.Name] = i
+		}
 		g2, gctx2 := errgroup.WithContext(ctx)
 		g2.SetLimit(parquetReadConcurrency)
-		for _, fpath := range oldPaths {
+		for idx, fpath := range oldPaths {
 			fpath := fpath
+			// Source sequence number lookup — the caller guarantees
+			// len(oldPaths) == len(oldSeqNums) in both the full-walk
+			// and override-fast paths.
+			srcSeq := int64(0)
+			if idx < len(oldSeqNums) {
+				srcSeq = oldSeqNums[idx]
+			}
 			g2.Go(func() error {
 				if gctx2.Err() != nil {
 					return gctx2.Err()
@@ -462,6 +573,31 @@ func executeStitchAndCommit(
 				batches, n, rerr := readParquetFileBatches(gctx2, fs, fpath, writeSchema, mem)
 				if rerr != nil {
 					return fmt.Errorf("copying %s: %w", fpath, rerr)
+				}
+				// Apply V2 deletes if any. Position deletes are
+				// indexed by row offset within the source file, so
+				// we track a running offset across this source's
+				// batches. Equality deletes apply per-row regardless
+				// of position. Rows marked false by BuildRowMask are
+				// filtered before the write.
+				if deletesApply {
+					var rowOffset int64
+					filtered := make([]arrow.Record, 0, len(batches))
+					var surviving int64
+					for _, b := range batches {
+						mask := BuildRowMask(fpath, srcSeq, rowOffset, b, deleteBundle, arrowColIdxByName)
+						rowOffset += b.NumRows()
+						kept := applyRowMask(b, mask, mem)
+						b.Release()
+						if kept != nil {
+							surviving += kept.NumRows()
+							filtered = append(filtered, kept)
+						}
+					}
+					dropped := n - surviving
+					atomic.AddInt64(&deletedRows, dropped)
+					batches = filtered
+					n = surviving
 				}
 				pqWriterMu.Lock()
 				defer pqWriterMu.Unlock()
@@ -502,11 +638,13 @@ func executeStitchAndCommit(
 
 	// Step 4: pre-flight check. The iceberg-go writer's manifest
 	// entries record the exact row count of each data file. If
-	// rowsWritten != expectedRows, parquet-go's reader dropped or
-	// added rows during file copy — abort and clean up.
-	if rowsWritten != expectedRows {
+	// rowsWritten != expectedRows (minus any rows dropped by V2
+	// deletes during the decode/encode path), parquet-go's reader
+	// dropped or added rows during file copy — abort and clean up.
+	if rowsWritten+deletedRows != expectedRows {
 		_ = wfs.Remove(newFilePath)
-		return fmt.Errorf("read/manifest row mismatch: read %d rows but manifest entries sum to %d", rowsWritten, expectedRows)
+		return fmt.Errorf("read/manifest row mismatch: read %d rows + %d deleted but manifest entries sum to %d",
+			rowsWritten, deletedRows, expectedRows)
 	}
 
 	// Step 4b: post-stitch row group merge + sort. Same logic as
@@ -541,9 +679,15 @@ func executeStitchAndCommit(
 		return fmt.Errorf("getting staged table: %w", err)
 	}
 
-	// Step 6: master check (mandatory, unchanged).
+	// Step 6: master check (mandatory). Pass the deleted-row count
+	// so I1 can distinguish a legitimate V2 merge-on-read drop from
+	// a genuine row-conservation violation.
 	ctx, verifySpan := tr.Start(ctx, "master_check")
-	verification, err := safety.VerifyCompactionConsistency(ctx, tbl, staged, cat.Props())
+	var verifyOpts []safety.VerifyOption
+	if deletedRows > 0 {
+		verifyOpts = append(verifyOpts, safety.WithDeletedRows(deletedRows))
+	}
+	verification, err := safety.VerifyCompactionConsistency(ctx, tbl, staged, cat.Props(), verifyOpts...)
 	result.Verification = verification
 	if err != nil {
 		verifySpan.RecordError(err)
@@ -567,8 +711,12 @@ func executeStitchAndCommit(
 		result.AfterSnapshotID = newSnap.SnapshotID
 	}
 	result.AfterFiles, result.AfterRows = SnapshotFileStatsFast(ctx, newTbl)
-	if result.AfterRows != result.BeforeRows {
-		return fmt.Errorf("post-commit row count mismatch: before=%d after=%d", result.BeforeRows, result.AfterRows)
+	// When V2 deletes applied, the post-commit row count drops by
+	// exactly `deletedRows`. Otherwise the invariant is strict
+	// equality (pure compaction preserves rows).
+	if result.AfterRows != result.BeforeRows-deletedRows {
+		return fmt.Errorf("post-commit row count mismatch: before=%d - deleted=%d != after=%d",
+			result.BeforeRows, deletedRows, result.AfterRows)
 	}
 	return nil
 }

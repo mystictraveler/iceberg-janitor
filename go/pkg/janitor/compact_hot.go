@@ -314,6 +314,18 @@ func CompactHot(ctx context.Context, cat *catalog.DirectoryCatalog, ident iceber
 		return result, fmt.Errorf("loading table %v: %w", ident, err)
 	}
 
+	// Mandatory safety gate: refuse tables using features the janitor
+	// doesn't correctly handle (V3 deletion vectors, mixed partition
+	// spec ids). See checkTableForUnsupportedFeatures for the full
+	// list of refusal conditions.
+	hotFs, hotFsErr := tbl.FS(ctx)
+	if hotFsErr != nil {
+		return result, fmt.Errorf("opening fs for safety check: %w", hotFsErr)
+	}
+	if gerr := checkTableForUnsupportedFeatures(ctx, tbl, hotFs); gerr != nil {
+		return result, gerr
+	}
+
 	parts, err := analyzer.AnalyzePartitions(ctx, tbl, analyzer.PartitionHealthOptions{
 		SmallFileThresholdBytes: opts.SmallFileThresholdBytes,
 		HotWindowSnapshots:      opts.HotWindowSnapshots,
