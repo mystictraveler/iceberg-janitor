@@ -89,7 +89,7 @@ uuid/binary/struct/list/map) are refused via `*UnsupportedFeatureError`
 
 **Known gaps (logged as future work):**
 
-- End-to-end equality-delete fixture: iceberg-go has no public emit path for eq deletes (only pos deletes via `tx.Delete` + merge-on-read). Eq-delete runtime code in `BuildRowMask` is exercised today by unit tests with synthetic Arrow batches but lacks a real-table integration test. Tracked at GitHub issue #8 (cc @ptandra). Three options documented: DuckDB iceberg writer, hand-craft via `ManifestWriter` + `DataFileBuilder`, or upstream `AddEqualityDeleteFile` PR.
+- End-to-end equality-delete fixture: iceberg-go has no public emit path for eq deletes (only pos deletes via `tx.Delete` + merge-on-read). Eq-delete runtime code in `BuildRowMask` is exercised today by unit tests with synthetic Arrow batches but lacks a real-table integration test. Tracked at GitHub issue #8 (cc @praveentandra). Three options documented: DuckDB iceberg writer, hand-craft via `ManifestWriter` + `DataFileBuilder`, or upstream `AddEqualityDeleteFile` PR.
 - Removing consumed delete files from the snapshot at commit: iceberg-go's public `ReplaceDataFiles` takes only data file paths; there's no exposed primitive to drop a delete file. After compaction, the orphaned delete files are semantically inert (referenced data files are gone OR have lower seq_num) and will be cleaned up by Expire + OrphanFiles. A follow-up tapping iceberg-go's internal `snapshotProducer` API would close the gap.
 
 ---
