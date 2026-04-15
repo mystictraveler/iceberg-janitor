@@ -15,6 +15,18 @@
 #   bench.sh minio   # MinIO via docker compose. Mid-fidelity S3.
 #   bench.sh aws     # Runs inside the bench Fargate container in AWS.
 #
+# Workload selection (env)
+# ========================
+#
+#   WORKLOAD=tpcds    Default. The TPC-DS streaming + maintain + query
+#                     comparison described below.
+#   WORKLOAD=deletes  V2 merge-on-read position-delete bench. Skips the
+#                     streamer entirely. Seeds a V2 table, fires
+#                     NUM_DELETES tx.Delete commits, runs janitor.Compact
+#                     once, validates row count + master check.
+#                     Knobs: NUM_BATCHES, ROWS_PER_BATCH, NUM_DELETES.
+#                     Currently supported in local + minio modes only.
+#
 # Pattern: phased A/B, NOT interleaved
 # ====================================
 #
@@ -86,6 +98,17 @@ NAMESPACE="${NAMESPACE:-tpcds}"
 BURSTY="${BURSTY:-true}"
 BURST_MAX="${BURST_MAX:-10}"
 TARGET_FILE_SIZE="${TARGET_FILE_SIZE:-1MB}"
+
+WORKLOAD="${WORKLOAD:-tpcds}"
+case "$WORKLOAD" in
+  tpcds|deletes) ;;
+  *) echo "unknown WORKLOAD: $WORKLOAD (want: tpcds|deletes)" >&2; exit 2 ;;
+esac
+
+# WORKLOAD=deletes knobs
+NUM_BATCHES="${NUM_BATCHES:-200}"
+ROWS_PER_BATCH="${ROWS_PER_BATCH:-50}"
+NUM_DELETES="${NUM_DELETES:-50}"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../../.." 2>/dev/null && pwd || echo /)"
@@ -219,6 +242,43 @@ case "$MODE" in
     JANITOR_SERVER_BIN=""
     ;;
 esac
+
+# === Workload branch: deletes ===
+#
+# The deletes workload is self-contained. It does not need the
+# janitor-server, the streamer, or the query suite — it seeds + fires
+# deletes + runs Compact + validates in one Go process. We share this
+# script's mode setup (S3 env, bucket creation, build steps) and then
+# hand off to the delete-bench binary.
+
+if [[ "$WORKLOAD" == "deletes" ]]; then
+  if [[ "$MODE" == "aws" ]]; then
+    echo "WORKLOAD=deletes is not yet supported in aws mode" >&2
+    exit 2
+  fi
+  log "WORKLOAD=deletes — building delete-bench"
+  cd "$GO_DIR"
+  go build -tags bench -o /tmp/janitor-delete-bench ./test/bench/delete-bench
+  log "running V2 delete bench (batches=$NUM_BATCHES rows/batch=$ROWS_PER_BATCH deletes=$NUM_DELETES)"
+  # Use the WITH warehouse URL — it was already wiped above on minio
+  # mode, and is the only warehouse needed for this workload.
+  JANITOR_WAREHOUSE_URL="$WH_WITH_URL" \
+  S3_ENDPOINT="${S3_ENDPOINT:-}" \
+  S3_ACCESS_KEY="${S3_ACCESS_KEY:-}" \
+  S3_SECRET_KEY="${S3_SECRET_KEY:-}" \
+  S3_REGION="${S3_REGION:-us-east-1}" \
+  NUM_BATCHES="$NUM_BATCHES" \
+  ROWS_PER_BATCH="$ROWS_PER_BATCH" \
+  NUM_DELETES="$NUM_DELETES" \
+  /tmp/janitor-delete-bench | tee "$RESULTS_DIR/delete-bench-$TS.log"
+  rc=${PIPESTATUS[0]}
+  if [[ $rc -ne 0 ]]; then
+    log "delete-bench FAILED (exit $rc)"
+    exit $rc
+  fi
+  log "delete-bench complete; log at $RESULTS_DIR/delete-bench-$TS.log"
+  exit 0
+fi
 
 # === Phase 1: janitor-server (local + minio) ===
 
