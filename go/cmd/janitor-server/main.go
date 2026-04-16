@@ -57,6 +57,8 @@ func main() {
 
 	shutdownTracer := observe.Init("janitor-server")
 	defer shutdownTracer()
+	shutdownMetrics := observe.InitMetrics("janitor-server")
+	defer shutdownMetrics()
 
 	listen := getenv("JANITOR_LISTEN", ":8080")
 	warehouseURL := os.Getenv("JANITOR_WAREHOUSE_URL")

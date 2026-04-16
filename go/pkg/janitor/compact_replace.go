@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/apache/arrow-go/v18/arrow/array"
@@ -725,13 +726,18 @@ func executeStitchAndCommit(
 
 	// Step 6: master check (mandatory). Pass the deleted-row count
 	// so I1 can distinguish a legitimate V2 merge-on-read drop from
-	// a genuine row-conservation violation.
+	// a genuine row-conservation violation. Wall time is recorded
+	// into the master_check.wall_ms histogram so operators can chart
+	// it separately from the rest of the Compact call.
 	ctx, verifySpan := tr.Start(ctx, "master_check")
+	verifyStart := time.Now()
 	var verifyOpts []safety.VerifyOption
 	if deletedRows > 0 {
 		verifyOpts = append(verifyOpts, safety.WithDeletedRows(deletedRows))
 	}
 	verification, err := safety.VerifyCompactionConsistency(ctx, tbl, staged, cat.Props(), verifyOpts...)
+	verifyWallMs := time.Since(verifyStart).Milliseconds()
+	observe.RecordMasterCheckWall(ctx, ident[0]+"."+ident[1], verifyWallMs)
 	result.Verification = verification
 	if err != nil {
 		verifySpan.RecordError(err)
