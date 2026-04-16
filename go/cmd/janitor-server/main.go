@@ -100,9 +100,18 @@ func main() {
 	mux.HandleFunc("POST /v1/tables/{ns}/{name}/maintain", srv.handleMaintainAsync)
 	mux.HandleFunc("GET /v1/jobs/{id}", srv.handleJobStatus)
 
+	// Middleware chain (outermost first, innermost last):
+	//   withTracing      starts the per-request OTel span on the
+	//                    matched route so every handler inherits
+	//                    trace context. NoOp by default — see
+	//                    pkg/observe/trace.go for the production
+	//                    posture rationale.
+	//   withRequestID    stamps a stable X-Request-ID so correlated
+	//                    logs and traces share a key.
+	//   withLogging      emits the per-request slog line.
 	httpServer := &http.Server{
 		Addr:              listen,
-		Handler:           withRequestID(withLogging(mux, logger)),
+		Handler:           withTracing(withRequestID(withLogging(mux, logger))),
 		ReadHeaderTimeout: 10 * time.Second,
 	}
 
