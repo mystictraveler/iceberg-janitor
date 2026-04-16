@@ -1,0 +1,85 @@
+# iceberg-janitor — dev observability overlay
+#
+# Brings up the observability stack (Jaeger all-in-one, Pyroscope,
+# OpenTelemetry Collector) as a compose overlay on top of the base
+# MinIO compose file. Nothing here is intended for production — all
+# data lives in ephemeral container volumes, there is no auth, and
+# every service is exposed on localhost.
+#
+# Usage (from the repo root):
+#   docker compose -f go/test/mvp/docker-compose.yml \
+#                  -f go/test/mvp/docker-compose.dev.yml up -d
+#
+#   # Start the janitor-server pointed at the collector + with a
+#   # pprof listener that Pyroscope can scrape:
+#   JANITOR_WAREHOUSE_URL=s3://warehouse?region=us-east-1&endpoint=http://localhost:9000 \
+#   S3_ENDPOINT=http://localhost:9000 S3_REGION=us-east-1 \
+#   AWS_ACCESS_KEY_ID=minioadmin AWS_SECRET_ACCESS_KEY=minioadmin \
+#   JANITOR_TRACE=stdout-compact JANITOR_METRICS=stdout \
+#   JANITOR_DEBUG_ADDR=127.0.0.1:6060 \
+#   go run ./go/cmd/janitor-server
+#
+# UIs:
+#   Jaeger:      http://localhost:16686   (traces)
+#   Pyroscope:   http://localhost:4040    (continuous profiling)
+#   Collector:   http://localhost:13133   (health check)
+#   MinIO:       http://localhost:9001    (console, from base compose)
+#
+# Wiring direction:
+#
+#   janitor-server ─OTLP/gRPC:4317─> otel-collector ─> Jaeger :14250
+#                                                   └─> (logs dropped)
+#
+#   janitor-server ─pprof HTTP:6060─> scraped by Pyroscope
+#
+# Notes:
+#
+# - The collector accepts OTLP on 4317 (grpc) and 4318 (http). Default
+#   gRPC client in go.opentelemetry.io/otel/exporters/otlp/otlptracegrpc
+#   targets localhost:4317 with TLS off — matches this setup.
+# - Pyroscope scrapes pprof from the host's 127.0.0.1:6060 using
+#   `docker.host.internal` on macOS / Linux-with-host.docker.internal
+#   extra_hosts (see below). The janitor-server must be started with
+#   --debug-addr=127.0.0.1:6060 (or JANITOR_DEBUG_ADDR env) for this
+#   to work. Default production build starts NO pprof listener —
+#   this is an explicit dev-only knob.
+# - No GPU, no persistent volumes for the observability stack. Tear
+#   down with `docker compose ... down` and state is gone.
+
+services:
+  jaeger:
+    image: jaegertracing/all-in-one:1.62
+    container_name: janitor-mvp-jaeger
+    ports:
+      - "16686:16686"  # Jaeger UI
+      - "14250:14250"  # gRPC accept — collector points here
+      - "14268:14268"  # HTTP accept (legacy)
+    environment:
+      COLLECTOR_OTLP_ENABLED: "true"
+
+  pyroscope:
+    image: grafana/pyroscope:1.8.0
+    container_name: janitor-mvp-pyroscope
+    ports:
+      - "4040:4040"
+    command:
+      - "server"
+    # Scrape the host's janitor-server pprof endpoint on :6060.
+    # docker-compose on macOS/Windows resolves host.docker.internal
+    # automatically; on Linux we add it via extra_hosts.
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:0.113.0
+    container_name: janitor-mvp-otel-collector
+    command:
+      - "--config=/etc/otelcol/config.yaml"
+    volumes:
+      - ./otel-collector-config.yaml:/etc/otelcol/config.yaml:ro
+    ports:
+      - "4317:4317"   # OTLP gRPC — primary ingress from janitor-server
+      - "4318:4318"   # OTLP HTTP — alternative ingress
+      - "13133:13133" # health check endpoint
+    depends_on:
+      - jaeger

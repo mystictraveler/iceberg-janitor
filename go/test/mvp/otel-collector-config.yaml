@@ -1,0 +1,52 @@
+# OpenTelemetry Collector config for the iceberg-janitor dev stack.
+#
+# Consumed by test/mvp/docker-compose.dev.yml. Scope is limited to
+# what the dev loop needs: accept OTLP from the janitor-server (or
+# janitor-cli running locally), forward traces to Jaeger, drop metric
+# and log signals on the floor for now (nothing to render them yet).
+#
+# Extend this file when adding a Prometheus / Loki backend — the
+# receivers block already has the OTLP wiring; only the exporters
+# and the pipelines need to grow.
+
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+      http:
+        endpoint: 0.0.0.0:4318
+
+processors:
+  batch:
+    timeout: 2s
+    send_batch_size: 1024
+
+exporters:
+  # Traces go to Jaeger all-in-one via OTLP gRPC (Jaeger 1.35+
+  # accepts OTLP natively when COLLECTOR_OTLP_ENABLED=true).
+  otlp/jaeger:
+    endpoint: jaeger:4317
+    tls:
+      insecure: true
+  # Drop metrics to the collector's own debug log until we wire a
+  # Prometheus or similar backend. Useful during dev to eyeball
+  # what the janitor is emitting.
+  debug:
+    verbosity: basic
+
+extensions:
+  health_check:
+    endpoint: 0.0.0.0:13133
+
+service:
+  extensions: [health_check]
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [batch]
+      exporters: [otlp/jaeger, debug]
+    metrics:
+      receivers: [otlp]
+      processors: [batch]
+      exporters: [debug]
