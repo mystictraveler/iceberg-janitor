@@ -7,16 +7,38 @@
 # detail that populates during and after maintain cycles.
 #
 # Layout:
-#   Row 1 — ECS service health (running/desired, CPU, memory)
-#   Row 2 — HTTP request rate by path + active/completed jobs
-#   Row 3 — File count sawtooth (before/after per maintain job)
-#   Row 4 — Maintain pipeline phase timings
-#   Row 5 — Classifier decisions + mode mix
-#   Row 6 — Hot-path: CompactHot partitions stitched + wall time
-#   Row 7 — Cold-path: trigger firings
-#   Row 8 — Manifest consolidation + expire
-#   Row 9 — Cross-replica dedup + dry-run
-#   Row 10 — Errors
+#   Row 1  — ECS service health (running/desired, CPU, memory)
+#   Row 2  — HTTP request rate by path + active/completed jobs
+#   Row 3  — File count sawtooth (before/after per maintain job)
+#   Row 4  — Top 10 hot tables last hour
+#   Row 5a — Maintain pipeline phase timings
+#   Row 5b — Classifier + mode mix
+#   Row 6  — Hot-path: CompactHot partitions stitched + wall time
+#   Row 7  — Cold-path + manifest consolidation + expire
+#   Row 8  — Cross-replica dedup + dry-run
+#   Row 9  — MASTER CHECK correctness (pass/fail + per-invariant)     — NEW
+#   Row 10 — Skipped rounds (schema-evolution guard, deferrals)       — NEW
+#   Row 11 — Circuit breakers (trip rate by id + paused tables)       — NEW (phased)
+#   Row 12 — V2 deletes (position/equality applied + refused)         — NEW (phased)
+#   Row 13 — CAS contention (retries distribution)                    — NEW
+#   Row 14 — Errors (always last)
+#
+# Observability-track phasing. Rows 9, 10, 13 read fields emitted by
+# the compact-completed log line today (via
+# cmd/janitor-server/jobs.go after the observability-track branch):
+# `skipped`, `skipped_reason`, `master_overall`, `master_I1..I7`,
+# `dvs_applied`, `attempts`. Rows 11 and 12 depend on later phase PRs
+# that add CB-trip and V2-delete fields to the logs; until those
+# ship, those panels render empty. That empty state is the deliberate
+# signal that the corresponding instrumentation hasn't landed.
+#
+# Cost discipline. Every widget below is a CloudWatch Logs Insights
+# query over the existing janitor log group; no agent deployment, no
+# new metric-filter resources, no hot-path work on the server. Log
+# cardinality is not amplified — we're reading fields the server
+# was already going to emit (or has started emitting as of the
+# observability-track branch). See OBSERVABILITY_SPEC.md for the
+# no-hot-path-overhead rule this dashboard respects.
 
 resource "aws_cloudwatch_dashboard" "main" {
   dashboard_name = "${var.project}-overview"
@@ -391,11 +413,232 @@ resource "aws_cloudwatch_dashboard" "main" {
         }
       },
 
-      # === Row 9: Errors (always check last) ===
+      # === Row 9: Master-check correctness (pass/fail + per-invariant) ===
+      #
+      # The master check is the janitor's non-bypassable pre-commit
+      # invariant set. A failure here means the janitor REFUSED to
+      # commit something that would have been silently wrong — which
+      # is a feature working as intended, but operators need it on a
+      # dashboard to spot a sudden spike (could indicate an upstream
+      # writer bug or a corrupt source file).
+      #
+      # Fields used (emitted by cmd/janitor-server/jobs.go on compact
+      # job completed):
+      #   master_overall   "pass" | "fail"
+      #   master_I1        "pass" | "fail"  (row count)
+      #   master_I2        schema identity
+      #   master_I3/I4     per-column value/null counts
+      #   master_I5        bounds presence
+      #   master_I7        manifest references exist
       {
         type   = "log"
         x      = 0
         y      = 48
+        width  = 12
+        height = 6
+        properties = {
+          title  = "Master check overall pass/fail"
+          region = var.region
+          query  = <<-EOQ
+            SOURCE '${aws_cloudwatch_log_group.janitor.name}'
+            | filter msg = "compact job completed"
+            | stats count() as checks by master_overall, bin(5m)
+          EOQ
+          view    = "timeSeries"
+          stacked = true
+        }
+      },
+      {
+        type   = "log"
+        x      = 12
+        y      = 48
+        width  = 12
+        height = 6
+        properties = {
+          title  = "Master check: failures by invariant (last 24h)"
+          region = var.region
+          query  = <<-EOQ
+            SOURCE '${aws_cloudwatch_log_group.janitor.name}'
+            | filter msg = "compact job completed" and master_overall = "fail"
+            | stats count() as failures by master_I1, master_I2, master_I3, master_I4, master_I5, master_I7
+          EOQ
+          view = "table"
+        }
+      },
+
+      # === Row 10: Skipped rounds (schema-evolution guard, deferrals) ===
+      #
+      # A compact that "ran" but Skipped=true did no work — e.g. the
+      # schema-evolution guard saw source files spanning two schema
+      # ids and refused to cross the boundary. Not an error, but a
+      # signal: if the skip rate is chronic, the table's old-schema
+      # tail isn't aging out and an operator may need to run expire.
+      #
+      # Fields: `skipped` (bool), `skipped_reason` ("mixed_schemas",
+      # etc), from the compact-completed log line.
+      {
+        type   = "log"
+        x      = 0
+        y      = 54
+        width  = 12
+        height = 6
+        properties = {
+          title  = "Skipped compactions by reason"
+          region = var.region
+          query  = <<-EOQ
+            SOURCE '${aws_cloudwatch_log_group.janitor.name}'
+            | filter msg = "compact job completed" and skipped = 1
+            | stats count() as skips by skipped_reason, bin(10m)
+          EOQ
+          view    = "timeSeries"
+          stacked = true
+        }
+      },
+      {
+        type   = "log"
+        x      = 12
+        y      = 54
+        width  = 12
+        height = 6
+        properties = {
+          title  = "Tables with mixed-schema backlog (last hour)"
+          region = var.region
+          query  = <<-EOQ
+            SOURCE '${aws_cloudwatch_log_group.janitor.name}'
+            | filter msg = "compact job completed" and skipped_reason = "mixed_schemas"
+            | stats count() as mixed_rounds by table
+            | sort mixed_rounds desc
+            | limit 20
+          EOQ
+          view = "table"
+        }
+      },
+
+      # === Row 11: Circuit breakers ===
+      #
+      # PHASED — these widgets read `cb_tripped` and `cb_reason`
+      # fields that later observability-phase PRs must emit from
+      # pkg/safety/circuitbreaker.go trip sites. Until that lands,
+      # the panels render empty. That's the deliberate signal that
+      # Phase 2 of the observability track has not yet shipped.
+      #
+      # Required log fields (to be emitted on trip):
+      #   cb_tripped   "CB2" | "CB3" | "CB4" | "CB7" | "CB8" | "CB9" | "CB10" | "CB11"
+      #   cb_reason    short human-readable reason string
+      #   table        "ns.name"
+      {
+        type   = "log"
+        x      = 0
+        y      = 60
+        width  = 12
+        height = 6
+        properties = {
+          title  = "Circuit breaker trips by id (PHASED — needs Phase 2 emission)"
+          region = var.region
+          query  = <<-EOQ
+            SOURCE '${aws_cloudwatch_log_group.janitor.name}'
+            | filter cb_tripped != ""
+            | stats count() as trips by cb_tripped, bin(15m)
+          EOQ
+          view    = "timeSeries"
+          stacked = true
+        }
+      },
+      {
+        type   = "log"
+        x      = 12
+        y      = 60
+        width  = 12
+        height = 6
+        properties = {
+          title  = "Currently-paused tables (PHASED)"
+          region = var.region
+          query  = <<-EOQ
+            SOURCE '${aws_cloudwatch_log_group.janitor.name}'
+            | filter cb_tripped != ""
+            | stats latest(cb_tripped) as last_trip, latest(cb_reason) as reason by table
+            | sort @timestamp desc
+            | limit 50
+          EOQ
+          view = "table"
+        }
+      },
+
+      # === Row 12: V2 deletes applied / refused ===
+      #
+      # Fields — `dvs_applied` (int) is emitted today on the compact
+      # completed line (from VerifyCompactionConsistency.I1RowCount.DVs).
+      # `eq_delete_refused` + `eq_delete_file` are PHASED — emitted
+      # by pkg/janitor/deletes.go's LoadEqualityDelete when it
+      # returns *UnsupportedFeatureError. That phase add is small
+      # (one logger call at the refusal site).
+      {
+        type   = "log"
+        x      = 0
+        y      = 66
+        width  = 12
+        height = 6
+        properties = {
+          title  = "Rows dropped by V2 deletes per compact (sum 5m)"
+          region = var.region
+          query  = <<-EOQ
+            SOURCE '${aws_cloudwatch_log_group.janitor.name}'
+            | filter msg = "compact job completed" and dvs_applied > 0
+            | stats sum(dvs_applied) as rows_dropped by bin(5m)
+          EOQ
+          view    = "timeSeries"
+          stacked = false
+        }
+      },
+      {
+        type   = "log"
+        x      = 12
+        y      = 66
+        width  = 12
+        height = 6
+        properties = {
+          title  = "Equality delete refusals (complex type) — PHASED"
+          region = var.region
+          query  = <<-EOQ
+            SOURCE '${aws_cloudwatch_log_group.janitor.name}'
+            | filter eq_delete_refused = 1
+            | stats count() as refusals, latest(eq_delete_file) as file by table
+          EOQ
+          view = "table"
+        }
+      },
+
+      # === Row 13: CAS contention — retry distribution ===
+      #
+      # `attempts` is already emitted on the compact-completed log
+      # line. attempts=1 means no contention; attempts>1 means at
+      # least one retry against a concurrent writer. Stacking by
+      # attempt-count bucket gives operators a distribution of
+      # writer-fight intensity per table over time.
+      {
+        type   = "log"
+        x      = 0
+        y      = 72
+        width  = 24
+        height = 6
+        properties = {
+          title  = "CAS attempts per compact (distribution — 1 = uncontended)"
+          region = var.region
+          query  = <<-EOQ
+            SOURCE '${aws_cloudwatch_log_group.janitor.name}'
+            | filter msg = "compact job completed"
+            | stats count() as compacts by attempts, bin(10m)
+          EOQ
+          view    = "timeSeries"
+          stacked = true
+        }
+      },
+
+      # === Row 14: Errors (always check last) ===
+      {
+        type   = "log"
+        x      = 0
+        y      = 78
         width  = 24
         height = 6
         properties = {
