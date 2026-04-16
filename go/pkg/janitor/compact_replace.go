@@ -559,7 +559,10 @@ func executeStitchAndCommit(
 		rowsWritten = 0
 
 		ctx, stitchSpan := tr.Start(ctx, "stitch_write_fallback")
-		stitchSpan.SetAttributes(observe.Files(len(oldPaths)))
+		stitchSpan.SetAttributes(
+			observe.Files(len(oldPaths)),
+			attribute.String("stitch.path", "pqarrow_fallback"),
+		)
 
 		pqProps := parquet.NewWriterProperties(parquet.WithStats(true))
 		pqWriter, perr := pqarrow.NewFileWriter(writeSchema, out, pqProps, pqarrow.DefaultWriterProps())
@@ -600,10 +603,21 @@ func executeStitchAndCommit(
 				if gctx2.Err() != nil {
 					return gctx2.Err()
 				}
-				batches, n, rerr := readParquetFileBatches(gctx2, fs, fpath, writeSchema, mem)
-				if rerr != nil {
-					return fmt.Errorf("copying %s: %w", fpath, rerr)
+				// One span per source file. Attributes: the file path
+				// (cheap string field already in hand) is gated behind
+				// IsRecording so the NoOp tracer stays allocation-free.
+				// Per-batch / per-row spans would blow the ±1% overhead
+				// budget — we deliberately stop here.
+				srcCtx, srcSpan := tr.Start(gctx2, "stitch_source_worker")
+				if srcSpan.IsRecording() {
+					srcSpan.SetAttributes(attribute.String("stitch.source_path", fpath))
 				}
+				defer srcSpan.End()
+				batches, n, rerr := readParquetFileBatches(srcCtx, fs, fpath, writeSchema, mem)
+				if rerr != nil {
+					return observe.RecordError(srcSpan, fmt.Errorf("copying %s: %w", fpath, rerr))
+				}
+				srcSpan.SetAttributes(observe.Rows(n))
 				// Apply V2 deletes if any. Position deletes are
 				// indexed by row offset within the source file, so
 				// we track a running offset across this source's
