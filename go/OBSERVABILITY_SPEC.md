@@ -98,18 +98,20 @@ overhead source is isolated and either fixed or deferred.
 
 ## Phasing
 
-| Phase | Scope | Risk | Bench gate |
-|---|---|---|---|
-| 1 | Attributes + `span.RecordError` on the 11 existing spans; log-enrichment on compact-completed (already merged as part of the observability-track branch) | Very low — zero new code paths, just annotations on existing ones | ±0.3% expected |
-| 2 | Span coverage for `pkg/maintenance` + `pkg/safety` + `pkg/catalog` | Low — new spans at call boundaries, no hot-loop instrumentation | ±0.5% expected |
-| 3 | HTTP + Lambda handler wrapping (`otelhttp.NewHandler`, `otellambda`) | Low — request-level, not per-op | ±0.2% expected |
-| 4 | Hot-path spans inside `stitch.go` + the per-source-file worker in `executeStitchAndCommit` | Medium — these are tight loops; use `span.IsRecording()` gating aggressively | ±0.8% expected; the one phase most likely to hit the 1% ceiling |
-| 5 | Metrics signal (OTel counters/histograms) alongside traces | Low — async + wait-free | ±0.2% expected |
-| 6 | `net/http/pprof` behind `--debug-addr` + docker-compose overlay for Jaeger/Tempo/Pyroscope dev stack | Zero — opt-in, disabled by default | 0% |
+| Phase | Scope | Risk | Bench gate | Status |
+|---|---|---|---|---|
+| 1 | Attributes + `span.RecordError` on the 11 existing spans; log-enrichment on compact-completed (already merged as part of the observability-track branch) | Very low — zero new code paths, just annotations on existing ones | ±0.3% expected | **Done** — `7d4beae` |
+| 2 | Span coverage for `pkg/maintenance` + `pkg/safety` + `pkg/catalog` | Low — new spans at call boundaries, no hot-loop instrumentation | ±0.5% expected | **Done** — `478f22d` |
+| 3 | HTTP request-span middleware (hand-written, no `otelhttp` dep); Lambda is N/A — `cmd/janitor-lambda` is a CLI-not-handler in this repo | Low — request-level, not per-op | ±0.2% expected | **Done** — `7cf2adb` |
+| 4 | Hot-path spans inside `stitch.go` + the per-source-file worker in `executeStitchAndCommit` | Medium — these are tight loops; use `span.IsRecording()` gating aggressively | ±0.8% expected; the one phase most likely to hit the 1% ceiling | **Done** — `7b6cf01` (microbench skipped — see phase-4 commit message) |
+| 5 | Metrics signal (OTel counters/histograms) alongside traces | Low — async + wait-free | ±0.2% expected | **Done** — `dfa0179` |
+| 6 | `net/http/pprof` behind `--debug-addr` + docker-compose overlay for Jaeger + Pyroscope + otel-collector dev stack | Zero — opt-in, disabled by default | 0% | **Done** — `b23accc` |
 
-Each phase is its own PR. Each PR carries its own bench rows in the
-body. The Phase 4 bench is the most important — it's where the
-1% ceiling is actually load-bearing.
+Each phase is its own commit on the `feature/observability-track`
+branch. The MinIO TPC-DS A/B bench gate (§Hot-path overhead) has
+NOT yet been run — that's the last open item, pending a dedicated
+bench window. The phased commit shape is deliberate so that if the
+bench surfaces a regression, bisection narrows it to one phase.
 
 ---
 

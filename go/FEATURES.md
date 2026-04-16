@@ -60,8 +60,10 @@ on the feature's main file gives the full history.
 | 24 | [Equality deletes on complex column types](#refused) | Refused (safety gate) | refusal in `feature/v2-deletes` (`d54e4bf`) | — |
 | 25 | [Pattern C (on-commit dispatcher)](#planned) | Planned | — | [#3](https://github.com/mystictraveler/iceberg-janitor/issues/3) |
 | 26 | [Adaptive feedback loop](#planned) | Planned (design plan #12) | — | — |
-| 27 | [pprof endpoint on janitor-server](#planned) | Planned | — | — |
+| 27 | [pprof endpoint on janitor-server](#observability) | Shipped (branch `feature/observability-track`) | `b23accc` | PR pending |
 | 28 | [q1 query latency outlier diagnosis](#planned) | Planned (open since Run 8) | — | — |
+| 29 | [OpenTelemetry tracing](#observability) | Shipped (branch `feature/observability-track`) | `7d4beae` phase 1; `478f22d` phase 2; `7cf2adb` phase 3; `7b6cf01` phase 4 | PR pending |
+| 30 | [OpenTelemetry metrics](#observability) | Shipped (branch `feature/observability-track`) | `dfa0179` | PR pending |
 
 ---
 
@@ -83,6 +85,7 @@ on the feature's main file gives the full history.
 - [Dry-run mode](#dry-run-mode)
 - [Glue registration](#glue-registration)
 - [Schema-evolution guard](#schema-evolution-guard)
+- [Observability](#observability)
 - [Refused (safety gates)](#refused)
 - [Planned](#planned)
 
@@ -497,6 +500,41 @@ an error.
 
 ---
 
+## Observability
+
+OpenTelemetry tracing + metrics + pprof. Lives on branch
+`feature/observability-track` until the MinIO TPC-DS bench gate
+(OBSERVABILITY_SPEC.md §Hot-path overhead, ±1% rule) is run. Default
+production posture: every signal is **off** — NoOp tracer, NoOp
+meter, no pprof listener. Operators opt in per signal at deploy
+time via env vars.
+
+| Signal | Default | How to turn on | Export destination |
+|---|---|---|---|
+| OTel tracing | off (NoOp tracer) | `JANITOR_TRACE=stdout` (pretty) or `stdout-compact` (smaller) | stderr; operators who need OTLP register their own `TracerProvider` before janitor startup |
+| OTel metrics | off (NoOp meter) | `JANITOR_METRICS=stdout` | stderr; `JANITOR_METRICS=otlp` is reserved — operators register their own `MeterProvider` to keep the OTLP/gRPC dep out of the default binary |
+| pprof | off (no listener) | `--debug-addr=127.0.0.1:6060` or `JANITOR_DEBUG_ADDR=...` | separate `http.Server`, no overlap with the public `/v1` surface |
+
+Instrument inventory (stable field names; dashboard contract):
+
+- Traces: `Compact`, `Expire`, `RewriteManifests`, `VerifyCompactionConsistency`, `compactOnce`, `manifest_walk`, `stitchParquetFiles`, `stitch_source`, `stitch_write_fallback`, `stitch_source_worker`, `master_check`, `cas_commit`, `load_table`, plus per-request `HTTP <method> <route>` spans
+- Counters: `janitor.compact.attempts` (tags: table/outcome/skip_reason), `janitor.compact.cb_trips` (tags: cb_id/table), `janitor.expire.attempts`, `janitor.rewrite_manifests.attempts`
+- Histograms: `janitor.compact.wall_ms`, `janitor.master_check.wall_ms`, `janitor.compact.cas_retries`, `janitor.compact.file_reduction_ratio`
+
+Dev stack: `go/test/mvp/docker-compose.dev.yml` overlays Jaeger,
+Pyroscope, and an otel-collector onto the base MinIO compose so a
+local run can see traces in Jaeger UI and profiles in Pyroscope
+without touching production infra.
+
+Hot-path protection: OBSERVABILITY_SPEC.md enforces a **±1% rule**
+on the MinIO TPC-DS A/B bench. Every recording site uses
+`span.IsRecording()` gating for any attribute that would cost an
+allocation even on the NoOp path (the source file path in the
+stitch workers, specifically). Per-row and per-row-group spans are
+deliberately skipped.
+
+---
+
 ## Refused
 
 Capabilities the janitor deliberately does not support, refused at the
@@ -531,7 +569,7 @@ Designed but not implemented. Each row links to its tracker.
 | **Master check I9** | Reserved invariant slot. Shape TBD. | — |
 | **Pattern C (on-commit dispatcher)** | External SQS-driven dispatcher with dequeue-time dedup; reacts to writer commits via S3 EventBridge. | [#3](https://github.com/mystictraveler/iceberg-janitor/issues/3) |
 | **Adaptive feedback loop** | Per-table convergence on the right compute tier based on history. Design plan #12. | — |
-| **pprof endpoint on `janitor-server`** | `net/http/pprof` behind a `--debug-addr` flag (default off). The parallelism-hang diagnosis required SIGQUIT because there was no other way to get Go stacks. | — |
+| **pprof endpoint on `janitor-server`** | Shipped on branch `feature/observability-track` — `net/http/pprof` behind `--debug-addr` / `JANITOR_DEBUG_ADDR`, default off. See the Observability section. | — |
 | **q1 query latency outlier diagnosis** | +32% on q1 since Run 8, never diagnosed. EXPLAIN ANALYZE pass needed. | — |
 | **Per-table maintain config override** | Earlier scoped, then cancelled by user ("classification logic is very advanced already"). Re-listed if a real workload demands it. | — |
 
