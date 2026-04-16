@@ -23,8 +23,10 @@ pkg/
   state/         persistent janitor state in object storage
 cmd/
   janitor-cli/    local CLI (analyze / maintain / inspect)
-  janitor-server/ Knative HTTP server adapter
-  janitor-lambda/ AWS Lambda handler adapter
+  janitor-server/ HTTP server — one container image, portable to
+                  Fargate / EKS / Cloud Run / Knative / Lambda (via
+                  AWS Lambda Web Adapter). Orchestrator choice is a
+                  deployment decision, not a binary decision.
 internal/
   metrics/  Prometheus exporter
   log/      slog setup
