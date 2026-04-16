@@ -663,7 +663,11 @@ func (s *server) runCompactJob(jobID string, ident icebergtable.Identifier, opts
 			)
 		}
 	} else {
-		s.logger.Info("compact job completed",
+		// Fields kept stable across releases — the CloudWatch
+		// dashboard (deploy/aws/terraform/dashboard.tf) queries them
+		// by name. When adding new fields, APPEND rather than
+		// rename/remove.
+		args := []any{
 			"job_id", jobID,
 			"table", fmt.Sprintf("%s.%s", ident[0], ident[1]),
 			"elapsed_ms", elapsed.Milliseconds(),
@@ -674,7 +678,29 @@ func (s *server) runCompactJob(jobID string, ident icebergtable.Identifier, opts
 			"before_bytes", result.BeforeBytes,
 			"after_bytes", result.AfterBytes,
 			"attempts", result.Attempts,
-		)
+			// Skipped-round telemetry (schema-evolution guard, etc).
+			// skipped=false for normal rounds; when skipped is true
+			// the reason is the discriminator the dashboard stacks
+			// by.
+			"skipped", result.Skipped,
+			"skipped_reason", result.SkippedReason,
+		}
+		if result.Verification != nil {
+			// Surface the master-check result so a dashboard can
+			// track pass/fail rate + per-invariant pass without a
+			// separate error-path log line.
+			args = append(args,
+				"master_overall", result.Verification.Overall,
+				"master_I1", result.Verification.I1RowCount.Result,
+				"master_I2", result.Verification.I2Schema.Result,
+				"master_I3", result.Verification.I3ValueCounts.Result,
+				"master_I4", result.Verification.I4NullCounts.Result,
+				"master_I5", result.Verification.I5Bounds.Result,
+				"master_I7", result.Verification.I7ManifestRefs.Result,
+				"dvs_applied", result.Verification.I1RowCount.DVs,
+			)
+		}
+		s.logger.Info("compact job completed", args...)
 	}
 }
 
