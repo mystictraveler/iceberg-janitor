@@ -18,37 +18,107 @@ No catalog service required. No managed control plane. No per-GB pricing.
 
 ## Architecture
 
-```
-                    Iceberg warehouse on object storage
-                    (S3, MinIO, GCS, Azure Blob, local file://)
+The janitor is one Go core (`pkg/janitor`) driven from three runtime
+tiers. Every maintenance call flows through the same pipeline: classify
+→ safety gate → manifest walk → stitch/merge → master check → CAS
+commit → circuit breakers. Everything persists on the warehouse bucket
+under a reserved `_janitor/` prefix — no external state store, no
+catalog service.
 
-                    <warehouse>/tpcds.db/store_sales/
-                    +-- data/        parquet files (written by any producer)
-                    +-- metadata/    metadata.json + manifest-list + manifests
-                    +-- _janitor/    lease files, job records, partition state
-                        +-- state/leases/<ns>.<table>/<op>.lease
-                        +-- state/jobs/<job_id>.json
-                        +-- state/<table_uuid>/partitions.json
-                                |
-                                | gocloud.dev/blob (s3, gs, azblob, file)
-                                |
-            +-------------------+--------------------+
-            |                                        |
-    janitor-server (ECS/Knative)          janitor-cli (operator tool)
-    POST /v1/tables/{ns}/{name}/maintain  janitor-cli compact <warehouse-url>
-    GET  /v1/jobs/{id}                    janitor-cli expire <warehouse-url>
-    |                                     janitor-cli analyze <warehouse-url>
-    | auto-classifies table on every call
-    | dispatches: hot / cold / full
-    |
-    pkg/janitor       compaction (byte-copy stitch + fallback pqarrow)
-    pkg/maintenance   expire + manifest rewrite
-    pkg/safety        master check (I1-I9) + circuit breaker (CB8)
-    pkg/lease         S3-backed cross-replica lock (If-None-Match CAS)
-    pkg/jobrecord     persistent async job records on warehouse bucket
-    pkg/analyzer      per-partition health assessment
-    pkg/strategy      workload classifier (streaming/batch/dormant)
-    pkg/catalog       directory catalog (LoadTable + atomic CommitTable)
+```
+  Producers (Spark Structured Streaming / Flink / Kafka Connect / iceberg-go / ...)
+                                    │
+                                    ▼
+ ┌───────────────────────────────────────────────────────────────────────────────┐
+ │  Iceberg warehouse on object storage   (S3 | MinIO | GCS | Azure | file://)  │
+ │  <warehouse>/<ns>.db/<table>/                                                 │
+ │    ├── data/              parquet data + V2 pos/eq delete files               │
+ │    ├── metadata/          v<N>.metadata.json, manifest-list, manifests        │
+ │    └── _janitor/          reserved prefix — all janitor state                 │
+ │         ├── state/<uuid>.json           TableState (CB2/CB7/CB8/CB9)          │
+ │         ├── state/<uuid>/partitions.json   per-partition bookkeeping          │
+ │         ├── state/leases/<ns>.<table>/<op>.lease   cross-replica CAS lock     │
+ │         ├── state/jobs/<job_id>.json    persistent async job records          │
+ │         ├── control/paused/<uuid>.json  CB-trip auto-pause markers            │
+ │         └── results/<run_id>.json       per-run outcome reports               │
+ └──────────────────────────────┬────────────────────────────────────────────────┘
+                                │  gocloud.dev/blob   (s3 | gs | azblob | file)
+                                │
+     ┌──────────────────────────┼──────────────────────────┐
+     ▼                          ▼                          ▼
+ ┌─────────────────┐  ┌───────────────────┐  ┌───────────────────────────────┐
+ │ janitor-server  │  │ janitor-lambda    │  │ janitor-cli                   │
+ │ Fargate/Knative │  │ AWS Lambda        │  │ local | SSM | container       │
+ │                 │  │ (one-shot)        │  │                               │
+ │ POST …/maintain │  │ handler wraps     │  │ compact │ expire │ rewrite-   │
+ │ POST …/compact  │  │ the same          │  │ manifests │ maintain │        │
+ │ POST …/expire   │  │ pkg/janitor core  │  │ analyze │ glue-register       │
+ │ POST …/rewrite  │  │                   │  │                               │
+ │ GET  /v1/jobs/… │  │                   │  │                               │
+ │ (?dry_run=true) │  │                   │  │                               │
+ └────────┬────────┘  └─────────┬─────────┘  └───────────────┬───────────────┘
+          │                     │                            │
+          └─────────────────────┴───── shared ───────────────┘
+                                │
+                                ▼
+ ┌───────────────────────────────────────────────────────────────────────────────┐
+ │                            pkg/janitor  core                                  │
+ │                                                                               │
+ │   1. CLASSIFY  pkg/strategy/classify                                          │
+ │      commit-rate windows → {streaming, batch, slow_changing, dormant}         │
+ │      per-class plan: hot vs cold, target size, parallelism                    │
+ │                                                                               │
+ │   2. SAFETY GATE  pkg/janitor/safety_guards.go                                │
+ │      refuse loudly: V3 deletion vectors, mixed partition spec-ids,            │
+ │      equality deletes on complex column types                                 │
+ │                                                                               │
+ │   3. MANIFEST WALK  pkg/janitor/compact_replace.go                            │
+ │      collect data files + V2 pos/eq delete refs  (partition-matched)          │
+ │      Pattern B: skip files ≥ target size  (skipped for delete entries)        │
+ │                                                                               │
+ │   4. EXECUTE  pkg/janitor/{compact,compact_hot,compact_cold}.go               │
+ │     ┌─────────────────────────────────────────────────────────────────┐       │
+ │     │  Phase 1: byte-copy stitch  pkg/janitor/stitch.go               │       │
+ │     │    parquet-go CopyRows — zero Arrow decode, zero CPU per row    │       │
+ │     │    skipped when V2 deletes apply                                │       │
+ │     │                                                                 │       │
+ │     │  Phase 2: decode/encode merge  pkg/janitor/merge_rowgroups.go   │       │
+ │     │    fires when: row_groups > 4  OR  sort order defined  OR       │       │
+ │     │                V2 deletes apply                                 │       │
+ │     │    apply row mask (pkg/janitor/deletes.go BuildRowMask)         │       │
+ │     │    sort rows by table's default sort order                      │       │
+ │     │    rewrite to 1 merged row group with fresh stats               │       │
+ │     └─────────────────────────────────────────────────────────────────┘       │
+ │                                                                               │
+ │   5. MASTER CHECK  pkg/safety/verify.go   (mandatory, non-bypassable)         │
+ │      I1 row count (w/ WithDeletedRows hint for V2 deletes)                    │
+ │      I2 schema identity   I3 per-column values   I4 per-column nulls          │
+ │      I5 bounds presence   I7 manifest refs exist   I8 file-set invariant      │
+ │                                                                               │
+ │   6. CAS COMMIT  pkg/catalog                                                  │
+ │      If-None-Match:*  (S3, Azure) | IfNotExist  (GCS)                         │
+ │      single snapshot per CompactHot call, all partitions batched              │
+ │                                                                               │
+ │   7. CIRCUIT BREAKERS  pkg/safety/circuitbreaker.go  (post-commit outcome)    │
+ │      CB2 loop  CB3 meta-ratio  CB4 no-effectiveness  CB7 daily byte budget    │
+ │      CB8 consecutive failures  CB9 lifetime rewrite ratio  CB10 recursion     │
+ │      CB11 low-ROI     — trips write pause file, next call refuses             │
+ │                                                                               │
+ │   Cross-replica:   pkg/lease (TTL'd CAS per op)                               │
+ │                    pkg/jobrecord (persistent async job state)                 │
+ │                                                                               │
+ │   Support:         pkg/catalog     directory catalog (LoadTable + CommitTable)│
+ │                    pkg/analyzer    per-partition health                       │
+ │                    pkg/maintenance expire + manifest rewrite + maintain orch. │
+ │                    pkg/observe     OpenTelemetry tracing                      │
+ │                    pkg/state       TableState / PauseFile / PartitionState    │
+ └───────────────────────────────────────────────────────────────────────────────┘
+
+              ┌─────────────────────────────┐
+  optional →  │  AWS Glue (for Athena/EMR)  │ ← janitor-cli glue-register, or
+              └─────────────────────────────┘     metadata_location returned in
+                                                   server job result for external
+                                                   registration (sandbox NACL fix)
 ```
 
 ### Key design choices
