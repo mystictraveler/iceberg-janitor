@@ -18,6 +18,7 @@ import (
 
 	"github.com/mystictraveler/iceberg-janitor/go/pkg/catalog"
 	"github.com/mystictraveler/iceberg-janitor/go/pkg/janitor"
+	"github.com/mystictraveler/iceberg-janitor/go/pkg/observe"
 	"github.com/mystictraveler/iceberg-janitor/go/pkg/safety"
 )
 
@@ -140,6 +141,14 @@ type RewriteManifestsResult struct {
 // RewriteManifests is the public entry point. Same retry/CB shape as
 // janitor.Compact and maintenance.Expire.
 func RewriteManifests(ctx context.Context, cat *catalog.DirectoryCatalog, ident icebergtable.Identifier, opts RewriteManifestsOptions) (*RewriteManifestsResult, error) {
+	tr := observe.Tracer("janitor.rewrite_manifests")
+	ctx, span := tr.Start(ctx, "RewriteManifests")
+	span.SetAttributes(
+		observe.Table(ident[0], ident[1]),
+		observe.Operation("rewrite-manifests"),
+	)
+	defer span.End()
+
 	opts.defaults()
 	started := time.Now()
 	result := &RewriteManifestsResult{Identifier: ident}
@@ -192,9 +201,15 @@ func RewriteManifests(ctx context.Context, cat *catalog.DirectoryCatalog, ident 
 		}
 	}
 
+	span.SetAttributes(
+		observe.Attempt(result.Attempts),
+		observe.DurationMs(result.DurationMs),
+	)
 	if runErr != nil {
-		return result, runErr
+		span.SetAttributes(observe.Result("fail"))
+		return result, observe.RecordError(span, runErr)
 	}
+	span.SetAttributes(observe.Result("pass"))
 	return result, nil
 }
 
@@ -211,6 +226,11 @@ func RewriteManifests(ctx context.Context, cat *catalog.DirectoryCatalog, ident 
 // write of the next-version metadata.json that the transaction path
 // would. The CAS retry contract is identical.
 func rewriteManifestsOnce(ctx context.Context, cat *catalog.DirectoryCatalog, ident icebergtable.Identifier, opts RewriteManifestsOptions, result *RewriteManifestsResult) error {
+	tr := observe.Tracer("janitor.rewrite_manifests")
+	ctx, span := tr.Start(ctx, "rewriteManifestsOnce")
+	span.SetAttributes(observe.Attempt(result.Attempts))
+	defer span.End()
+
 	tbl, err := cat.LoadTable(ctx, ident)
 	if err != nil {
 		return fmt.Errorf("loading table %v: %w", ident, err)

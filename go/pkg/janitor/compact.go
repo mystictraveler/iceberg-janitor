@@ -285,7 +285,10 @@ type CompactResult struct {
 func Compact(ctx context.Context, cat *catalog.DirectoryCatalog, ident icebergtable.Identifier, opts CompactOptions) (*CompactResult, error) {
 	tr := observe.Tracer("janitor.compact")
 	ctx, span := tr.Start(ctx, "Compact")
-	span.SetAttributes(observe.Table(ident[0], ident[1]))
+	span.SetAttributes(
+		observe.Table(ident[0], ident[1]),
+		observe.Operation("compact"),
+	)
 	defer span.End()
 
 	opts.defaults()
@@ -361,6 +364,23 @@ func Compact(ctx context.Context, cat *catalog.DirectoryCatalog, ident icebergta
 		}
 		// If runErr != nil we deliberately drop recordErr; the
 		// underlying compaction failure is the actionable signal.
+	}
+
+	// Annotate the span with the transition + outcome. No-op on the
+	// default NoOp tracer — costless when nobody's collecting spans.
+	span.SetAttributes(observe.FilesBeforeAfter(result.BeforeFiles, result.AfterFiles)...)
+	span.SetAttributes(observe.RowsBeforeAfter(result.BeforeRows, result.AfterRows, 0)...)
+	span.SetAttributes(
+		observe.Attempt(result.Attempts),
+		observe.DurationMs(result.DurationMs),
+	)
+	if result.Skipped {
+		span.SetAttributes(observe.SkippedReason(result.SkippedReason), observe.Result("skip"))
+	} else if runErr != nil {
+		span.SetAttributes(observe.Result("fail"))
+		return result, observe.RecordError(span, runErr)
+	} else {
+		span.SetAttributes(observe.Result("pass"))
 	}
 
 	if runErr != nil {

@@ -28,6 +28,7 @@ import (
 
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
 	"go.opentelemetry.io/otel/exporters/stdout/stdouttrace"
 	"go.opentelemetry.io/otel/sdk/resource"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
@@ -130,4 +131,63 @@ func Manifests(n int) attribute.KeyValue {
 
 func DurationMs(ms int64) attribute.KeyValue {
 	return attribute.Int64("duration_ms", ms)
+}
+
+// Operation tags the span with the maintenance operation name
+// ("compact" / "expire" / "rewrite-manifests" / "maintain").
+func Operation(name string) attribute.KeyValue {
+	return attribute.String("janitor.op", name)
+}
+
+// FilesBeforeAfter captures the file-count transition.
+func FilesBeforeAfter(before, after int) []attribute.KeyValue {
+	return []attribute.KeyValue{
+		attribute.Int("iceberg.files.before", before),
+		attribute.Int("iceberg.files.after", after),
+	}
+}
+
+// RowsBeforeAfter captures the row-count transition. When V2 deletes
+// applied, `deleted` is non-zero and before−deleted==after is the I1
+// invariant verified by the master check.
+func RowsBeforeAfter(before, after, deleted int64) []attribute.KeyValue {
+	return []attribute.KeyValue{
+		attribute.Int64("iceberg.rows.before", before),
+		attribute.Int64("iceberg.rows.after", after),
+		attribute.Int64("iceberg.rows.deleted", deleted),
+	}
+}
+
+// SkippedReason tags a span with the skip reason ("mixed_schemas" etc).
+func SkippedReason(reason string) attribute.KeyValue {
+	return attribute.String("janitor.skipped_reason", reason)
+}
+
+// Result tags a span with its outcome ("pass" / "fail" / "skip").
+// Separate from span.SetStatus (reserved for error flow).
+func Result(r string) attribute.KeyValue {
+	return attribute.String("janitor.result", r)
+}
+
+// Partition is a partition-key tag for per-partition spans.
+func Partition(key string) attribute.KeyValue {
+	return attribute.String("iceberg.partition", key)
+}
+
+// Invariant tags master-check sub-spans with the I-number they test.
+func Invariant(id string) attribute.KeyValue {
+	return attribute.String("master_check.invariant", id)
+}
+
+// RecordError applies span.RecordError + SetStatus(Error) in one
+// call. Cost-free on the no-op tracer (which is the production
+// default — see the package doc). Returns err unchanged so callers
+// can chain `return observe.RecordError(span, err)`.
+func RecordError(span trace.Span, err error) error {
+	if span == nil || err == nil {
+		return err
+	}
+	span.RecordError(err)
+	span.SetStatus(codes.Error, err.Error())
+	return err
 }
