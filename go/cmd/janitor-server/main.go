@@ -29,9 +29,16 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"flag"
 	"fmt"
 	"log/slog"
 	"net/http"
+	// net/http/pprof registers /debug/pprof/* handlers onto
+	// http.DefaultServeMux when imported. We scope it to a separate
+	// mux in runDebugServer below so the main /v1 handler tree does
+	// NOT inherit pprof — a pprof endpoint on the public listener
+	// would be a footgun for deployments without an auth layer.
+	_ "net/http/pprof"
 	"os"
 	"os/signal"
 	"strings"
@@ -52,6 +59,15 @@ import (
 )
 
 func main() {
+	// --debug-addr is intentionally closed by default. When set (via
+	// flag or JANITOR_DEBUG_ADDR env), a second http.Server starts on
+	// that address with net/http/pprof handlers registered. The public
+	// :8080 listener never exposes /debug/pprof — that separation is
+	// the whole point of the flag.
+	debugAddr := flag.String("debug-addr", os.Getenv("JANITOR_DEBUG_ADDR"),
+		"optional pprof listen address (e.g. 127.0.0.1:6060). Empty = no pprof listener (production default).")
+	flag.Parse()
+
 	logger := slog.New(slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
 	slog.SetDefault(logger)
 
@@ -117,6 +133,28 @@ func main() {
 		ReadHeaderTimeout: 10 * time.Second,
 	}
 
+	// Optional pprof listener on a separate mux + separate port.
+	// Only registered handlers are net/http/pprof's /debug/pprof/*
+	// (registered on http.DefaultServeMux via the blank import).
+	// We mount DefaultServeMux here — nothing else in this binary
+	// registers on DefaultServeMux, so the debug server's surface
+	// is exactly the pprof handlers. A nil *http.Server is fine;
+	// we just never start it.
+	var debugServer *http.Server
+	if *debugAddr != "" {
+		debugServer = &http.Server{
+			Addr:              *debugAddr,
+			Handler:           http.DefaultServeMux,
+			ReadHeaderTimeout: 10 * time.Second,
+		}
+		go func() {
+			logger.Info("pprof debug listener started", "addr", *debugAddr)
+			if err := debugServer.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+				logger.Error("debug listen failed", "err", err)
+			}
+		}()
+	}
+
 	go func() {
 		logger.Info("janitor-server listening", "addr", listen, "warehouse", warehouseURL)
 		if err := httpServer.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
@@ -131,6 +169,11 @@ func main() {
 	defer shutdownCancel()
 	if err := httpServer.Shutdown(shutdownCtx); err != nil {
 		logger.Error("graceful shutdown error", "err", err)
+	}
+	if debugServer != nil {
+		// Best-effort. The debug listener is operator-only; failures
+		// here do not matter for correctness and are only logged.
+		_ = debugServer.Shutdown(shutdownCtx)
 	}
 	logger.Info("shutdown complete")
 }
