@@ -11,7 +11,10 @@ import (
 	"github.com/parquet-go/parquet-go"
 	"github.com/parquet-go/parquet-go/encoding/thrift"
 	"github.com/parquet-go/parquet-go/format"
+	"go.opentelemetry.io/otel/attribute"
 	"golang.org/x/sync/errgroup"
+
+	"github.com/mystictraveler/iceberg-janitor/go/pkg/observe"
 )
 
 // stitchParquetFiles is the **stitching binpack v2** compaction
@@ -71,6 +74,27 @@ func stitchParquetFiles(ctx context.Context, fs icebergio.IO, srcPaths []string,
 	if len(srcPaths) == 0 {
 		return 0, nil
 	}
+
+	// Single span for the overall stitch. Per-source spans live
+	// inside the row-group loop below. Neither the outer nor the
+	// per-source spans instrument the per-row-group or per-column-
+	// chunk inner loops — that would blow the ±1% overhead budget
+	// in OBSERVABILITY_SPEC.md. The set of attributes is deliberately
+	// kept to ints and short strings that cost nothing to compute;
+	// anything more is gated behind span.IsRecording().
+	tr := observe.Tracer("janitor.stitch")
+	ctx, span := tr.Start(ctx, "stitchParquetFiles")
+	span.SetAttributes(
+		observe.Files(len(srcPaths)),
+		attribute.String("stitch.path", "byte_copy"),
+	)
+	defer func() {
+		span.SetAttributes(observe.Rows(rowsWritten))
+		if err != nil {
+			observe.RecordError(span, err)
+		}
+		span.End()
+	}()
 
 	// Open all source files first. We need access to each one's
 	// io.ReaderAt for the byte copy in step 4. icebergio.File already
@@ -160,11 +184,28 @@ func stitchParquetFiles(ctx context.Context, fs icebergio.IO, srcPaths []string,
 
 	// Step 4 + 5: copy column chunks for each row group of each
 	// source, building the output's RowGroups slice as we go.
-	for _, src := range sources {
-		if cerr := ctx.Err(); cerr != nil {
-			return rowsWritten, cerr
-		}
+	//
+	// stitchOneSource is a closure so the per-source span End() is
+	// deferred and fires on every return path (including the inner
+	// error returns). No per-row-group or per-column-chunk spans —
+	// those fire 10s of thousands of times and would dominate the
+	// overhead budget in OBSERVABILITY_SPEC.md §Hot-path overhead.
+	stitchOneSource := func(src srcEntry) error {
+		_, srcSpan := tr.Start(ctx, "stitch_source")
 		srcMeta := src.file.Metadata()
+		// Attributes are all ints / int64s already in hand, no
+		// allocation or serialization cost even when the real SDK
+		// is recording. The source path — a string that the SDK
+		// would intern — is gated behind IsRecording so NoOp stays
+		// allocation-free.
+		srcSpan.SetAttributes(
+			attribute.Int("stitch.row_groups", len(srcMeta.RowGroups)),
+			attribute.Int64("stitch.source_size", src.size),
+		)
+		if srcSpan.IsRecording() {
+			srcSpan.SetAttributes(attribute.String("stitch.source_path", src.path))
+		}
+		defer srcSpan.End()
 		for rgIdx := range srcMeta.RowGroups {
 			srcRG := &srcMeta.RowGroups[rgIdx]
 			outRG := format.RowGroup{
@@ -195,23 +236,23 @@ func stitchParquetFiles(ctx context.Context, fs icebergio.IO, srcPaths []string,
 				}
 				length := srcMD.TotalCompressedSize
 				if length <= 0 {
-					return rowsWritten, fmt.Errorf("source %s row group %d column %d has non-positive TotalCompressedSize=%d", src.path, rgIdx, colIdx, length)
+					return fmt.Errorf("source %s row group %d column %d has non-positive TotalCompressedSize=%d", src.path, rgIdx, colIdx, length)
 				}
 
 				// Read the page bytes from the source.
 				buf := make([]byte, length)
 				n, rerr := src.readerAt.ReadAt(buf, srcStart)
 				if rerr != nil && rerr != io.EOF {
-					return rowsWritten, fmt.Errorf("reading source %s column chunk [rg=%d col=%d off=%d len=%d]: %w", src.path, rgIdx, colIdx, srcStart, length, rerr)
+					return fmt.Errorf("reading source %s column chunk [rg=%d col=%d off=%d len=%d]: %w", src.path, rgIdx, colIdx, srcStart, length, rerr)
 				}
 				if int64(n) != length {
-					return rowsWritten, fmt.Errorf("short read for source %s column chunk: got %d want %d", src.path, n, length)
+					return fmt.Errorf("short read for source %s column chunk: got %d want %d", src.path, n, length)
 				}
 
 				// Write to the output and remember the new offset.
 				newStart := wc.offset
 				if _, werr := wc.Write(buf); werr != nil {
-					return rowsWritten, fmt.Errorf("writing column chunk to output: %w", werr)
+					return fmt.Errorf("writing column chunk to output: %w", werr)
 				}
 
 				// Build the new column chunk metadata. Translate
@@ -288,6 +329,16 @@ func stitchParquetFiles(ctx context.Context, fs icebergio.IO, srcPaths []string,
 			outMeta.RowGroups = append(outMeta.RowGroups, outRG)
 			outMeta.NumRows += srcRG.NumRows
 			rowsWritten += srcRG.NumRows
+		}
+		return nil
+	}
+
+	for _, src := range sources {
+		if cerr := ctx.Err(); cerr != nil {
+			return rowsWritten, cerr
+		}
+		if err := stitchOneSource(src); err != nil {
+			return rowsWritten, err
 		}
 	}
 
