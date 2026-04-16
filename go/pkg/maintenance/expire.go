@@ -9,6 +9,7 @@ import (
 
 	"github.com/mystictraveler/iceberg-janitor/go/pkg/catalog"
 	"github.com/mystictraveler/iceberg-janitor/go/pkg/janitor"
+	"github.com/mystictraveler/iceberg-janitor/go/pkg/observe"
 	"github.com/mystictraveler/iceberg-janitor/go/pkg/safety"
 )
 
@@ -161,6 +162,14 @@ type ExpireResult struct {
 // because expire is cheap to redo and the only races we can hit are
 // foreign-writer commits between our load and our commit.
 func Expire(ctx context.Context, cat *catalog.DirectoryCatalog, ident icebergtable.Identifier, opts ExpireOptions) (*ExpireResult, error) {
+	tr := observe.Tracer("janitor.expire")
+	ctx, span := tr.Start(ctx, "Expire")
+	span.SetAttributes(
+		observe.Table(ident[0], ident[1]),
+		observe.Operation("expire"),
+	)
+	defer span.End()
+
 	opts.defaults()
 	started := time.Now()
 	result := &ExpireResult{Identifier: ident}
@@ -214,9 +223,15 @@ func Expire(ctx context.Context, cat *catalog.DirectoryCatalog, ident icebergtab
 		}
 	}
 
+	span.SetAttributes(
+		observe.Attempt(result.Attempts),
+		observe.DurationMs(result.DurationMs),
+	)
 	if runErr != nil {
-		return result, runErr
+		span.SetAttributes(observe.Result("fail"))
+		return result, observe.RecordError(span, runErr)
 	}
+	span.SetAttributes(observe.Result("pass"))
 	return result, nil
 }
 
@@ -224,6 +239,11 @@ func Expire(ctx context.Context, cat *catalog.DirectoryCatalog, ident icebergtab
 // "before" state, stages the ExpireSnapshots update, runs the master
 // check, and commits.
 func expireOnce(ctx context.Context, cat *catalog.DirectoryCatalog, ident icebergtable.Identifier, opts ExpireOptions, result *ExpireResult) error {
+	tr := observe.Tracer("janitor.expire")
+	ctx, span := tr.Start(ctx, "expireOnce")
+	span.SetAttributes(observe.Attempt(result.Attempts))
+	defer span.End()
+
 	tbl, err := cat.LoadTable(ctx, ident)
 	if err != nil {
 		return fmt.Errorf("loading table %v: %w", ident, err)

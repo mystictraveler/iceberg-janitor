@@ -18,6 +18,8 @@ import (
 	icebergio "github.com/apache/iceberg-go/io"
 	icebergtable "github.com/apache/iceberg-go/table"
 	"golang.org/x/sync/errgroup"
+
+	"github.com/mystictraveler/iceberg-janitor/go/pkg/observe"
 )
 
 // Verification is the structured result of running the master check on a
@@ -127,6 +129,10 @@ type verifyCfg struct {
 }
 
 func VerifyCompactionConsistency(ctx context.Context, before *icebergtable.Table, staged *icebergtable.StagedTable, props map[string]string, opts ...VerifyOption) (*Verification, error) {
+	tr := observe.Tracer("janitor.safety")
+	ctx, span := tr.Start(ctx, "VerifyCompactionConsistency")
+	defer span.End()
+
 	cfg := verifyCfg{}
 	for _, o := range opts {
 		o(&cfg)
@@ -276,6 +282,10 @@ func VerifyCompactionConsistency(ctx context.Context, before *icebergtable.Table
 	}
 	v.I7ManifestRefs.Result = "pass"
 
+	span.SetAttributes(
+		observe.Result("pass"),
+		observe.Rows(v.I1RowCount.Out),
+	)
 	v.Overall = "pass"
 	return v, nil
 }

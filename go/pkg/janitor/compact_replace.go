@@ -121,10 +121,12 @@ func compactOnce(ctx context.Context, cat *catalog.DirectoryCatalog, ident icebe
 
 	ctx, loadSpan := tr.Start(ctx, "load_table")
 	tbl, err := cat.LoadTable(ctx, ident)
-	loadSpan.End()
 	if err != nil {
-		return fmt.Errorf("loading table %v: %w", ident, err)
+		observe.RecordError(loadSpan, err)
+		loadSpan.End()
+		return observe.RecordError(span, fmt.Errorf("loading table %v: %w", ident, err))
 	}
+	loadSpan.End()
 
 	if opts.PartitionTuple != nil {
 		if spec := tbl.Spec(); spec.NumFields() == 0 {
