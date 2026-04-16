@@ -227,10 +227,16 @@ func Expire(ctx context.Context, cat *catalog.DirectoryCatalog, ident icebergtab
 		observe.Attempt(result.Attempts),
 		observe.DurationMs(result.DurationMs),
 	)
+
+	// Metrics: one counter bump per Expire call. NoOp in production
+	// unless JANITOR_METRICS is set (see pkg/observe/metrics.go).
+	tableTag := ident[0] + "." + ident[1]
 	if runErr != nil {
+		observe.RecordExpireOutcome(ctx, tableTag, "fail")
 		span.SetAttributes(observe.Result("fail"))
 		return result, observe.RecordError(span, runErr)
 	}
+	observe.RecordExpireOutcome(ctx, tableTag, "pass")
 	span.SetAttributes(observe.Result("pass"))
 	return result, nil
 }

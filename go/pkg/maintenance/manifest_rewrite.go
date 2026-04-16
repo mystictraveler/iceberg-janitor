@@ -205,10 +205,15 @@ func RewriteManifests(ctx context.Context, cat *catalog.DirectoryCatalog, ident 
 		observe.Attempt(result.Attempts),
 		observe.DurationMs(result.DurationMs),
 	)
+
+	// Metrics: one counter bump per RewriteManifests call.
+	tableTag := ident[0] + "." + ident[1]
 	if runErr != nil {
+		observe.RecordRewriteManifestsOutcome(ctx, tableTag, "fail")
 		span.SetAttributes(observe.Result("fail"))
 		return result, observe.RecordError(span, runErr)
 	}
+	observe.RecordRewriteManifestsOutcome(ctx, tableTag, "pass")
 	span.SetAttributes(observe.Result("pass"))
 	return result, nil
 }

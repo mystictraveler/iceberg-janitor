@@ -374,6 +374,25 @@ func Compact(ctx context.Context, cat *catalog.DirectoryCatalog, ident icebergta
 		observe.Attempt(result.Attempts),
 		observe.DurationMs(result.DurationMs),
 	)
+
+	// Metrics signal. One Counter.Add + one or two Histogram.Record
+	// per Compact call, independent of the per-file worker hot path.
+	// NoOp meter provider (production default) makes the recording
+	// effectively free — see pkg/observe/metrics.go for the
+	// rationale.
+	tableTag := ident[0] + "." + ident[1]
+	var outcome string
+	switch {
+	case result.Skipped:
+		outcome = "skip"
+	case runErr != nil:
+		outcome = "fail"
+	default:
+		outcome = "pass"
+	}
+	observe.RecordCompactOutcome(ctx, tableTag, outcome, result.SkippedReason,
+		result.DurationMs, result.Attempts, result.BeforeFiles, result.AfterFiles)
+
 	if result.Skipped {
 		span.SetAttributes(observe.SkippedReason(result.SkippedReason), observe.Result("skip"))
 	} else if runErr != nil {

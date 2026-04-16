@@ -10,6 +10,7 @@ import (
 
 	"gocloud.dev/blob"
 
+	"github.com/mystictraveler/iceberg-janitor/go/pkg/observe"
 	"github.com/mystictraveler/iceberg-janitor/go/pkg/state"
 )
 
@@ -213,6 +214,10 @@ func (cb *CircuitBreaker) RecordOutcome(ctx context.Context, tableUUID string, r
 		if err := state.SavePause(ctx, cb.Bucket, pause); err != nil {
 			return fmt.Errorf("circuit breaker: save pause: %w", err)
 		}
+		// Metric: one counter bump per CB trip. Tag by cb_id so
+		// operators can chart the CB8 rate separately from the
+		// CB2 / CB3 / CB9 rates wired in RecordCompactOutcome.
+		observe.RecordCBTrip(ctx, "CB8", tableUUID)
 	}
 	return nil
 }
@@ -456,18 +461,21 @@ func (cb *CircuitBreaker) RecordCompactOutcome(ctx context.Context, tableUUID st
 	if outcome.Err != nil && s.ConsecutiveFailedRuns >= cb.threshold() {
 		fatalReasons = append(fatalReasons, fmt.Sprintf("cb8_consecutive_failure: %d consecutive failed runs", s.ConsecutiveFailedRuns))
 		cost.ChecksFired++
+		observe.RecordCBTrip(ctx, "CB8", tableUUID)
 	}
 
 	// CB2 (fatal): loop detection — feedback loop with external writer.
 	if reason := cb.checkCB2(s, outcome); reason != "" {
 		fatalReasons = append(fatalReasons, reason)
 		cost.ChecksFired++
+		observe.RecordCBTrip(ctx, "CB2", tableUUID)
 	}
 
 	// CB3: metadata ratio. Pause threshold (50%) is fatal; warn/critical are soft.
 	if warn, pauseReason := cb.checkCB3(outcome); pauseReason != "" {
 		fatalReasons = append(fatalReasons, pauseReason)
 		cost.ChecksFired++
+		observe.RecordCBTrip(ctx, "CB3", tableUUID)
 	} else if warn != "" {
 		softReasons = append(softReasons, warn)
 		cost.ChecksFired++
@@ -477,24 +485,28 @@ func (cb *CircuitBreaker) RecordCompactOutcome(ctx context.Context, tableUUID st
 	if reason := cb.checkCB4(outcome); reason != "" {
 		softReasons = append(softReasons, reason)
 		cost.ChecksFired++
+		observe.RecordCBTrip(ctx, "CB4", tableUUID)
 	}
 
 	// CB7 (soft): daily budget exceeded — skip, resets tomorrow.
 	if reason := cb.checkCB7(s, outcome); reason != "" {
 		softReasons = append(softReasons, reason)
 		cost.ChecksFired++
+		observe.RecordCBTrip(ctx, "CB7", tableUUID)
 	}
 
 	// CB9 (fatal): lifetime rewrite ratio — misconfigured aggressive compaction.
 	if reason := cb.checkCB9(s, outcome); reason != "" {
 		fatalReasons = append(fatalReasons, reason)
 		cost.ChecksFired++
+		observe.RecordCBTrip(ctx, "CB9", tableUUID)
 	}
 
 	// CB11 (soft): low ROI — skip, more files may accumulate to improve ROI.
 	if reason := cb.checkCB11(outcome); reason != "" {
 		softReasons = append(softReasons, reason)
 		cost.ChecksFired++
+		observe.RecordCBTrip(ctx, "CB11", tableUUID)
 	}
 
 	cost.EvalChecksMs = time.Since(evalStart).Milliseconds()
