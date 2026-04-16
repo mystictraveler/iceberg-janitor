@@ -118,7 +118,7 @@ We do NOT add:
 What we DO add (compared to today's polling janitor):
 
 1. **`pkg/janitor/oncommit/`** — a small package per cloud event source (`s3events.go`, `gcsevents.go`, `azureevents.go`, `kafka.go`) that parses the cloud-specific event payload into a normalized `CommitEvent{warehouse, table, snapshot_id, timestamp}` shape
-2. **`cmd/janitor-lambda`** is already designed to be event-triggered (Phase 4); the Lambda handler routes S3 EventBridge events to `oncommit.HandleS3Event` which produces a `CommitEvent` and dispatches into `pkg/janitor.OnCommit`
+2. **Event-triggered dispatch runs the same container image.** The janitor is one HTTP binary packaged as one container image; running it under AWS Lambda Web Adapter (or an API Gateway proxy) lets S3 EventBridge events invoke the existing `/v1/tables/.../maintain` endpoint. No separate Lambda binary, no separate handler code — `oncommit.HandleS3Event` parses the cloud event, produces a `CommitEvent`, and dispatches into `pkg/janitor.OnCommit` via the same HTTP route the polling path uses.
 3. **`pkg/janitor.OnCommit(ctx, evt) → Decision`** — the dispatcher. Reads `_janitor/state/<table>.json`, checks the workload class, evaluates the per-class trigger, and either runs `Compact` with a scoped `CompactionRequest` or returns "skip, not yet" cheaply
 4. **Per-cloud event-bus wiring** in the deployment artifacts (one-time setup; documented in the runbook)
 
@@ -161,7 +161,7 @@ This covers the vast majority of real-world Iceberg deployments.
 
 ## How it composes with the rest of the design
 
-The middle path is **not a separate runtime or a separate deployment.** It's a different trigger plumbed into the existing serverless adapters (`cmd/janitor-server`, `cmd/janitor-lambda`, `cmd/janitor-task`). Specifically:
+The middle path is **not a separate runtime or a separate deployment.** It's a different trigger plumbed into the existing `cmd/janitor-server` HTTP surface. The same container image runs on Fargate, Cloud Run, Knative, or Lambda (via AWS Lambda Web Adapter) — the cloud event bus invokes the same `/v1/tables/.../maintain` route the polling loop uses. Specifically:
 
 - **Same `pkg/janitor.Compact`** — the compaction code path is unchanged. The CLI, the polling cron, and the on-commit handler all call into the same function.
 - **Same `pkg/safety.VerifyCompactionConsistency`** — the master check runs identically on every commit, regardless of whether the trigger was a polling tick or a commit event.
@@ -218,7 +218,7 @@ This document is a **design proposal**, not yet shipped. The work-ahead list:
 2. Land the per-class trigger thresholds and `WRITE_BUFFER_SECONDS` knob
 3. Implement `pkg/janitor/oncommit/` event subscribers (one file per cloud)
 4. Implement `pkg/janitor.OnCommit(ctx, evt)` dispatcher
-5. Wire `cmd/janitor-lambda` to the S3 EventBridge event format (Phase 4)
+5. Wire the event bus to `cmd/janitor-server`'s `/v1/tables/.../maintain` endpoint. For AWS, that's EventBridge → Lambda-Web-Adapter-wrapped container → HTTP route; for GCS, Pub/Sub → Cloud Run; for Azure, Event Grid → Container Apps. One container image, cloud-specific event plumbing.
 6. Add per-cloud event-bus deployment artifacts (Terraform / SAM / Bicep)
 7. Document the operator runbook in `go/test/mvp/MVP.md` for the local fileblob equivalent (file system watcher) and the MinIO equivalent (MinIO event notifications via webhook → curl)
 

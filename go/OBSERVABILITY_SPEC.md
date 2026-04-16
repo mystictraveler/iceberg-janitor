@@ -13,8 +13,9 @@ more than 1%.**
 1. **Tracing** — OpenTelemetry spans covering every public entry
    point in `pkg/janitor`, `pkg/maintenance`, `pkg/safety`,
    `pkg/catalog`, `pkg/lease`, `pkg/jobrecord`, `pkg/analyzer`, plus
-   the HTTP handler mux in `cmd/janitor-server` and the Lambda
-   handler in `cmd/janitor-lambda`.
+   the HTTP handler mux in `cmd/janitor-server`. Lambda deployment
+   reuses the same container image behind AWS Lambda Web Adapter, so
+   there's no separate Lambda handler to instrument.
 2. **Structured logs** — slog-based, JSON output, stable field names
    the CloudWatch dashboard (and future Grafana/Loki setups) can
    query. Every feature that ships must extend the compact/expire/
@@ -102,7 +103,7 @@ overhead source is isolated and either fixed or deferred.
 |---|---|---|---|---|
 | 1 | Attributes + `span.RecordError` on the 11 existing spans; log-enrichment on compact-completed (already merged as part of the observability-track branch) | Very low — zero new code paths, just annotations on existing ones | ±0.3% expected | **Done** — `7d4beae` |
 | 2 | Span coverage for `pkg/maintenance` + `pkg/safety` + `pkg/catalog` | Low — new spans at call boundaries, no hot-loop instrumentation | ±0.5% expected | **Done** — `478f22d` |
-| 3 | HTTP request-span middleware (hand-written, no `otelhttp` dep); Lambda is N/A — `cmd/janitor-lambda` is a CLI-not-handler in this repo | Low — request-level, not per-op | ±0.2% expected | **Done** — `7cf2adb` |
+| 3 | HTTP request-span middleware (hand-written, no `otelhttp` dep). Lambda invocations hit the same HTTP middleware via AWS Lambda Web Adapter — one container, one middleware. | Low — request-level, not per-op | ±0.2% expected | **Done** — `7cf2adb` |
 | 4 | Hot-path spans inside `stitch.go` + the per-source-file worker in `executeStitchAndCommit` | Medium — these are tight loops; use `span.IsRecording()` gating aggressively | ±0.8% expected; the one phase most likely to hit the 1% ceiling | **Done** — `7b6cf01` (microbench skipped — see phase-4 commit message) |
 | 5 | Metrics signal (OTel counters/histograms) alongside traces | Low — async + wait-free | ±0.2% expected | **Done** — `dfa0179` |
 | 6 | `net/http/pprof` behind `--debug-addr` + docker-compose overlay for Jaeger + Pyroscope + otel-collector dev stack | Zero — opt-in, disabled by default | 0% | **Done** — `b23accc` |

@@ -1,7 +1,9 @@
 // Command janitor-server is the HTTP adapter for the janitor's
 // pkg/janitor.Core entry points. Same code path as cmd/janitor-cli
-// (in-process mode) and the planned cmd/janitor-lambda — three thin
-// wrappers around one shared core.
+// (in-process mode) — two thin wrappers around one shared core. The
+// same container image runs under Fargate / EKS / Cloud Run /
+// Knative / Lambda-via-AWS-Lambda-Web-Adapter; orchestrator choice
+// is a deployment-layer decision, not a binary decision.
 //
 // MVP scope: discover, analyze, and compact endpoints, plus
 // /v1/healthz and /v1/readyz. Auth is delegated to the deployment

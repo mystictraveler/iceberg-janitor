@@ -47,7 +47,7 @@ on the feature's main file gives the full history.
 | 12 | [Workload classification (4-class)](#workload-classification) | Shipped | `1ff841c` | — |
 | 13 | [Async job API + persistent records](#async-job-api) | Shipped | `8971543` async job API; `70df322` persistent records (Phase 2); `e2ce521` wired into jobStore (Phase 3) | — |
 | 14 | [Per-table in-flight dedup (lease)](#per-table-in-flight-dedup) | Shipped | `09de93d` lease primitive (Phase 1); `e2ce521` wired (Phase 3); `642fcf1` in-flight guard fix | — |
-| 15 | [Three runtime tiers (server / lambda / cli)](#three-runtime-tiers) | Shipped | `f5f16e3` server + dual-mode CLI; `8971543` Lambda (AWS deployment) | — |
+| 15 | [Two runtime tiers, one container image](#two-runtime-tiers-one-container-image) | Shipped | `f5f16e3` server + CLI; `8971543` AWS Fargate deployment; lambda scaffold removed on observability-track | — |
 | 16 | [Catalog-less directory catalog](#catalog-less-directory-catalog) | Shipped | `23f8440` Spark-compatible v\<N\>.metadata.json + version-hint.text; `d54e4bf` WithProperties round-trip fix | — |
 | 17 | [Sort-on-merge from Iceberg metadata](#sort-on-merge) | Shipped | `f3918f3` | — |
 | 18 | [Dry-run mode (all 4 endpoints)](#dry-run-mode) | Shipped | `a7b6110` cut points; `a029370` wired through handlers + CompactCold + OpenAPI + tests | — |
@@ -79,7 +79,7 @@ on the feature's main file gives the full history.
 - [Workload classification](#workload-classification)
 - [Async job API + persistent records](#async-job-api)
 - [Per-table in-flight dedup (lease)](#per-table-in-flight-dedup)
-- [Three runtime tiers](#three-runtime-tiers)
+- [Two runtime tiers, one container image](#two-runtime-tiers-one-container-image)
 - [Catalog-less directory catalog](#catalog-less-directory-catalog)
 - [Sort-on-merge](#sort-on-merge)
 - [Dry-run mode](#dry-run-mode)
@@ -313,20 +313,27 @@ takeover via TTL.
 
 ---
 
-## Three runtime tiers
+## Two runtime tiers, one container image
 
-**STATE: Shipped** in `f5f16e3` (HTTP server + dual-mode CLI + OpenAPI) and `8971543` (Lambda + AWS Fargate deployment).
+**STATE: Shipped** in `f5f16e3` (HTTP server + CLI + OpenAPI) and `8971543` (AWS Fargate deployment). Lambda scaffold (`cmd/janitor-lambda`) removed as dead code — see below.
 
 Same `pkg/janitor` core runs as:
 
-- Long-lived HTTP server (`cmd/janitor-server`) — Knative / Fargate
-- AWS Lambda handler (`cmd/janitor-lambda`)
-- One-shot CLI (`cmd/janitor-cli`)
+- Long-lived HTTP server (`cmd/janitor-server`) — container image runs on Fargate / EKS / Cloud Run / Knative; the same image runs on AWS Lambda when wrapped with [AWS Lambda Web Adapter](https://github.com/awslabs/aws-lambda-web-adapter) (LWA terminates the Lambda Runtime API and proxies to the HTTP port). Orchestrator choice is a Terraform-layer decision, not a binary decision.
+- One-shot CLI (`cmd/janitor-cli`) — local operator tool for analyze / compact / expire / rewrite-manifests / maintain / glue-register.
+
+**Why no dedicated Lambda binary.** An earlier design had `cmd/janitor-lambda` as a separate Lambda handler binary. Two facts killed it:
+
+1. The real binary (had it been written) would have imported the same `pkg/janitor` + `pkg/maintenance` + `pkg/catalog` + `pkg/safety` dep graph as the server, so the linux/amd64 stripped binary would be ~77 MB — essentially the same as the server. Cold-start advantage of a zip Lambda over a container-image Lambda shrinks to ~100–200 ms at this size, not the 3–5× the original design assumed.
+2. A separate binary means a second CI path, a second artifact, and a second test surface for identical pkg/janitor code. Container-image Lambda via AWS Lambda Web Adapter gets us to one binary, one image, one CI, one test surface, with a bounded cold-start cost.
+
+The scaffold was a 21-line placeholder that printed `"scaffold only; Lambda adapter lands in Phase 4"` and exited 2. It was never deployed, and the Terraform stack has no Lambda function resource. Removed in the observability-track branch.
 
 **Correctness evidence:**
 
 - Each `cmd/*` builds and tests independently
-- AWS bench runs the server in Fargate; CLI is used by `bench.sh local`; Lambda has its own test target
+- AWS bench runs the server in Fargate; CLI is used by `bench.sh local`
+- For Lambda deployment: untested today — will be proven when the Pattern C on-commit dispatcher (GitHub issue #3) lands and wires the first EventBridge → LWA → server path
 
 ---
 
