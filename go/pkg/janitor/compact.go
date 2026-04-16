@@ -244,6 +244,19 @@ type CompactResult struct {
 	ContentionDetected bool `json:"contention_detected,omitempty"`
 	PlannedOldFiles    int  `json:"planned_old_files,omitempty"`
 	PlannedNewFiles    int  `json:"planned_new_files,omitempty"`
+
+	// Skipped is set when compaction deliberately did NOT run — the
+	// source set was either empty (already compacted / nothing to do)
+	// or crossed a schema-evolution boundary (SkippedReason =
+	// "mixed_schemas"). Skipped runs are NOT failures: BeforeSnapshotID
+	// == AfterSnapshotID, zero rows moved. See SkippedReason for the
+	// discriminator.
+	Skipped       bool   `json:"skipped,omitempty"`
+	SkippedReason string `json:"skipped_reason,omitempty"`
+	// SkippedDetail is a short human-readable description useful in
+	// logs and dashboards, e.g.
+	//   "schema=1 files=45 | schema=2 files=7"
+	SkippedDetail string `json:"skipped_detail,omitempty"`
 }
 
 // Compact rewrites the table's data files via the parquet-go-direct

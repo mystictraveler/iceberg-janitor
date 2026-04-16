@@ -52,6 +52,7 @@ on the feature's main file gives the full history.
 | 17 | [Sort-on-merge from Iceberg metadata](#sort-on-merge) | Shipped | `f3918f3` | — |
 | 18 | [Dry-run mode (all 4 endpoints)](#dry-run-mode) | Shipped | `a7b6110` cut points; `a029370` wired through handlers + CompactCold + OpenAPI + tests | — |
 | 19 | [Glue registration](#glue-registration) | Shipped | `896048b` janitor-cli fast path; `ca96c63` server: metadata_location in job result + direct Glue UpdateTable | — |
+| 19a | [Schema-evolution guard (skip mixed-schema rounds)](#schema-evolution-guard) | Shipped (branch `feature/schema-evolution-guard`) | TBD on merge | PR pending |
 | 20 | [V3 deletion vectors](#refused) | Refused (safety gate) — backlog [#10](https://github.com/mystictraveler/iceberg-janitor/issues/10) | refusal in `feature/v2-deletes` (`d54e4bf`) | [#10](https://github.com/mystictraveler/iceberg-janitor/issues/10) |
 | 21 | [V3 row lineage](#refused) | Refused (safety gate) — backlog [#11](https://github.com/mystictraveler/iceberg-janitor/issues/11) | — | [#11](https://github.com/mystictraveler/iceberg-janitor/issues/11) |
 | 22 | [V3 Puffin stats](#refused) | Refused (safety gate) — backlog [#12](https://github.com/mystictraveler/iceberg-janitor/issues/12) | — | [#12](https://github.com/mystictraveler/iceberg-janitor/issues/12) |
@@ -81,6 +82,7 @@ on the feature's main file gives the full history.
 - [Sort-on-merge](#sort-on-merge)
 - [Dry-run mode](#dry-run-mode)
 - [Glue registration](#glue-registration)
+- [Schema-evolution guard](#schema-evolution-guard)
 - [Refused (safety gates)](#refused)
 - [Planned](#planned)
 
@@ -394,6 +396,104 @@ callers.
 
 - AWS bench Run 18-20: Athena queries the Glue-registered tables with no manual SQL
 - Sandbox NACL blocks Glue from Fargate; production deployments call externally — see memory note `glue_bottleneck.md`
+
+---
+
+## Schema-evolution guard
+
+**STATE: Shipped (branch `feature/schema-evolution-guard`, PR pending).**
+
+### What it does
+
+When a compaction round's source file set straddles a schema change
+(some files at schema N, others at schema N+1 after a DDL
+evolution), the janitor **skips** the round rather than producing
+silently-corrupt output. The result carries `Skipped=true`,
+`SkippedReason="mixed_schemas"`, and a `SkippedDetail` string of the
+form `"schema=1 files=45 | schema=2 files=7"` (or `fid-sig=...` when
+the schema-id metadata key is absent — see below). Before/after
+snapshot ids are equal; no transaction is staged; no rows move.
+
+### Rationale — why skip rather than rewrite
+
+**Schema evolutions are rare; compaction is continuous.** A real
+Iceberg table evolves its schema at a cadence of days to weeks —
+deliberate DDL operations like "add nullable column", "drop column",
+"widen int32 to int64". Streaming workloads, which are the janitor's
+hot path, run against a stable schema for the lifetime of the
+streamer. Compaction in contrast runs every few seconds on hot
+tables. The rate ratio is ~10⁵ or larger: compaction cycles per
+schema change.
+
+Given that asymmetry, the architecturally simple thing is for the
+compactor to respect the boundary and let time heal:
+
+- **Skip** any round whose source set spans schemas. Zero work, zero
+  risk of silent corruption, zero coupling between maintenance and DDL.
+- As the writer produces more files at the new schema, the tail at
+  schema N+1 grows. The next round's source selection window will
+  eventually contain only N+1 files and fire normally.
+- Old-schema files age out through Expire (old snapshots drop from
+  the retain set) and OrphanFiles (the recycle bin sweeps
+  unreferenced paths). Within one or two expire cycles the old
+  schema is gone from the active table entirely.
+
+**Rewriting across a schema boundary** — decoding schema-N files and
+re-encoding them at schema N+1 — is a fundamentally different
+operation than compaction. It changes data: added-column values
+become NULL in the output, dropped-column values are lost, widened
+types may overflow. That belongs in a separate `rewrite-schema` op
+if a user ever needs it, not silently bundled into compaction.
+
+### Mechanism
+
+`pkg/janitor/schema_group.go` owns the detection:
+
+- **Primary path**: parse `iceberg.schema.id` from the parquet
+  footer's key-value metadata (stamped by some Iceberg writers,
+  notably Spark).
+- **Fallback path** (used when the KV key is absent, which is the
+  case for iceberg-go-written files in v0.5.0): SHA-256 signature
+  over the sorted `(field-id, physical-type-code)` pairs for every
+  leaf column. Catches add/drop/widen evolutions without flagging
+  benign column renames (which preserve field IDs).
+- **Sign-bit collision avoidance**: signature-derived keys are
+  negated so they can never collide with a legitimate non-negative
+  schema-id from the direct-parse path.
+
+`pkg/janitor/compact_replace.go::executeStitchAndCommit` calls
+`groupPathsBySchemaID` before any write-side work. If the result has
+more than one group, `CompactResult` gets `Skipped` + reason +
+detail populated and the function returns `nil` — a no-op round, not
+an error.
+
+### Correctness evidence
+
+- `pkg/janitor/schema_evolution_test.go`:
+  - `TestCompact_SchemaEvolution_MixedSchemasSkipped` — seeds 3
+    files at the original schema, evolves with `AddColumn`, seeds 2
+    more files at the evolved schema, runs `Compact`, verifies
+    `Skipped=true` + `SkippedReason="mixed_schemas"` + snapshot id
+    unchanged + file/row counts unchanged.
+  - `TestCompact_SchemaEvolution_SingleSchemaRunsNormally` — evolves
+    FIRST, then seeds 5 files all at the evolved schema, confirms
+    `Skipped=false` and normal file reduction.
+- Full `go test ./...` green on `feature/schema-evolution-guard`
+  (all 29 packages).
+
+### Known gaps
+
+- `SkippedDetail` currently shows `fid-sig=<hex>` because iceberg-go
+  doesn't stamp `iceberg.schema.id` in parquet KV metadata today.
+  Functionally correct — grouping still fires — but less friendly
+  than `schema=1 files=45 | schema=2 files=7`. If iceberg-go adds
+  the stamp (or Spark is the writer), the detail string uses the
+  friendlier form automatically.
+- The guard refuses mixed rounds but does not OFFER the per-group
+  compaction alternative (produce N output files, one per schema
+  version, in one transaction). Per the rationale above, that's a
+  deliberate non-feature — if a user needs it, the right shape is a
+  dedicated `rewrite-schema` op.
 
 ---
 
