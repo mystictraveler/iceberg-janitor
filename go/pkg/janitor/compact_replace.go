@@ -419,6 +419,34 @@ func executeStitchAndCommit(
 	result *CompactResult,
 	cat *catalog.DirectoryCatalog,
 ) error {
+	// Schema-evolution guard. Before any write, group the source
+	// paths by parquet schema-id (peeked from the footer's iceberg.
+	// schema.id metadata, or a field-id signature fallback). A mixed
+	// result means the source set straddles a schema change: refuse
+	// loudly-but-softly by recording Skipped and returning nil. The
+	// caller's BeforeSnapshotID == AfterSnapshotID is preserved and
+	// the round completes as a no-op. See pkg/janitor/schema_group.go
+	// for the full rationale (TL;DR: schema evolutions are rare
+	// relative to compaction cadence; let the old-schema tail age out
+	// rather than rewrite across the boundary).
+	if len(oldPaths) > 1 {
+		ctx2, schemaSpan := tr.Start(ctx, "schema_group_check")
+		groups, gerr := groupPathsBySchemaID(ctx2, fs, oldPaths)
+		schemaSpan.End()
+		if gerr != nil {
+			return fmt.Errorf("grouping source files by schema: %w", gerr)
+		}
+		if len(groups) > 1 {
+			result.Skipped = true
+			result.SkippedReason = "mixed_schemas"
+			result.SkippedDetail = describeSchemaGroups(groups)
+			result.AfterSnapshotID = result.BeforeSnapshotID
+			result.AfterFiles = result.BeforeFiles
+			result.AfterRows = result.BeforeRows
+			return nil
+		}
+	}
+
 	// V2 delete handling: load every delete-file payload that the
 	// manifest walk collected. If any eq delete references a column
 	// type we can't safely compare, BuildDeleteBundle returns an
