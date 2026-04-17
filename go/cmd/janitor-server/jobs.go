@@ -984,11 +984,18 @@ func (s *server) runMaintainJob(jobID string, ident icebergtable.Identifier, pla
 		mr.CompactHot = hotResult
 		compactErr = err
 		if err == nil && hotResult != nil {
+			var bf, af int
+			for _, p := range hotResult.Partitions {
+				bf += p.BeforeFiles
+				af += p.AfterFiles
+			}
 			s.logger.Info("maintain: compact_hot done", "job_id", jobID, "table", tableName,
 				"partitions_hot", hotResult.PartitionsHot,
 				"partitions_stitched", hotResult.PartitionsStitched,
 				"partitions_failed", hotResult.PartitionsFailed,
-				"elapsed_ms", hotResult.TotalDurationMs)
+				"elapsed_ms", hotResult.TotalDurationMs,
+				"before_files", bf, "after_files", af,
+			)
 		}
 	case classify.ModeCold:
 		coldResult, err := janitor.CompactCold(ctx, s.cat, ident, janitor.CompactColdOptions{
@@ -1003,12 +1010,19 @@ func (s *server) runMaintainJob(jobID string, ident icebergtable.Identifier, pla
 		mr.CompactCold = coldResult
 		compactErr = err
 		if err == nil && coldResult != nil {
+			var bf, af int
+			for _, p := range coldResult.Partitions {
+				bf += p.BeforeFiles
+				af += p.AfterFiles
+			}
 			s.logger.Info("maintain: compact_cold done", "job_id", jobID, "table", tableName,
 				"partitions_cold", coldResult.PartitionsCold,
 				"partitions_triggered", coldResult.PartitionsTriggered,
 				"partitions_compacted", coldResult.PartitionsCompacted,
 				"partitions_failed", coldResult.PartitionsFailed,
-				"elapsed_ms", coldResult.TotalDurationMs)
+				"elapsed_ms", coldResult.TotalDurationMs,
+				"before_files", bf, "after_files", af,
+			)
 		}
 	default: // ModeFull or unknown
 		compactResult, err := janitor.CompactTable(ctx, s.cat, ident, janitor.CompactOptions{
@@ -1018,11 +1032,18 @@ func (s *server) runMaintainJob(jobID string, ident icebergtable.Identifier, pla
 		mr.CompactFull = compactResult
 		compactErr = err
 		if err == nil && compactResult != nil {
+			var bf, af int
+			for _, p := range compactResult.PartitionResults {
+				bf += p.BeforeFiles
+				af += p.AfterFiles
+			}
 			s.logger.Info("maintain: compact_full done", "job_id", jobID, "table", tableName,
 				"partitions_found", compactResult.PartitionsFound,
 				"partitions_compacted", compactResult.PartitionsSucceeded,
 				"partitions_failed", compactResult.PartitionsFailed,
-				"elapsed_ms", compactResult.TotalDurationMs)
+				"elapsed_ms", compactResult.TotalDurationMs,
+				"before_files", bf, "after_files", af,
+			)
 		}
 	}
 	if compactErr != nil {
@@ -1059,9 +1080,46 @@ func (s *server) runMaintainJob(jobID string, ident icebergtable.Identifier, pla
 
 	mr.TotalDurationMs = time.Since(started).Milliseconds()
 	s.jobs.complete(jobID, mr, nil)
-	s.logger.Info("maintain job completed", "job_id", jobID, "table", tableName,
+	// Surface compact-phase outcomes on the maintain-completed line so
+	// the dashboard can query ONE message for the full picture. Fields
+	// match the compact job completed contract in OBSERVABILITY_SPEC.md.
+	maintainArgs := []any{
+		"job_id", jobID, "table", tableName,
 		"mode", plan.Mode, "steps", mr.Steps, "total_ms", mr.TotalDurationMs,
-		"metadata_location", mr.MetadataLocation)
+		"metadata_location", mr.MetadataLocation,
+	}
+	switch {
+	case mr.CompactHot != nil:
+		var bf, af int
+		for _, p := range mr.CompactHot.Partitions {
+			bf += p.BeforeFiles
+			af += p.AfterFiles
+		}
+		maintainArgs = append(maintainArgs,
+			"before_files", bf, "after_files", af,
+			"partitions_stitched", mr.CompactHot.PartitionsStitched,
+		)
+	case mr.CompactCold != nil:
+		var bf, af int
+		for _, p := range mr.CompactCold.Partitions {
+			bf += p.BeforeFiles
+			af += p.AfterFiles
+		}
+		maintainArgs = append(maintainArgs,
+			"before_files", bf, "after_files", af,
+			"partitions_compacted", mr.CompactCold.PartitionsCompacted,
+		)
+	case mr.CompactFull != nil:
+		var bf, af int
+		for _, p := range mr.CompactFull.PartitionResults {
+			bf += p.BeforeFiles
+			af += p.AfterFiles
+		}
+		maintainArgs = append(maintainArgs,
+			"before_files", bf, "after_files", af,
+		)
+	}
+	s.logger.Info("maintain job completed", maintainArgs...)
 }
 
 // partitionConcurrencyFromEnv reads JANITOR_PARTITION_CONCURRENCY from
