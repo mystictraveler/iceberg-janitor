@@ -95,9 +95,11 @@ class ScrollExplainer(MovingCameraScene):
                 rect.move_to([-2 + c * 0.45, y1 - 2 + r * 0.38, 0])
                 s1_files.add(rect)
 
-        self.add(s1_title, s1_lines, s1_files)
         scroll_to(y1, 2)
-        self.wait(3)
+        self.play(Write(s1_title), run_time=0.5)
+        self.play(*[Write(l) for l in s1_lines], run_time=0.8)
+        self.play(*[FadeIn(f, scale=0.5) for f in s1_files], run_time=0.6)
+        self.wait(2)
 
         # ═══════════════════════════════════════
         # Section 2: Byte-Copy Stitch (metadata tree + anchor)
@@ -164,11 +166,17 @@ class ScrollExplainer(MovingCameraScene):
                           font_size=16, color=YELLOW, weight=BOLD)
         s2_callout.move_to([0, y2 - 3, 0])
 
-        self.add(s2_title, meta_snap, meta_snap_t, meta_ml, meta_ml_t, meta_arrow,
-                 small_files, small_labels, anchor, anchor_label, gravity_arrows,
-                 rgs, s2_callout)
         scroll_to(y2, 2)
-        self.wait(4)
+        self.play(Write(s2_title), run_time=0.5)
+        self.play(FadeIn(meta_snap), Write(meta_snap_t), run_time=0.4)
+        self.play(GrowArrow(meta_arrow), run_time=0.3)
+        self.play(FadeIn(meta_ml), Write(meta_ml_t), run_time=0.4)
+        self.play(*[FadeIn(sf, shift=DOWN*0.2) for sf in small_files], *[Write(sl) for sl in small_labels], run_time=0.6)
+        self.play(FadeIn(anchor), Write(anchor_label), run_time=0.5)
+        self.play(*[GrowArrow(a) for a in gravity_arrows], run_time=0.8)
+        self.play(*[FadeIn(rg, shift=LEFT*0.3) for rg in rgs], run_time=0.8)
+        self.play(Write(s2_callout), run_time=0.5)
+        self.wait(3)
 
         # ═══════════════════════════════════════
         # Section 3: Row Group Merge
@@ -199,9 +207,14 @@ class ScrollExplainer(MovingCameraScene):
                       font_size=15, color=YELLOW, weight=BOLD)
         s3_key.move_to([0, y3 - 2.5, 0])
 
-        self.add(s3_title, s3_trigger, s3_before, s3_arrow, s3_merged, s3_merged_t, s3_key)
         scroll_to(y3, 2)
-        self.wait(4)
+        self.play(Write(s3_title), run_time=0.5)
+        self.play(Write(s3_trigger), run_time=0.4)
+        self.play(*[FadeIn(rg) for rg in s3_before], run_time=0.5)
+        self.play(Write(s3_arrow), run_time=0.5)
+        self.play(FadeIn(s3_merged), Write(s3_merged_t), run_time=0.6)
+        self.play(Write(s3_key), run_time=0.5)
+        self.wait(3)
 
         # ═══════════════════════════════════════
         # Section 4: Delete Handling
@@ -234,14 +247,97 @@ class ScrollExplainer(MovingCameraScene):
                          font_size=14, color=YELLOW)
         s4_result.move_to([0, y4 - 1.5, 0])
 
-        self.add(s4_title, s4_rows, s4_del, s4_result)
         scroll_to(y4, 2)
+        self.play(Write(s4_title), run_time=0.5)
+        for i in range(0, len(s4_rows), 2):
+            self.play(FadeIn(s4_rows[i]), Write(s4_rows[i+1]), run_time=0.25)
+        self.play(*[Write(d) for d in s4_del], run_time=0.5)
+        self.play(Write(s4_result), run_time=0.5)
+        self.wait(2)
+
+        # ═══════════════════════════════════════
+        # Section 5: Safety Gates
+        # ═══════════════════════════════════════
+        y5s = -5 * SECTION
+        s5s_title = Text("Safety Gates", font_size=40, color=YELLOW, weight=BOLD)
+        s5s_title.move_to([0, y5s + 3.5, 0])
+
+        gates = [
+            ("⏭", "Schema Guard",     "Mixed schemas → skip round",         CYAN),
+            ("🚫", "V3 DV Refusal",    "Puffin deletes → refuse",            RED),
+            ("✓", "Master Check",      "I1-I8 invariants before commit",     YELLOW),
+            ("⚡", "11 Circuit Breakers","Loop, budget, ratio, ROI → pause",  PURPLE),
+        ]
+        gate_objs = VGroup()
+        for i, (icon, name, desc, color) in enumerate(gates):
+            bg = RoundedRectangle(width=9, height=0.7, corner_radius=0.1,
+                                  color=color, fill_opacity=0.08, stroke_width=2)
+            bg.move_to([0, y5s + 2 - i * 0.9, 0])
+            ic = Text(icon, font_size=20)
+            ic.move_to(bg.get_left() + RIGHT * 0.6)
+            nm = Text(name, font_size=14, color=color, weight=BOLD)
+            nm.move_to(bg.get_left() + RIGHT * 3)
+            ds = Text(desc, font_size=12, color=FG)
+            ds.move_to(bg.get_center() + RIGHT * 1.5)
+            gate_objs.add(VGroup(bg, ic, nm, ds))
+
+        s5s_principle = Text("Refuse loudly rather than corrupt silently",
+                             font_size=17, color=YELLOW, weight=BOLD)
+        s5s_principle.move_to([0, y5s - 2, 0])
+
+        # CAS commit animation below the gates
+        cas_title = Text("Atomic CAS Commit", font_size=18, color=PURPLE, weight=BOLD)
+        cas_title.move_to([0, y5s - 3, 0])
+
+        cas_steps = VGroup(
+            RoundedRectangle(width=2, height=0.5, corner_radius=0.06,
+                             color=CYAN, fill_opacity=0.2, stroke_width=1.5),
+            RoundedRectangle(width=2, height=0.5, corner_radius=0.06,
+                             color=GREEN, fill_opacity=0.2, stroke_width=1.5),
+            RoundedRectangle(width=2, height=0.5, corner_radius=0.06,
+                             color=PURPLE, fill_opacity=0.2, stroke_width=1.5),
+        )
+        cas_labels = VGroup(
+            Text("1. LOAD", font_size=10, color=CYAN),
+            Text("2. COMPACT", font_size=10, color=GREEN),
+            Text("3. CAS PUT", font_size=10, color=PURPLE),
+        )
+        for i in range(3):
+            cas_steps[i].move_to([-3 + i * 3, y5s - 3.8, 0])
+            cas_labels[i].move_to(cas_steps[i].get_center())
+
+        cas_arrows = VGroup()
+        for i in range(2):
+            a = Arrow(cas_steps[i].get_right(), cas_steps[i+1].get_left(),
+                      color=COMMENT, buff=0.1, stroke_width=1.5, max_tip_length_to_length_ratio=0.2)
+            cas_arrows.add(a)
+
+        cas_retry = Text("412? → reload → re-plan → retry", font_size=12, color=ORANGE)
+        cas_retry.move_to([0, y5s - 4.5, 0])
+        cas_nolock = Text("No lock service. Just conditional PUT on S3.",
+                          font_size=13, color=PURPLE)
+        cas_nolock.move_to([0, y5s - 5, 0])
+
+        scroll_to(y5s, 2)
+        self.play(Write(s5s_title), run_time=0.5)
+        for g in gate_objs:
+            self.play(FadeIn(g, shift=RIGHT * 0.3), run_time=0.4)
+        self.play(Write(s5s_principle), run_time=0.5)
+        self.wait(1)
+        # CAS animation
+        self.play(Write(cas_title), run_time=0.4)
+        for i in range(3):
+            self.play(FadeIn(cas_steps[i]), Write(cas_labels[i]), run_time=0.3)
+            if i < 2:
+                self.play(GrowArrow(cas_arrows[i]), run_time=0.2)
+        self.play(Write(cas_retry), run_time=0.4)
+        self.play(Write(cas_nolock), run_time=0.4)
         self.wait(3)
 
         # ═══════════════════════════════════════
-        # Section 5: Feature & Cost Comparison
+        # Section 6: Feature & Cost Comparison
         # ═══════════════════════════════════════
-        y5 = -5 * SECTION
+        y5 = -6 * SECTION
         s5_title = Text("Feature & Cost Comparison", font_size=40, color=FG)
         s5_title.move_to([0, y5 + 3.5, 0])
 
@@ -273,52 +369,89 @@ class ScrollExplainer(MovingCameraScene):
                          font_size=15, color=GREEN, weight=BOLD)
         s5_winner.move_to([0, y5 - 3.5, 0])
 
-        self.add(s5_title, feat_t, cost_t, s5_winner)
         scroll_to(y5, 2)
-        self.wait(4)
+        self.play(Write(s5_title), run_time=0.5)
+        self.play(FadeIn(feat_t), run_time=1.0)
+        self.wait(2)
+        self.play(FadeIn(cost_t), run_time=1.0)
+        self.play(Write(s5_winner), run_time=0.5)
+        self.wait(3)
 
         # ═══════════════════════════════════════
         # Section 6: Import from Hive
         # ═══════════════════════════════════════
-        y6 = -6 * SECTION
+        y6 = -7 * SECTION
         s6_title = Text("Import from Hive / Legacy Parquet", font_size=40, color=CYAN)
         s6_title.move_to([0, y6 + 3.5, 0])
 
-        s6_steps = VGroup(
-            Text("1. Scan *.parquet under table path", font_size=15, color=FG),
-            Text("2. Read footer → infer schema", font_size=15, color=FG),
-            Text("3. Detect Hive paths (col=value/)", font_size=15, color=FG),
-            Text("4. CreateTable + AddFiles → Iceberg", font_size=15, color=FG),
-            Text("5. Optional --compact → maintain", font_size=15, color=FG),
-        )
-        s6_steps.arrange(DOWN, buff=0.35, aligned_edge=LEFT)
-        s6_steps.move_to([-1, y6, 0])
+        # Hive files on the left (orange = legacy)
+        hive_files = VGroup()
+        hive_paths = ["date=2026-04-01/", "date=2026-04-02/", "date=2026-04-03/"]
+        for i, hp in enumerate(hive_paths):
+            hf = RoundedRectangle(width=3, height=0.5, corner_radius=0.06,
+                                   color=ORANGE, fill_opacity=0.5, stroke_width=2)
+            hf.move_to([-4, y6 + 1.5 - i * 0.7, 0])
+            hl = Text(f"{hp}*.parquet", font_size=10, color=FG)
+            hl.move_to(hf.get_center())
+            hive_files.add(VGroup(hf, hl))
 
-        s6_arrow = VGroup(
-            Text("Hive / Legacy", font_size=14, color=ORANGE),
-            Text("──────▶", font_size=14, color=GREEN),
-            Text("Iceberg Table", font_size=14, color=GREEN),
-        )
-        s6_arrow.arrange(RIGHT, buff=0.2)
-        s6_arrow.move_to([0, y6 - 2.5, 0])
+        # Arrow
+        import_arrow = Text("janitor-cli import ──▶", font_size=16, color=GREEN)
+        import_arrow.move_to([0, y6, 0])
 
-        self.add(s6_title, s6_steps, s6_arrow)
+        # Iceberg table on the right (green = Iceberg)
+        ice_box = RoundedRectangle(width=3, height=3, corner_radius=0.12,
+                                    color=GREEN, fill_opacity=0.08, stroke_width=3)
+        ice_box.move_to([4, y6, 0])
+        ice_parts = VGroup(
+            Text("metadata/", font_size=11, color=PURPLE),
+            Text("  v1.metadata.json", font_size=10, color=COMMENT),
+            Text("  manifest-list.avro", font_size=10, color=COMMENT),
+            Text("data/", font_size=11, color=GREEN),
+            Text("  (same parquet files)", font_size=10, color=COMMENT),
+        )
+        ice_parts.arrange(DOWN, buff=0.15, aligned_edge=LEFT)
+        ice_parts.move_to(ice_box.get_center())
+
+        s6_compact = Text("+ optional --compact → immediate optimization",
+                          font_size=14, color=YELLOW)
+        s6_compact.move_to([0, y6 - 2.5, 0])
+
         scroll_to(y6, 2)
-        self.wait(3)
+        self.play(Write(s6_title), run_time=0.5)
+        # Hive files appear
+        for hf in hive_files:
+            self.play(FadeIn(hf, shift=RIGHT * 0.2), run_time=0.3)
+        self.wait(0.5)
+        # Arrow
+        self.play(Write(import_arrow), run_time=0.5)
+        # Iceberg table builds
+        self.play(Create(ice_box), run_time=0.4)
+        for part in ice_parts:
+            self.play(Write(part), run_time=0.2)
+        # Hive files dim (they stay in place — data doesn't move)
+        self.play(
+            *[hf[0].animate.set_stroke(color=GREEN) for hf in hive_files],
+            run_time=0.5,
+        )
+        self.play(Write(s6_compact), run_time=0.4)
+        self.wait(2)
 
         # ═══════════════════════════════════════
         # Section 7: Takeaways
         # ═══════════════════════════════════════
-        y7 = -7 * SECTION
+        y7 = -8 * SECTION
         s7_title = Text("Takeaways", font_size=44, color=YELLOW, weight=BOLD)
         s7_title.move_to([0, y7 + 3.5, 0])
 
         takeaways = [
-            ("192×", "file reduction on TPC-DS streaming bench"),
-            ("42%", "faster Athena queries vs uncompacted"),
-            ("$557/mo", "at 1 PB — 10.7× cheaper than Spark"),
-            ("Zero", "CPU per row on the byte-copy stitch path"),
-            ("I1-I8", "mandatory master check — no silent corruption"),
+            ("192×", "fewer files after compaction"),
+            ("42%", "faster query latency"),
+            ("0", "rows decoded on the stitch fast path"),
+            ("10.7×", "cheaper than Spark at 1 PB"),
+            ("4.8×", "cheaper than Flink at 1 PB"),
+            ("$557", "per month for 1,000 tables"),
+            ("8", "mandatory invariants before every commit"),
             ("0", "catalog services required"),
         ]
         s7_items = VGroup()
@@ -329,14 +462,16 @@ class ScrollExplainer(MovingCameraScene):
             d.move_to([0, y7 + 2 - i * 0.85, 0])
             s7_items.add(n, d)
 
-        self.add(s7_title, s7_items)
         scroll_to(y7, 2)
-        self.wait(4)
+        self.play(Write(s7_title), run_time=0.5)
+        for i in range(0, len(s7_items), 2):
+            self.play(Write(s7_items[i]), Write(s7_items[i+1]), run_time=0.4)
+        self.wait(3)
 
         # ═══════════════════════════════════════
         # Section 8: Closing
         # ═══════════════════════════════════════
-        y8 = -8 * SECTION
+        y8 = -9 * SECTION
         s8 = VGroup(
             Text("iceberg-janitor", font_size=56, color=FG, weight=BOLD),
             Text("github.com/mystictraveler/iceberg-janitor",
@@ -346,6 +481,6 @@ class ScrollExplainer(MovingCameraScene):
         )
         s8.arrange(DOWN, buff=0.4)
         s8.move_to([0, y8, 0])
-        self.add(s8)
         scroll_to(y8, 2)
+        self.play(FadeIn(s8, scale=0.9), run_time=1.0)
         self.wait(4)
