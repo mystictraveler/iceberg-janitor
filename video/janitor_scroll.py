@@ -83,7 +83,7 @@ class ScrollExplainer(MovingCameraScene):
 
         # Streamers on the left
         streamers = VGroup()
-        streamer_names = ["Kafka Connect", "Spark Streaming", "Flink CDC"]
+        streamer_names = ["Writer A", "Writer B", "Writer C"]
         for i, name in enumerate(streamer_names):
             sb = RoundedRectangle(width=2, height=0.55, corner_radius=0.08,
                                    color=CYAN, fill_opacity=0.2, stroke_width=2)
@@ -397,47 +397,94 @@ class ScrollExplainer(MovingCameraScene):
 
 
         # ═══════════════════════════════════════
-        # Section 5: Auto-Classification
+        # Section 5: Workload Auto-Classification
         # ═══════════════════════════════════════
         y_ac = -5 * SECTION
-        ac_title = Text("Auto-Classification", font_size=40, color=CYAN, weight=BOLD)
+        ac_title = Text("Workload Auto-Classification", font_size=38, color=CYAN, weight=BOLD)
         ac_title.move_to([0, y_ac + 3.5, 0])
-        ac_sub = Text("Zero operator tuning — the server decides", font_size=16, color=COMMENT)
+        ac_sub = Text("The server sweeps every table, reads its commit rate, and sorts into buckets",
+                       font_size=14, color=COMMENT)
         ac_sub.move_to([0, y_ac + 2.7, 0])
 
-        classes = [
-            ("streaming",     "> 6/hr",   "5 min",  "hot stitch",     GREEN),
-            ("batch",         "1-6/hr",   "1 hour", "cold partition",  ORANGE),
-            ("slow_changing", "< 1/hr",   "daily",  "cold triggered",  CYAN),
-            ("dormant",       "none 7d",  "weekly", "skip",            COMMENT),
+        # 4 classification buckets on the right
+        bucket_info = [
+            ("streaming",     "> 6 commits/hr",  "maintain every 5 min",  GREEN),
+            ("batch",         "1-6 commits/hr",  "maintain every 1 hr",   ORANGE),
+            ("slow_changing", "< 1 commit/hr",   "maintain daily",        CYAN),
+            ("dormant",       "no commits 7d",   "maintain weekly",       COMMENT),
         ]
-        ac_items = VGroup()
-        for i, (cls, rate, cadence, mode, color) in enumerate(classes):
-            bg = RoundedRectangle(width=9.5, height=0.55, corner_radius=0.08,
-                                   color=color, fill_opacity=0.08, stroke_width=1.5)
-            bg.move_to([0, y_ac + 1.8 - i * 0.7, 0])
-            c_t = Text(cls, font_size=13, color=color, weight=BOLD)
-            c_t.move_to(bg.get_left() + RIGHT * 1.5)
-            r_t = Text(rate, font_size=11, color=FG)
-            r_t.move_to(bg.get_left() + RIGHT * 3.5)
-            cd_t = Text(cadence, font_size=11, color=FG)
-            cd_t.move_to(bg.get_center() + RIGHT * 0.5)
-            m_t = Text(mode, font_size=11, color=color)
-            m_t.move_to(bg.get_right() + LEFT * 1.5)
-            ac_items.add(VGroup(bg, c_t, r_t, cd_t, m_t))
+        buckets = VGroup()
+        bucket_rects = []
+        for i, (cls, criteria, action, color) in enumerate(bucket_info):
+            bkt = RoundedRectangle(width=3.5, height=0.8, corner_radius=0.1,
+                                    color=color, fill_opacity=0.1, stroke_width=2)
+            bkt.move_to([3.5, y_ac + 1.5 - i * 1.0, 0])
+            cls_t = Text(cls, font_size=13, color=color, weight=BOLD)
+            cls_t.move_to(bkt.get_left() + RIGHT * 0.9)
+            crit_t = Text(criteria, font_size=9, color=FG)
+            crit_t.move_to(bkt.get_center() + RIGHT * 0.3 + UP * 0.1)
+            act_t = Text(action, font_size=9, color=YELLOW)
+            act_t.move_to(bkt.get_center() + RIGHT * 0.3 + DOWN * 0.12)
+            buckets.add(VGroup(bkt, cls_t, crit_t, act_t))
+            bucket_rects.append(bkt)
 
-        ac_flow = Text("POST /maintain → classify → plan → dispatch → compact", font_size=13, color=YELLOW)
-        ac_flow.move_to([0, y_ac - 1.2, 0])
-        ac_key = Text("No per-table config. No knobs.", font_size=15, color=CYAN, weight=BOLD)
-        ac_key.move_to([0, y_ac - 1.8, 0])
+        # Unsorted tables on the left (the "sweep")
+        table_names = [
+            ("orders",    GREEN),    # will be streaming
+            ("dim_store", COMMENT),  # will be dormant
+            ("events",    GREEN),    # streaming
+            ("users",     ORANGE),   # batch
+            ("inventory", CYAN),     # slow_changing
+            ("logs",      GREEN),    # streaming
+            ("products",  COMMENT),  # dormant
+            ("clicks",    ORANGE),   # batch
+        ]
+        # Which bucket each table goes to (index into bucket_info)
+        table_bucket = [0, 3, 0, 1, 2, 0, 3, 1]
+
+        unsorted = VGroup()
+        for i, (name, color) in enumerate(table_names):
+            tb = RoundedRectangle(width=1.8, height=0.4, corner_radius=0.06,
+                                   color=color, fill_opacity=0.4, stroke_width=1.5)
+            tb.move_to([-4.5, y_ac + 2 - i * 0.55, 0])
+            tl = Text(name, font_size=9, color=FG)
+            tl.move_to(tb.get_center())
+            unsorted.add(VGroup(tb, tl))
+
+        sweep_label = Text("unsorted tables", font_size=12, color=COMMENT)
+        sweep_label.move_to([-4.5, y_ac + 2.5, 0])
 
         scroll_to(y_ac, 2)
         self.play(Write(ac_title), run_time=0.5)
         self.play(Write(ac_sub), run_time=0.3)
-        for item in ac_items:
-            self.play(FadeIn(item, shift=RIGHT * 0.2), run_time=0.3)
-        self.play(Write(ac_flow), run_time=0.4)
-        self.play(Write(ac_key), run_time=0.4)
+
+        # Show buckets first
+        self.play(*[FadeIn(b) for b in buckets], run_time=0.5)
+
+        # Show unsorted tables
+        self.play(Write(sweep_label), run_time=0.2)
+        self.play(*[FadeIn(u, shift=RIGHT * 0.2) for u in unsorted], run_time=0.4)
+        self.wait(0.5)
+
+        # Animate: each table evaluates → flies into the right bucket
+        classify_label = Text("classify →", font_size=14, color=YELLOW)
+        classify_label.move_to([-1, y_ac + 1.5, 0])
+        self.play(Write(classify_label), run_time=0.3)
+
+        for i, (name, color) in enumerate(table_names):
+            target_bucket = bucket_rects[table_bucket[i]]
+            # Table flies from left into its bucket
+            self.play(
+                unsorted[i].animate.move_to(target_bucket.get_center()).scale(0.6).set_opacity(0.7),
+                run_time=0.25,
+                rate_func=smooth,
+            )
+
+        self.wait(0.5)
+        ac_key = Text("No per-table config. No knobs. The server reads commit history and decides.",
+                      font_size=14, color=CYAN, weight=BOLD)
+        ac_key.move_to([0, y_ac - 2.5, 0])
+        self.play(Write(ac_key), run_time=0.5)
         self.wait(3)
 
         # ═══════════════════════════════════════
