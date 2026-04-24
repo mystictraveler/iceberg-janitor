@@ -75,33 +75,109 @@ class ScrollExplainer(MovingCameraScene):
         self.wait(3)
 
         # ═══════════════════════════════════════
-        # Section 1: The Problem
+        # Section 1: The Problem — streamers pollute the table
         # ═══════════════════════════════════════
         y1 = -SECTION
         s1_title = Text("The Small-File Problem", font_size=40, color=FG)
-        s1_title.move_to([0, y1 + 3, 0])
+        s1_title.move_to([0, y1 + 3.5, 0])
 
-        s1_lines = VGroup(
-            Text("Streaming writers → 60 commits/min", font_size=18, color=CYAN),
-            Text("→ 300+ files in 5 minutes", font_size=18, color=RED),
-            Text("→ query engines scan each → SLOW", font_size=18, color=ORANGE),
-        )
-        s1_lines.arrange(DOWN, buff=0.4)
-        s1_lines.move_to([0, y1, 0])
+        # Streamers on the left
+        streamers = VGroup()
+        streamer_names = ["Kafka Connect", "Spark Streaming", "Flink CDC"]
+        for i, name in enumerate(streamer_names):
+            sb = RoundedRectangle(width=2, height=0.55, corner_radius=0.08,
+                                   color=CYAN, fill_opacity=0.2, stroke_width=2)
+            sb.move_to([-5.5, y1 + 2 - i * 0.8, 0])
+            sl = Text(name, font_size=10, color=CYAN)
+            sl.move_to(sb.get_center())
+            streamers.add(VGroup(sb, sl))
 
-        s1_files = VGroup()
-        for r in range(4):
-            for c in range(10):
-                rect = Rectangle(width=0.38, height=0.28, color=CYAN,
-                                 fill_opacity=0.5, stroke_width=1)
-                rect.move_to([-2 + c * 0.45, y1 - 2 + r * 0.38, 0])
-                s1_files.add(rect)
+        rate_label = Text("60 commits/min", font_size=12, color=COMMENT)
+        rate_label.move_to([-5.5, y1 + 0, 0])
+
+        # Iceberg table on the right — snapshot → manifest-list → manifests → files
+        table_box = RoundedRectangle(width=5, height=4.5, corner_radius=0.12,
+                                      color=PURPLE, fill_opacity=0.03, stroke_width=2)
+        table_box.move_to([2.5, y1 + 0.5, 0])
+        table_label = Text("Iceberg Table", font_size=14, color=PURPLE)
+        table_label.move_to([2.5, y1 + 3, 0])
+
+        snap_box = RoundedRectangle(width=1.8, height=0.4, corner_radius=0.06,
+                                     color=PURPLE, fill_opacity=0.3, stroke_width=1.5)
+        snap_box.move_to([2.5, y1 + 2.3, 0])
+        snap_t = Text("snapshot", font_size=9, color=PURPLE)
+        snap_t.move_to(snap_box.get_center())
+
+        ml_box = RoundedRectangle(width=1.8, height=0.4, corner_radius=0.06,
+                                   color=PURPLE, fill_opacity=0.2, stroke_width=1.5)
+        ml_box.move_to([2.5, y1 + 1.6, 0])
+        ml_t = Text("manifest-list", font_size=9, color=COMMENT)
+        ml_t.move_to(ml_box.get_center())
+
+        tree_arrow = Arrow(snap_box.get_bottom(), ml_box.get_top(),
+                           color=COMMENT, buff=0.04, stroke_width=1, max_tip_length_to_length_ratio=0.2)
 
         scroll_to(y1, 2)
         self.play(Write(s1_title), run_time=0.5)
-        self.play(*[Write(l) for l in s1_lines], run_time=0.8)
-        self.play(*[FadeIn(f, scale=0.5) for f in s1_files], run_time=0.6)
-        self.wait(2)
+        self.play(*[FadeIn(s) for s in streamers], Write(rate_label), run_time=0.5)
+        self.play(FadeIn(table_box), Write(table_label), run_time=0.3)
+        self.play(FadeIn(snap_box), Write(snap_t), run_time=0.2)
+        self.play(GrowArrow(tree_arrow), FadeIn(ml_box), Write(ml_t), run_time=0.3)
+
+        # Animate: data flies from streamers → lands as micro-manifests + micro-files
+        # Each commit produces one manifest + one small file
+        manifests_area = VGroup()
+        files_area = VGroup()
+
+        for burst in range(3):  # 3 bursts of commits
+            batch_size = [4, 3, 5][burst]  # bursty pattern
+            for j in range(batch_size):
+                i = sum([4, 3, 5][:burst]) + j
+                col = i % 5
+                row = i // 5
+
+                # Small data file
+                df = RoundedRectangle(width=0.7, height=0.3, corner_radius=0.03,
+                                       color=CYAN, fill_opacity=0.5, stroke_width=1)
+                df.move_to(streamers[burst % 3][0].get_center())  # start at streamer
+                target_x = 0.8 + col * 0.85
+                target_y = y1 + 0.5 - row * 0.45
+                df_label = Text(f"f{i+1}", font_size=6, color=FG)
+
+                # Micro-manifest (tiny orange dot)
+                mm = Circle(radius=0.08, color=ORANGE, fill_opacity=0.7, stroke_width=0)
+                mm.move_to(streamers[burst % 3][0].get_center())
+                mm_target_x = 1.2 + (i % 4) * 0.4
+                mm_target_y = y1 + 1.1
+
+                # Fly both from streamer → table
+                self.play(
+                    df.animate.move_to([target_x, target_y, 0]),
+                    mm.animate.move_to([mm_target_x, mm_target_y, 0]),
+                    run_time=0.15,
+                    rate_func=smooth,
+                )
+                df_label.move_to(df.get_center())
+                self.add(df_label)
+                files_area.add(VGroup(df, df_label))
+                manifests_area.add(mm)
+
+            # Brief pause between bursts (bursty pattern)
+            self.wait(0.2)
+
+        # Show the pollution callout
+        manifest_count = Text(f"{len(manifests_area)} micro-manifests", font_size=13, color=ORANGE)
+        manifest_count.move_to([2, y1 + 0.8, 0])
+        file_count = Text(f"{len(files_area)} tiny files", font_size=13, color=RED)
+        file_count.move_to([2.5, y1 - 1.2, 0])
+        self.play(Write(manifest_count), Write(file_count), run_time=0.4)
+
+        # Query engine struggling
+        problem = Text("Query engine scans ALL of them → SLOW",
+                       font_size=16, color=RED, weight=BOLD)
+        problem.move_to([0, y1 - 2.5, 0])
+        self.play(Write(problem), run_time=0.5)
+        self.wait(3)
 
 
         # ═══════════════════════════════════════
