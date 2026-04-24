@@ -269,7 +269,7 @@ class ScrollExplainer(MovingCameraScene):
         s5s_principle.move_to([0, y4s - 2, 0])
 
         # CAS commit animation below the gates
-        cas_title = Text("Atomic CAS Commit", font_size=18, color=PURPLE, weight=BOLD)
+        cas_title = Text("Safety (continued) — Atomic CAS Commit", font_size=18, color=PURPLE, weight=BOLD)
         cas_title.move_to([0, y4s - 3, 0])
 
         cas_steps = VGroup(
@@ -306,8 +306,10 @@ class ScrollExplainer(MovingCameraScene):
         for g in gate_objs:
             self.play(FadeIn(g, shift=RIGHT * 0.3), run_time=0.4)
         self.play(Write(s5s_principle), run_time=0.5)
-        self.wait(1)
-        # CAS animation
+        self.wait(2)
+
+        # Scroll down to CAS section (Safety continued)
+        scroll_to(y4s - 4, 1.5)
         self.play(Write(cas_title), run_time=0.4)
         for i in range(3):
             self.play(FadeIn(cas_steps[i]), Write(cas_labels[i]), run_time=0.3)
