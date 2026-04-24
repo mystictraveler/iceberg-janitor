@@ -37,12 +37,14 @@ class ScrollExplainer(MovingCameraScene):
         def scroll_to(y, duration=2):
             self.play(cam.animate.move_to([0, y, 0]), run_time=duration, rate_func=smooth)
 
-        # Helper: bordered table
+        # Helper: bordered table (center-justified)
         def table(headers, rows, hdr_colors, y_offset, cell_w=2.7, cell_h=0.42):
             g = VGroup()
+            total_w = len(headers) * cell_w
+            x_start = -total_w / 2
             for ri in range(-1, len(rows)):
                 for ci in range(len(headers)):
-                    x = -4 + ci * cell_w + cell_w / 2
+                    x = x_start + ci * cell_w + cell_w / 2
                     y = y_offset - (ri + 1) * cell_h
                     cell = Rectangle(width=cell_w, height=cell_h, color=COMMENT,
                                      fill_opacity=0.1 if ri == -1 else 0.03, stroke_width=1)
@@ -101,127 +103,108 @@ class ScrollExplainer(MovingCameraScene):
         self.play(*[FadeIn(f, scale=0.5) for f in s1_files], run_time=0.6)
         self.wait(2)
 
+
         # ═══════════════════════════════════════
-        # Section 2: Byte-Copy Stitch (metadata tree + anchor)
+        # Section 2: Stitching Binpack + Row Group Merge (combined)
         # ═══════════════════════════════════════
         y2 = -2 * SECTION
-        s2_title = Text("Phase 1: Byte-Copy Stitch", font_size=40, color=GREEN)
+        s2_title = Text("Stitching Binpack + Row Group Merge", font_size=36, color=GREEN)
         s2_title.move_to([0, y2 + 3.5, 0])
 
-        # Metadata tree: snapshot → manifest-list → manifests → data files
-        meta_snap = RoundedRectangle(width=2, height=0.5, corner_radius=0.08,
-                                      color=PURPLE, fill_opacity=0.3, stroke_width=2)
-        meta_snap.move_to([-4, y2 + 2.5, 0])
-        meta_snap_t = Text("snapshot", font_size=10, color=PURPLE)
-        meta_snap_t.move_to(meta_snap.get_center())
+        p1_label = Text("Phase 1 — Byte-Copy Stitch", font_size=18, color=GREEN)
+        p1_label.move_to([-3, y2 + 2.5, 0])
 
-        meta_ml = RoundedRectangle(width=2, height=0.5, corner_radius=0.08,
-                                    color=PURPLE, fill_opacity=0.2, stroke_width=2)
-        meta_ml.move_to([-4, y2 + 1.8, 0])
-        meta_ml_t = Text("manifest-list", font_size=10, color=PURPLE)
-        meta_ml_t.move_to(meta_ml.get_center())
-
-        meta_arrow = Arrow(meta_snap.get_bottom(), meta_ml.get_top(),
-                           color=COMMENT, buff=0.05, stroke_width=1.5, max_tip_length_to_length_ratio=0.2)
-
-        # Small files branching from manifests
+        # Source files on the left
         file_colors = [CYAN, GREEN, ORANGE, PURPLE, PINK, RED]
-        small_files = VGroup()
-        small_labels = VGroup()
+        source_files = VGroup()
+        source_labels = VGroup()
         for i in range(6):
-            sf = RoundedRectangle(width=1.5, height=0.4, corner_radius=0.06,
-                                  color=file_colors[i], fill_opacity=0.6, stroke_width=1.5)
-            sf.move_to([-4 + (i % 3) * 1.8, y2 + 0.6 - (i // 3) * 0.6, 0])
+            sf = RoundedRectangle(width=1.6, height=0.45, corner_radius=0.06,
+                                  color=file_colors[i], fill_opacity=0.6, stroke_width=2)
+            sf.move_to([-4.5, y2 + 1.5 - i * 0.6, 0])
             sfl = Text(f"file_{i+1}", font_size=8, color=COMMENT)
-            sfl.next_to(sf, DOWN, buff=0.05)
-            small_files.add(sf)
-            small_labels.add(sfl)
+            sfl.next_to(sf, LEFT, buff=0.1)
+            source_files.add(sf)
+            source_labels.add(sfl)
 
-        # Anchor file on the right
-        anchor = RoundedRectangle(width=2.5, height=4.5, corner_radius=0.12,
+        # Anchor / output container on the right
+        anchor = RoundedRectangle(width=2.5, height=4.2, corner_radius=0.12,
                                    color=GREEN, fill_opacity=0.05, stroke_width=3)
-        anchor.move_to([4, y2, 0])
-        anchor_label = Text("anchor\n(output)", font_size=12, color=GREEN)
-        anchor_label.move_to([4, y2 + 2.8, 0])
-
-        # Gravity arrows: small files → anchor
-        gravity_arrows = VGroup()
-        for sf in small_files:
-            arr = Arrow(sf.get_right(), [2.5, sf.get_center()[1], 0],
-                        color=GREEN, buff=0.1, stroke_width=1,
-                        max_tip_length_to_length_ratio=0.15)
-            gravity_arrows.add(arr)
-
-        # Row groups inside anchor
-        rgs = VGroup()
-        for i in range(6):
-            rg = RoundedRectangle(width=2, height=0.5, corner_radius=0.06,
-                                   color=file_colors[i], fill_opacity=0.6, stroke_width=1.5)
-            rg.move_to([4, y2 + 1.8 - i * 0.65, 0])
-            rg_t = Text(f"RG {i+1}", font_size=11, color=FG, weight=BOLD)
-            rg_t.move_to(rg.get_center())
-            rgs.add(rg, rg_t)
-
-        s2_callout = Text("Zero decode · Zero CPU per row · Raw bytes only",
-                          font_size=16, color=YELLOW, weight=BOLD)
-        s2_callout.move_to([0, y2 - 3, 0])
+        anchor.move_to([3.5, y2, 0])
+        anchor_label = Text("output.parquet", font_size=11, color=GREEN)
+        anchor_label.move_to([3.5, y2 + 2.5, 0])
 
         scroll_to(y2, 2)
         self.play(Write(s2_title), run_time=0.5)
-        self.play(FadeIn(meta_snap), Write(meta_snap_t), run_time=0.4)
-        self.play(GrowArrow(meta_arrow), run_time=0.3)
-        self.play(FadeIn(meta_ml), Write(meta_ml_t), run_time=0.4)
-        self.play(*[FadeIn(sf, shift=DOWN*0.2) for sf in small_files], *[Write(sl) for sl in small_labels], run_time=0.6)
-        self.play(FadeIn(anchor), Write(anchor_label), run_time=0.5)
-        self.play(*[GrowArrow(a) for a in gravity_arrows], run_time=0.8)
-        self.play(*[FadeIn(rg, shift=LEFT*0.3) for rg in rgs], run_time=0.8)
+        self.play(Write(p1_label), run_time=0.3)
+        self.play(
+            *[FadeIn(sf, shift=RIGHT*0.2) for sf in source_files],
+            *[Write(sl) for sl in source_labels],
+            run_time=0.5,
+        )
+        self.play(FadeIn(anchor), Write(anchor_label), run_time=0.4)
+
+        # Animate: each file's RG FLIES from source position to anchor slot
+        landed_rgs = VGroup()
+        for i in range(6):
+            target_y = y2 + 1.5 - i * 0.6
+            rg = RoundedRectangle(width=2, height=0.42, corner_radius=0.06,
+                                   color=file_colors[i], fill_opacity=0.65, stroke_width=1.5)
+            rg.move_to(source_files[i].get_center())  # start at source position
+            rg_label = Text(f"RG {i+1}", font_size=10, color=FG, weight=BOLD)
+
+            # Fly the chunk from source to anchor
+            self.play(
+                rg.animate.move_to([3.5, target_y, 0]),
+                source_files[i].animate.set_fill(opacity=0.1).set_stroke(opacity=0.3),
+                source_labels[i].animate.set_opacity(0.2),
+                run_time=0.4,
+                rate_func=smooth,
+            )
+            rg_label.move_to(rg.get_center())
+            self.play(FadeIn(rg_label), run_time=0.1)
+            landed_rgs.add(VGroup(rg, rg_label))
+
+        s2_callout = Text("Zero decode · Zero CPU per row · Raw bytes only",
+                          font_size=15, color=YELLOW, weight=BOLD)
+        s2_callout.move_to([0, y2 - 2.8, 0])
         self.play(Write(s2_callout), run_time=0.5)
+        self.wait(1.5)
+
+        # Phase 2: RGs collapse into one merged block (same viewport)
+        p2_label = Text("Phase 2 — Row Group Merge", font_size=18, color=ORANGE)
+        p2_label.move_to([-3, y2 - 3.5, 0])
+        trigger_text = Text("(if RGs > 4 or sort order or deletes)", font_size=12, color=COMMENT)
+        trigger_text.next_to(p2_label, RIGHT, buff=0.3)
+        self.play(Write(p2_label), Write(trigger_text), run_time=0.4)
+
+        merged_rg = RoundedRectangle(width=2, height=3.5, corner_radius=0.1,
+                                      color=GREEN, fill_opacity=0.6, stroke_width=3)
+        merged_rg.move_to([3.5, y2, 0])
+        merged_label = Text("1 merged RG\nfresh stats\nsorted", font_size=11, color=FG)
+        merged_label.move_to(merged_rg.get_center())
+
+        # All 6 RGs collapse into one
+        self.play(
+            *[rg.animate.move_to([3.5, y2, 0]).set_opacity(0) for rg in landed_rgs],
+            FadeIn(merged_rg),
+            run_time=0.8,
+            rate_func=smooth,
+        )
+        self.play(Write(merged_label), run_time=0.3)
+
+        s2_key = Text("Spark & Flink ALWAYS decode. Janitor only when needed.",
+                      font_size=14, color=YELLOW, weight=BOLD)
+        s2_key.move_to([0, y2 - 4.2, 0])
+        self.play(Write(s2_key), run_time=0.5)
         self.wait(3)
 
         # ═══════════════════════════════════════
-        # Section 3: Row Group Merge
+        # Section 3: Delete Handling
         # ═══════════════════════════════════════
         y3 = -3 * SECTION
-        s3_title = Text("Phase 2: Row Group Merge", font_size=40, color=ORANGE)
-        s3_title.move_to([0, y3 + 3.5, 0])
-        s3_trigger = Text("Triggers: RGs > 4 | sort order | deletes",
-                          font_size=14, color=COMMENT)
-        s3_trigger.move_to([0, y3 + 2.5, 0])
-
-        s3_before = VGroup()
-        for i in range(6):
-            rg = Rectangle(width=2.5, height=0.4, color=CYAN, fill_opacity=0.4, stroke_width=1)
-            rg.move_to([-3, y3 + 1.5 - i * 0.5, 0])
-            s3_before.add(rg)
-
-        s3_arrow = Text("decode → sort → encode ──▶", font_size=13, color=ORANGE)
-        s3_arrow.move_to([0, y3, 0])
-
-        s3_merged = RoundedRectangle(width=2.5, height=3, corner_radius=0.1,
-                                      color=GREEN, fill_opacity=0.5, stroke_width=3)
-        s3_merged.move_to([4, y3 + 0.5, 0])
-        s3_merged_t = Text("1 merged RG\nfresh stats\nsorted", font_size=12, color=FG)
-        s3_merged_t.move_to(s3_merged.get_center())
-
-        s3_key = Text("Spark & Flink ALWAYS decode. Janitor only when needed.",
-                      font_size=15, color=YELLOW, weight=BOLD)
-        s3_key.move_to([0, y3 - 2.5, 0])
-
-        scroll_to(y3, 2)
-        self.play(Write(s3_title), run_time=0.5)
-        self.play(Write(s3_trigger), run_time=0.4)
-        self.play(*[FadeIn(rg) for rg in s3_before], run_time=0.5)
-        self.play(Write(s3_arrow), run_time=0.5)
-        self.play(FadeIn(s3_merged), Write(s3_merged_t), run_time=0.6)
-        self.play(Write(s3_key), run_time=0.5)
-        self.wait(3)
-
-        # ═══════════════════════════════════════
-        # Section 4: Delete Handling
-        # ═══════════════════════════════════════
-        y4 = -4 * SECTION
         s4_title = Text("Iceberg Delete Handling", font_size=40, color=RED)
-        s4_title.move_to([0, y4 + 3.5, 0])
+        s4_title.move_to([0, y3 + 3.5, 0])
 
         rows_data = ["id=1 us ✓", "id=2 eu ✕", "id=3 us ✕",
                      "id=4 eu ✕", "id=5 us ✓", "id=6 eu ✕"]
@@ -231,7 +214,7 @@ class ScrollExplainer(MovingCameraScene):
             op = 0.6 if "✓" in rd else 0.15
             rr = RoundedRectangle(width=3.5, height=0.38, corner_radius=0.05,
                                    color=c, fill_opacity=op, stroke_width=1)
-            rr.move_to([-2, y4 + 2 - i * 0.5, 0])
+            rr.move_to([-2, y3 + 2 - i * 0.5, 0])
             rt = Text(rd, font_size=12, color=FG)
             rt.move_to(rr.get_center())
             s4_rows.add(rr, rt)
@@ -241,13 +224,13 @@ class ScrollExplainer(MovingCameraScene):
             Text("eq delete: region='eu'", font_size=12, color=RED),
         )
         s4_del.arrange(DOWN, buff=0.2)
-        s4_del.move_to([4, y4 + 1.5, 0])
+        s4_del.move_to([4, y3 + 1.5, 0])
 
         s4_result = Text("Output: 2 rows. I1: in=6 − del=4 == out=2 ✓",
                          font_size=14, color=YELLOW)
-        s4_result.move_to([0, y4 - 1.5, 0])
+        s4_result.move_to([0, y3 - 1.5, 0])
 
-        scroll_to(y4, 2)
+        scroll_to(y3, 2)
         self.play(Write(s4_title), run_time=0.5)
         for i in range(0, len(s4_rows), 2):
             self.play(FadeIn(s4_rows[i]), Write(s4_rows[i+1]), run_time=0.25)
@@ -256,11 +239,11 @@ class ScrollExplainer(MovingCameraScene):
         self.wait(2)
 
         # ═══════════════════════════════════════
-        # Section 5: Safety Gates
+        # Section 4: Safety Gates
         # ═══════════════════════════════════════
-        y5s = -5 * SECTION
+        y4s = -4 * SECTION
         s5s_title = Text("Safety Gates", font_size=40, color=YELLOW, weight=BOLD)
-        s5s_title.move_to([0, y5s + 3.5, 0])
+        s5s_title.move_to([0, y4s + 3.5, 0])
 
         gates = [
             ("⏭", "Schema Guard",     "Mixed schemas → skip round",         CYAN),
@@ -272,7 +255,7 @@ class ScrollExplainer(MovingCameraScene):
         for i, (icon, name, desc, color) in enumerate(gates):
             bg = RoundedRectangle(width=9, height=0.7, corner_radius=0.1,
                                   color=color, fill_opacity=0.08, stroke_width=2)
-            bg.move_to([0, y5s + 2 - i * 0.9, 0])
+            bg.move_to([0, y4s + 2 - i * 0.9, 0])
             ic = Text(icon, font_size=20)
             ic.move_to(bg.get_left() + RIGHT * 0.6)
             nm = Text(name, font_size=14, color=color, weight=BOLD)
@@ -283,11 +266,11 @@ class ScrollExplainer(MovingCameraScene):
 
         s5s_principle = Text("Refuse loudly rather than corrupt silently",
                              font_size=17, color=YELLOW, weight=BOLD)
-        s5s_principle.move_to([0, y5s - 2, 0])
+        s5s_principle.move_to([0, y4s - 2, 0])
 
         # CAS commit animation below the gates
         cas_title = Text("Atomic CAS Commit", font_size=18, color=PURPLE, weight=BOLD)
-        cas_title.move_to([0, y5s - 3, 0])
+        cas_title.move_to([0, y4s - 3, 0])
 
         cas_steps = VGroup(
             RoundedRectangle(width=2, height=0.5, corner_radius=0.06,
@@ -303,7 +286,7 @@ class ScrollExplainer(MovingCameraScene):
             Text("3. CAS PUT", font_size=10, color=PURPLE),
         )
         for i in range(3):
-            cas_steps[i].move_to([-3 + i * 3, y5s - 3.8, 0])
+            cas_steps[i].move_to([-3 + i * 3, y4s - 3.8, 0])
             cas_labels[i].move_to(cas_steps[i].get_center())
 
         cas_arrows = VGroup()
@@ -313,12 +296,12 @@ class ScrollExplainer(MovingCameraScene):
             cas_arrows.add(a)
 
         cas_retry = Text("412? → reload → re-plan → retry", font_size=12, color=ORANGE)
-        cas_retry.move_to([0, y5s - 4.5, 0])
+        cas_retry.move_to([0, y4s - 4.5, 0])
         cas_nolock = Text("No lock service. Just conditional PUT on S3.",
                           font_size=13, color=PURPLE)
-        cas_nolock.move_to([0, y5s - 5, 0])
+        cas_nolock.move_to([0, y4s - 5, 0])
 
-        scroll_to(y5s, 2)
+        scroll_to(y4s, 2)
         self.play(Write(s5s_title), run_time=0.5)
         for g in gate_objs:
             self.play(FadeIn(g, shift=RIGHT * 0.3), run_time=0.4)
@@ -335,9 +318,9 @@ class ScrollExplainer(MovingCameraScene):
         self.wait(3)
 
         # ═══════════════════════════════════════
-        # Section 6: Feature & Cost Comparison
+        # Section 5: Feature & Cost Comparison
         # ═══════════════════════════════════════
-        y5 = -6 * SECTION
+        y5 = -5 * SECTION
         s5_title = Text("Feature & Cost Comparison", font_size=40, color=FG)
         s5_title.move_to([0, y5 + 3.5, 0])
 
@@ -378,9 +361,9 @@ class ScrollExplainer(MovingCameraScene):
         self.wait(3)
 
         # ═══════════════════════════════════════
-        # Section 6: Import from Hive
+        # Section 5: Import from Hive
         # ═══════════════════════════════════════
-        y6 = -7 * SECTION
+        y6 = -6 * SECTION
         s6_title = Text("Import from Hive / Legacy Parquet", font_size=40, color=CYAN)
         s6_title.move_to([0, y6 + 3.5, 0])
 
@@ -438,9 +421,9 @@ class ScrollExplainer(MovingCameraScene):
         self.wait(2)
 
         # ═══════════════════════════════════════
-        # Section 7: Takeaways
+        # Section 6: Takeaways
         # ═══════════════════════════════════════
-        y7 = -8 * SECTION
+        y7 = -7 * SECTION
         s7_title = Text("Takeaways", font_size=44, color=YELLOW, weight=BOLD)
         s7_title.move_to([0, y7 + 3.5, 0])
 
@@ -469,9 +452,9 @@ class ScrollExplainer(MovingCameraScene):
         self.wait(3)
 
         # ═══════════════════════════════════════
-        # Section 8: Closing
+        # Section 7: Closing
         # ═══════════════════════════════════════
-        y8 = -9 * SECTION
+        y8 = -8 * SECTION
         s8 = VGroup(
             Text("iceberg-janitor", font_size=56, color=FG, weight=BOLD),
             Text("github.com/mystictraveler/iceberg-janitor",
