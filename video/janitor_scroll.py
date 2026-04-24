@@ -319,10 +319,55 @@ class ScrollExplainer(MovingCameraScene):
         self.play(Write(cas_nolock), run_time=0.4)
         self.wait(3)
 
+
         # ═══════════════════════════════════════
-        # Section 5: Feature & Cost Comparison
+        # Section 5: Auto-Classification
         # ═══════════════════════════════════════
-        y5 = -5 * SECTION
+        y_ac = -5 * SECTION
+        ac_title = Text("Auto-Classification", font_size=40, color=CYAN, weight=BOLD)
+        ac_title.move_to([0, y_ac + 3.5, 0])
+        ac_sub = Text("Zero operator tuning — the server decides", font_size=16, color=COMMENT)
+        ac_sub.move_to([0, y_ac + 2.7, 0])
+
+        classes = [
+            ("streaming",     "> 6/hr",   "5 min",  "hot stitch",     GREEN),
+            ("batch",         "1-6/hr",   "1 hour", "cold partition",  ORANGE),
+            ("slow_changing", "< 1/hr",   "daily",  "cold triggered",  CYAN),
+            ("dormant",       "none 7d",  "weekly", "skip",            COMMENT),
+        ]
+        ac_items = VGroup()
+        for i, (cls, rate, cadence, mode, color) in enumerate(classes):
+            bg = RoundedRectangle(width=9.5, height=0.55, corner_radius=0.08,
+                                   color=color, fill_opacity=0.08, stroke_width=1.5)
+            bg.move_to([0, y_ac + 1.8 - i * 0.7, 0])
+            c_t = Text(cls, font_size=13, color=color, weight=BOLD)
+            c_t.move_to(bg.get_left() + RIGHT * 1.5)
+            r_t = Text(rate, font_size=11, color=FG)
+            r_t.move_to(bg.get_left() + RIGHT * 3.5)
+            cd_t = Text(cadence, font_size=11, color=FG)
+            cd_t.move_to(bg.get_center() + RIGHT * 0.5)
+            m_t = Text(mode, font_size=11, color=color)
+            m_t.move_to(bg.get_right() + LEFT * 1.5)
+            ac_items.add(VGroup(bg, c_t, r_t, cd_t, m_t))
+
+        ac_flow = Text("POST /maintain → classify → plan → dispatch → compact", font_size=13, color=YELLOW)
+        ac_flow.move_to([0, y_ac - 1.2, 0])
+        ac_key = Text("No per-table config. No knobs.", font_size=15, color=CYAN, weight=BOLD)
+        ac_key.move_to([0, y_ac - 1.8, 0])
+
+        scroll_to(y_ac, 2)
+        self.play(Write(ac_title), run_time=0.5)
+        self.play(Write(ac_sub), run_time=0.3)
+        for item in ac_items:
+            self.play(FadeIn(item, shift=RIGHT * 0.2), run_time=0.3)
+        self.play(Write(ac_flow), run_time=0.4)
+        self.play(Write(ac_key), run_time=0.4)
+        self.wait(3)
+
+        # ═══════════════════════════════════════
+        # Section 6: Feature & Cost Comparison
+        # ═══════════════════════════════════════
+        y5 = -6 * SECTION
         s5_title = Text("Feature & Cost Comparison", font_size=40, color=FG)
         s5_title.move_to([0, y5 + 3.5, 0])
 
@@ -362,10 +407,94 @@ class ScrollExplainer(MovingCameraScene):
         self.play(Write(s5_winner), run_time=0.5)
         self.wait(3)
 
+
         # ═══════════════════════════════════════
-        # Section 5: Import from Hive
+        # Section 7: Manifest Rewrite
         # ═══════════════════════════════════════
-        y6 = -6 * SECTION
+        y_mr = -7 * SECTION
+        mr_title = Text("Manifest Rewrite", font_size=40, color=CYAN)
+        mr_title.move_to([0, y_mr + 3.5, 0])
+
+        mr_before = Text("BEFORE — 12 micro-manifests", font_size=14, color=RED)
+        mr_before.move_to([-3.5, y_mr + 2.2, 0])
+        micro_m = VGroup()
+        for i in range(12):
+            mm = RoundedRectangle(width=0.7, height=0.35, corner_radius=0.04, color=ORANGE, fill_opacity=0.5, stroke_width=1)
+            mm.move_to([-5 + (i%4)*0.85, y_mr + 1.5 - (i//4)*0.5, 0])
+            micro_m.add(mm)
+        mr_arrow = Text("rewrite ──────▶", font_size=16, color=GREEN)
+        mr_arrow.move_to([0, y_mr + 0.8, 0])
+        mr_after = Text("AFTER — 3 partition-organized", font_size=14, color=GREEN)
+        mr_after.move_to([3.5, y_mr + 2.2, 0])
+        consol = VGroup()
+        for i, pn in enumerate(["partition A", "partition B", "partition C"]):
+            cm = RoundedRectangle(width=2.5, height=0.55, corner_radius=0.08, color=GREEN, fill_opacity=0.5, stroke_width=2)
+            cm.move_to([3.5, y_mr + 1.5 - i*0.7, 0])
+            cm_t = Text(pn, font_size=10, color=FG)
+            cm_t.move_to(cm.get_center())
+            consol.add(VGroup(cm, cm_t))
+        mr_key = Text("Compact walks 3 manifests, not 12", font_size=14, color=YELLOW, weight=BOLD)
+        mr_key.move_to([0, y_mr - 1, 0])
+
+        scroll_to(y_mr, 2)
+        self.play(Write(mr_title), run_time=0.5)
+        self.play(Write(mr_before), run_time=0.3)
+        self.play(*[FadeIn(m, scale=0.8) for m in micro_m], run_time=0.6)
+        self.play(Write(mr_arrow), run_time=0.4)
+        self.play(Write(mr_after), run_time=0.3)
+        self.play(*[FadeIn(c, shift=LEFT*0.3) for c in consol], *[m.animate.set_opacity(0.1) for m in micro_m], run_time=0.8)
+        self.play(Write(mr_key), run_time=0.5)
+        self.wait(3)
+
+        # ═══════════════════════════════════════
+        # Section 8: Snapshot Expiration
+        # ═══════════════════════════════════════
+        y_se = -8 * SECTION
+        se_title = Text("Snapshot Expiration", font_size=40, color=ORANGE)
+        se_title.move_to([0, y_se + 3.5, 0])
+        se_policy = Text("keep_last=5  keep_within=24h", font_size=14, color=YELLOW)
+        se_policy.move_to([0, y_se + 2.5, 0])
+
+        snap_chain = VGroup()
+        ages = ["7d", "6d", "5d", "3d", "2d", "1d", "4h", "now"]
+        for i in range(8):
+            expired = i < 5
+            color = RED if expired else GREEN
+            op = 0.25 if expired else 0.6
+            s = RoundedRectangle(width=0.9, height=1.2, corner_radius=0.06, color=color, fill_opacity=op, stroke_width=2)
+            s.move_to([-5 + i*1.4, y_se + 1, 0])
+            at = Text(ages[i], font_size=10, color=color, weight=BOLD)
+            at.move_to(s.get_center() + DOWN*0.15)
+            it = Text(f"s{i+1}", font_size=8, color=FG)
+            it.move_to(s.get_center() + UP*0.25)
+            snap_chain.add(VGroup(s, at, it))
+
+        ch_arrows = VGroup()
+        for i in range(7):
+            a = Arrow(snap_chain[i][0].get_right(), snap_chain[i+1][0].get_left(), color=COMMENT, buff=0.05, stroke_width=1, max_tip_length_to_length_ratio=0.2)
+            ch_arrows.add(a)
+
+        scroll_to(y_se, 2)
+        self.play(Write(se_title), run_time=0.5)
+        self.play(Write(se_policy), run_time=0.3)
+        self.play(*[FadeIn(s) for s in snap_chain], run_time=0.6)
+        self.play(*[GrowArrow(a) for a in ch_arrows], run_time=0.5)
+        self.wait(1)
+        for i in range(5):
+            x = Text("✕", font_size=18, color=RED, weight=BOLD)
+            x.move_to(snap_chain[i][0].get_center())
+            self.play(snap_chain[i][0].animate.set_fill(opacity=0.05), FadeIn(x, scale=1.5), run_time=0.3)
+        for i in range(5, 8):
+            self.play(snap_chain[i][0].animate.set_stroke(color=GREEN, width=3), run_time=0.2)
+        se_result = Text("Orphaned files now eligible for GC", font_size=14, color=YELLOW, weight=BOLD)
+        se_result.move_to([0, y_se - 1.5, 0])
+        self.play(Write(se_result), run_time=0.5)
+        self.wait(3)
+
+        # ═══════════════════════════════════════
+        # Section 9: Import from Hive
+        # ═══════════════════════════════════════
+        y6 = -9 * SECTION
         s6_title = Text("Import from Hive / Legacy Parquet", font_size=40, color=CYAN)
         s6_title.move_to([0, y6 + 3.5, 0])
 
@@ -425,7 +554,7 @@ class ScrollExplainer(MovingCameraScene):
         # ═══════════════════════════════════════
         # Section 6: Takeaways
         # ═══════════════════════════════════════
-        y7 = -7 * SECTION
+        y7 = -10 * SECTION
         s7_title = Text("Takeaways", font_size=44, color=YELLOW, weight=BOLD)
         s7_title.move_to([0, y7 + 3.5, 0])
 
@@ -456,7 +585,7 @@ class ScrollExplainer(MovingCameraScene):
         # ═══════════════════════════════════════
         # Section 7: Closing
         # ═══════════════════════════════════════
-        y8 = -8 * SECTION
+        y8 = -11 * SECTION
         s8 = VGroup(
             Text("iceberg-janitor", font_size=56, color=FG, weight=BOLD),
             Text("github.com/mystictraveler/iceberg-janitor",
