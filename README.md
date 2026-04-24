@@ -16,6 +16,10 @@ iceberg-janitor fixes this automatically:
 
 No catalog service required. No managed control plane. No per-GB pricing.
 
+## How it works
+
+[**Watch the animated explainer (1:17)**](https://github.com/mystictraveler/iceberg-janitor/releases/download/v0.1.0/iceberg_janitor_algorithm.mp4) — covers the stitching binpack algorithm, row group merge, delete handling, safety gates, CAS commit protocol, cost comparison vs Spark/Flink, and Hive import.
+
 ## Architecture
 
 The janitor is one Go core (`pkg/janitor`) driven from three runtime
