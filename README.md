@@ -16,6 +16,49 @@ iceberg-janitor fixes this automatically:
 
 No catalog service required. No managed control plane. No per-GB pricing.
 
+## The problem: metadata explosion
+
+An Iceberg table's metadata footprint (snapshots, manifest lists, manifests) grows orders of magnitude faster than the data it describes, until *reading the metadata* costs more than reading the data.
+
+Mechanism: every commit produces a new snapshot + manifest list and at least one new manifest. Frequent writes (streaming, micro-batches, repeated compactions) pile these up linearly. Without expiration + manifest rewrite, a table with a few GB of data can accumulate tens of thousands of manifest files referencing the same partitions.
+
+Symptoms:
+
+- Query planners walk the manifest tree on every read — planning time dominated by per-object S3 latency, not data scan
+- Commits get slower because manifest lists are re-read and rewritten on every transaction
+- S3 bills shift from data GETs to metadata GETs; LIST/GET request counts blow up
+
+```
+HEALTHY                              EXPLODED
+═══════════════════════════════════  ═══════════════════════════════════
+
+current snapshot                     current snapshot
+   │                                    │
+   ▼                                    ▼
+┌─────────────────┐                  ┌─────────────────┐
+│ manifest_list   │                  │ manifest_list   │  ← rewritten on every commit
+└────────┬────────┘                  └─┬─┬─┬─┬─┬─┬─┬─┬─┘
+         │                             │ │ │ │ │ │ │ │
+    ┌────┴────┐                   ┌────┘ │ │ │ │ │ │ └────┐  ...×1000s
+    ▼         ▼                   ▼      ▼ ▼ ▼ ▼ ▼ ▼      ▼
+  ┌────┐   ┌────┐                ┌──┐┌──┐┌──┐┌──┐┌──┐┌──┐┌──┐ ...
+  │ m1 │   │ m2 │                │m1││m2││m3││m4││m5││m6││m7│      ← manifests
+  └─┬──┘   └─┬──┘                └─┬┘└─┬┘└─┬┘└─┬┘└─┬┘└─┬┘└─┬┘
+    │        │                     └───┴───┴─┬─┴───┴───┴───┘
+    ▼        ▼                               ▼
+  ┌────┐   ┌────┐                          ┌────────┐
+  │data│   │data│                          │  data  │  ← same few files,
+  └────┘   └────┘                          └────────┘     referenced over and
+                                                          over by stale snapshots
+   2 manifests                              ~10,000 manifests
+   ~few KB metadata                         ~GBs of metadata
+   plan time ≪ scan time                    plan time ≫ scan time
+```
+
+The pathology: **metadata cardinality grows with commit count, not data volume.** Two tables with identical data can differ 1000× in planning cost based purely on commit history.
+
+Fix: snapshot expiration + manifest rewrite + orphan removal, run on a cadence proportional to commit rate. That's what the janitor's `maintain` operation does automatically.
+
 ## How it works
 
 [**Watch the animated explainer (1:53)**](https://github.com/user-attachments/assets/25bbc96e-df19-4a34-9499-cda499b6b342) — covers the stitching binpack algorithm, row group merge, delete handling, safety gates, CAS commit, auto-classification, manifest rewrite, snapshot expiration, cost comparison vs Spark/Flink, and Hive import.
