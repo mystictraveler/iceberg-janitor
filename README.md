@@ -1,18 +1,12 @@
 # iceberg-janitor
 
-Catalog-less, multi-cloud maintenance for Apache Iceberg tables. Drop it onto any S3, MinIO, GCS, or Azure Blob warehouse and it maintains every table it finds: compaction, snapshot expiration, manifest consolidation, with mandatory pre-commit verification and zero operator configuration in normal operation.
+Automatic small-file and metadata maintenance for Apache Iceberg tables — streaming and batch. Compacts via byte-copy, expires snapshots, rewrites manifests, with mandatory pre-commit verification. Catalog-less: drop it onto any S3, MinIO, GCS, or Azure Blob warehouse. Zero operator configuration.
 
 ## What it does
 
-Streaming engines (Spark Structured Streaming, Kafka Connect, custom writers) produce thousands of small files per table per hour. Left unattended, these accumulate into a metadata and data-file sprawl that degrades query performance, inflates storage costs, and eventually breaks query planners that can't handle 50K+ manifest entries.
+Streaming and batch engines (Spark Structured Streaming, Kafka Connect, scheduled ETL, custom writers) produce thousands of small files per table per hour. Left unattended, these accumulate into a metadata and data-file sprawl that degrades query performance, inflates storage costs, and eventually breaks query planners that can't handle 50K+ manifest entries.
 
-iceberg-janitor fixes this automatically:
-
-- **Compact** small data files into target-sized files via byte-copy stitching (no Arrow decode/encode, no Spark, no Flink)
-- **Expire** old snapshots from the parent chain, freeing orphaned metadata
-- **Rewrite manifests** from per-commit micro-manifests into partition-organized layout
-- **Classify** each table's workload (streaming / batch / slow-changing / dormant) and dispatch the right maintenance mode automatically
-- **Master check** every commit against invariants I1-I9 (row count, schema, column stats, manifest refs) before writing metadata.json
+iceberg-janitor fixes this automatically. It stitches small files into target-sized ones via byte-copy (no Spark, no Flink, no decode/encode), expires stale snapshots, and rewrites fragmented manifests — all behind a mandatory 9-invariant master check. It classifies each table automatically (streaming, batch, slow-changing, dormant) and applies the right maintenance cadence and file-size targets without operator tuning. On a streaming TPC-DS workload: 192× file reduction, 42% faster Trino queries, at 1/10th the compute cost of Spark.
 
 No catalog service required. No managed control plane. No per-GB pricing.
 
